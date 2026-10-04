@@ -24,7 +24,7 @@ def parse_args():
             "lightgbm", "lgbm",
             "catboost", "cb", "cat",
             "xgboost", "xgb",
-            "resnet", "realmlp", "tabular_resnet", "nn",
+            "resnet", "realmlp", "tabm", "tabular_resnet", "nn",
             "transformer", "ft_transformer", "ft",
         ],
         help="Model architecture to train (default: lightgbm)"
@@ -95,6 +95,11 @@ def parse_args():
         action="store_true",
         help="Disable original dataset ingestion and train purely on synthetic data"
     )
+    parser.add_argument(
+        "--no_glm_margin",
+        action="store_true",
+        help="Disable Stage 1 GLM margin generation for tree models"
+    )
     return parser.parse_args()
 
 
@@ -110,15 +115,19 @@ def main():
         use_original_data=(not args.no_original),
         original_sample_weight=args.original_weight,
         use_density_ratio_weighting=args.density_ratio,
+        use_glm_margin=(not args.no_glm_margin),
     )
 
     if args.epochs is not None:
+        train_cfg.tabm_params["epochs"] = args.epochs
         train_cfg.resnet_params["epochs"] = args.epochs
         train_cfg.ft_params["epochs"] = args.epochs
     if args.batch_size is not None:
+        train_cfg.tabm_params["batch_size"] = args.batch_size
         train_cfg.resnet_params["batch_size"] = args.batch_size
         train_cfg.ft_params["batch_size"] = args.batch_size
     if args.lr is not None:
+        train_cfg.tabm_params["lr"] = args.lr
         train_cfg.resnet_params["lr"] = args.lr
         train_cfg.ft_params["lr"] = args.lr
 

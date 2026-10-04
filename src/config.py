@@ -180,6 +180,19 @@ class TrainConfig:
     density_ratio_clip_min: float = 0.05
     density_ratio_clip_max: float = 3.0
 
+    # GLM Margin Residual Boosting (Stage 1)
+    use_glm_margin: bool = True
+    glm_params: dict[str, Any] = field(
+        default_factory=lambda: {
+            "penalty": "l2",
+            "C": 0.1,
+            "max_iter": 1000,
+            "n_knots": 5,
+            "degree": 3,
+            "random_state": 42,
+        }
+    )
+
     # Default LightGBM Hyperparameters
     lgb_params: dict[str, Any] = field(
         default_factory=lambda: {
@@ -200,7 +213,7 @@ class TrainConfig:
         }
     )
 
-    # Default CatBoost Hyperparameters
+    # Default CatBoost Hyperparameters with CTR Configurations
     cb_params: dict[str, Any] = field(
         default_factory=lambda: {
             "loss_function": "Logloss",
@@ -209,6 +222,10 @@ class TrainConfig:
             "learning_rate": 0.05,
             "depth": 7,
             "l2_leaf_reg": 3.0,
+            "bagging_temperature": 0.2,
+            "random_strength": 1.0,
+            "combinations_ctr": ["BinarizedTargetMeanValue", "Counter"],
+            "max_ctr_complexity": 2,
             "random_seed": 42,
             "early_stopping_rounds": 100,
             "verbose": 250,
@@ -224,13 +241,31 @@ class TrainConfig:
             "max_depth": 7,
             "colsample_bytree": 0.80,
             "subsample": 0.80,
+            "gamma": 0.0,
             "n_estimators": 2500,
             "random_state": 42,
             "tree_method": "hist",
         }
     )
 
-    # Domain 3: Un-distilled Tabular ResNet / RealMLP with Periodic Embeddings (PLR)
+    # Domain 3: RealMLP-TD + TabM (BatchEnsemble) Hybrid
+    tabm_params: dict[str, Any] = field(
+        default_factory=lambda: {
+            "k_ensembles": 16,
+            "hidden_dim": 384,
+            "emb_dim": 8,
+            "num_bins": 16,
+            "dropout": 0.1,
+            "lr": 1e-3,
+            "weight_decay": 1e-4,
+            "batch_size": 4096,
+            "epochs": 32,
+            "gamma": 15.0,
+            "random_state": 42,
+        }
+    )
+
+    # Legacy ResNet parameters fallback
     resnet_params: dict[str, Any] = field(
         default_factory=lambda: {
             "n_blocks": 3,
@@ -284,8 +319,8 @@ class TrainConfig:
 
     @property
     def nn_params(self) -> dict[str, Any]:
-        return self.resnet_params
+        return self.tabm_params
 
     @property
     def realmlp_params(self) -> dict[str, Any]:
-        return self.resnet_params
+        return self.tabm_params

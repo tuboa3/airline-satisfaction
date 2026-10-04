@@ -8,6 +8,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
+import math
 import numpy as np
 
 try:
@@ -24,16 +25,123 @@ class BaseModel(ABC):
     """Abstract Model Interface."""
 
     @abstractmethod
-    def fit(self, X_train, y_train, X_val, y_val) -> None:
+    def fit(self, X_train, y_train, X_val, y_val, **kwargs) -> None:
         pass
 
     @abstractmethod
-    def predict_proba(self, X) -> np.ndarray:
+    def predict_proba(self, X, **kwargs) -> np.ndarray:
         pass
 
 
+class GLMMarginGenerator:
+    """
+    Stage 1 Generalized Linear Model with Natural Splines & One-Hot Encoding.
+    Decomposes the predictive task: GLM captures additive linear and monotonic spline signals,
+    generating leak-free OOF logit margins eta = x^T beta for downstream residual boosting.
+    """
+
+    def __init__(
+        self,
+        continuous_cols: list[str] | None = None,
+        categorical_cols: list[str] | None = None,
+        n_knots: int = 5,
+        degree: int = 3,
+        C: float = 0.1,
+        random_state: int = 42,
+    ):
+        self.continuous_cols = continuous_cols or []
+        self.categorical_cols = categorical_cols or []
+        self.n_knots = n_knots
+        self.degree = degree
+        self.C = C
+        self.random_state = random_state
+        self.spline = None
+        self.ohe = None
+        self.scaler = None
+        self.glm = None
+        self.actual_cont_cols: list[str] = []
+        self.actual_cat_cols: list[str] = []
+
+    def fit(
+        self,
+        X_train,
+        y_train: np.ndarray,
+        sample_weight: np.ndarray | None = None,
+    ) -> "GLMMarginGenerator":
+        import pandas as pd
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.preprocessing import OneHotEncoder, SplineTransformer, StandardScaler
+
+        if isinstance(X_train, np.ndarray):
+            X_train = pd.DataFrame(X_train)
+
+        self.actual_cont_cols = [c for c in self.continuous_cols if c in X_train.columns]
+        self.actual_cat_cols = [c for c in self.categorical_cols if c in X_train.columns]
+
+        parts = []
+        if self.actual_cont_cols:
+            X_cont = X_train[self.actual_cont_cols].fillna(0).values.astype(np.float32)
+            self.scaler = StandardScaler()
+            X_cont_scaled = self.scaler.fit_transform(X_cont)
+            self.spline = SplineTransformer(
+                n_knots=self.n_knots, degree=self.degree, include_bias=False
+            )
+            X_cont_splines = self.spline.fit_transform(X_cont_scaled)
+            parts.append(X_cont_splines)
+
+        if self.actual_cat_cols:
+            X_cat = X_train[self.actual_cat_cols].astype(str).values
+            self.ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+            X_cat_encoded = self.ohe.fit_transform(X_cat)
+            parts.append(X_cat_encoded)
+
+        if not parts:
+            X_mat = X_train.fillna(0).values.astype(np.float32)
+            self.scaler = StandardScaler()
+            X_mat_scaled = self.scaler.fit_transform(X_mat)
+            parts.append(X_mat_scaled)
+
+        X_combined = np.hstack(parts) if len(parts) > 1 else parts[0]
+
+        self.glm = LogisticRegression(
+            C=self.C,
+            max_iter=1000,
+            solver="lbfgs",
+            random_state=self.random_state,
+        )
+        self.glm.fit(X_combined, y_train, sample_weight=sample_weight)
+        return self
+
+    def predict_margin(self, X) -> np.ndarray:
+        import pandas as pd
+
+        if isinstance(X, np.ndarray):
+            X = pd.DataFrame(X)
+
+        parts = []
+        if self.actual_cont_cols and self.spline is not None and self.scaler is not None:
+            X_cont = X[self.actual_cont_cols].fillna(0).values.astype(np.float32)
+            X_cont_scaled = self.scaler.transform(X_cont)
+            X_cont_splines = self.spline.transform(X_cont_scaled)
+            parts.append(X_cont_splines)
+
+        if self.actual_cat_cols and self.ohe is not None:
+            X_cat = X[self.actual_cat_cols].astype(str).values
+            X_cat_encoded = self.ohe.transform(X_cat)
+            parts.append(X_cat_encoded)
+
+        if not parts and self.scaler is not None:
+            X_mat = X.fillna(0).values.astype(np.float32)
+            X_mat_scaled = self.scaler.transform(X_mat)
+            parts.append(X_mat_scaled)
+
+        X_combined = np.hstack(parts) if len(parts) > 1 else parts[0]
+        margins = self.glm.decision_function(X_combined).astype(np.float32)
+        return margins
+
+
 class LightGBMModel(BaseModel):
-    """Production LightGBM Model with Auto-Hardware Configuration."""
+    """Production LightGBM Model with Auto-Hardware Configuration and Residual Margin Support."""
 
     def __init__(self, params: dict[str, Any] = None, device: str = "cpu"):
         self.params = params.copy() if params else {}
@@ -42,7 +150,6 @@ class LightGBMModel(BaseModel):
 
         # Hardware optimization
         if self.device == "cuda":
-            # Attempt to use GPU in LightGBM if compiled, otherwise fallback to CPU
             try:
                 self.params["device"] = "gpu"
             except Exception:
@@ -51,7 +158,7 @@ class LightGBMModel(BaseModel):
             self.params["device"] = "cpu"
             self.params["n_jobs"] = -1
 
-        # Sanitize any accidental foreign hyperparameters
+        # Sanitize foreign hyperparameters
         for invalid_key in [
             "loss_function",
             "eval_metric",
@@ -60,14 +167,22 @@ class LightGBMModel(BaseModel):
             "l2_leaf_reg",
             "iterations",
             "tree_method",
+            "gamma",
         ]:
             self.params.pop(invalid_key, None)
 
     def fit(self, X_train, y_train, X_val, y_val, sample_weight=None, **kwargs) -> None:
         import lightgbm as lgb
 
-        trn_data = lgb.Dataset(X_train, label=y_train, weight=sample_weight)
-        val_data = lgb.Dataset(X_val, label=y_val, reference=trn_data)
+        base_margin_tr = kwargs.get("base_margin_tr", None)
+        base_margin_val = kwargs.get("base_margin_val", None)
+
+        trn_data = lgb.Dataset(
+            X_train, label=y_train, weight=sample_weight, init_score=base_margin_tr
+        )
+        val_data = lgb.Dataset(
+            X_val, label=y_val, init_score=base_margin_val, reference=trn_data
+        )
 
         callbacks = [
             lgb.early_stopping(stopping_rounds=100, verbose=False),
@@ -104,12 +219,24 @@ class LightGBMModel(BaseModel):
             else:
                 raise e
 
-    def predict_proba(self, X) -> np.ndarray:
-        return self.model.predict(X, num_iteration=self.model.best_iteration)
+    def predict_proba(self, X, **kwargs) -> np.ndarray:
+        from scipy.special import expit
+
+        base_margin = kwargs.get("base_margin", None)
+        if base_margin is not None:
+            raw_scores = self.model.predict(
+                X, num_iteration=self.model.best_iteration, raw_score=True
+            )
+            return expit(raw_scores + base_margin)
+        else:
+            return self.model.predict(X, num_iteration=self.model.best_iteration)
 
 
 class CatBoostModel(BaseModel):
-    """Production CatBoost Model with Native GPU / Multi-threading."""
+    """
+    Production CatBoost Model with Native CTR, Ordered Target Statistics,
+    and string categorical support to break collinearity with LightGBM.
+    """
 
     def __init__(self, params: dict[str, Any] = None, device: str = "cpu"):
         from catboost import CatBoostClassifier
@@ -146,32 +273,36 @@ class CatBoostModel(BaseModel):
             "colsample_bytree",
             "subsample",
             "tree_method",
+            "gamma",
         ]:
             self.params.pop(invalid_key, None)
 
         self.model = CatBoostClassifier(**self.params)
 
     def fit(self, X_train, y_train, X_val, y_val, sample_weight=None, **kwargs) -> None:
+        cat_features = kwargs.get("cat_features", None)
         self.model.fit(
             X_train,
             y_train,
             sample_weight=sample_weight,
             eval_set=(X_val, y_val),
+            cat_features=cat_features,
             early_stopping_rounds=self.early_stopping_rounds,
             verbose=self.verbose,
             use_best_model=True,
         )
 
-    def predict_proba(self, X) -> np.ndarray:
+    def predict_proba(self, X, **kwargs) -> np.ndarray:
         return self.model.predict_proba(X)[:, 1]
 
 
 class XGBoostModel(BaseModel):
-    """Production XGBoost Model with Histogram GPU / Multi-threading."""
+    """
+    Production XGBoost Model with Histogram GPU / Multi-threading
+    and Base Margin Residual Boosting.
+    """
 
     def __init__(self, params: dict[str, Any] = None, device: str = "cpu"):
-        from xgboost import XGBClassifier
-
         self.params = params.copy() if params else {}
         self.params["tree_method"] = "hist"
         if device == "cuda":
@@ -180,13 +311,12 @@ class XGBoostModel(BaseModel):
             self.params["device"] = "cpu"
             self.params["n_jobs"] = -1
 
-        # Prevent duplicate/conflicting parameter errors
         self.early_stopping_rounds = self.params.pop("early_stopping_rounds", 100)
         self.verbose = self.params.pop("verbose", 250)
+        self.num_boost_round = self.params.pop("n_estimators", 2500)
 
-        # Sanitize any accidental foreign hyperparameters
+        # Sanitize foreign parameters
         for invalid_key in [
-            "metric",
             "loss_function",
             "task_type",
             "thread_count",
@@ -196,21 +326,40 @@ class XGBoostModel(BaseModel):
         ]:
             self.params.pop(invalid_key, None)
 
-        self.model = XGBClassifier(
-            **self.params, early_stopping_rounds=self.early_stopping_rounds
-        )
+        if "objective" not in self.params:
+            self.params["objective"] = "binary:logistic"
+        if "eval_metric" not in self.params:
+            self.params["eval_metric"] = "auc"
+
+        self.model = None
 
     def fit(self, X_train, y_train, X_val, y_val, sample_weight=None, **kwargs) -> None:
-        self.model.fit(
-            X_train,
-            y_train,
-            sample_weight=sample_weight,
-            eval_set=[(X_val, y_val)],
-            verbose=self.verbose,
+        import xgboost as xgb
+
+        base_margin_tr = kwargs.get("base_margin_tr", None)
+        base_margin_val = kwargs.get("base_margin_val", None)
+
+        dtrain = xgb.DMatrix(
+            X_train, label=y_train, weight=sample_weight, base_margin=base_margin_tr
+        )
+        dval = xgb.DMatrix(X_val, label=y_val, base_margin=base_margin_val)
+
+        evals = [(dtrain, "train"), (dval, "valid")]
+        self.model = xgb.train(
+            self.params,
+            dtrain,
+            num_boost_round=self.num_boost_round,
+            evals=evals,
+            early_stopping_rounds=self.early_stopping_rounds,
+            verbose_eval=self.verbose,
         )
 
-    def predict_proba(self, X) -> np.ndarray:
-        return self.model.predict_proba(X)[:, 1]
+    def predict_proba(self, X, **kwargs) -> np.ndarray:
+        import xgboost as xgb
+
+        base_margin = kwargs.get("base_margin", None)
+        dtest = xgb.DMatrix(X, base_margin=base_margin)
+        return self.model.predict(dtest)
 
 
 class FTTransformerModel(BaseModel):
@@ -942,6 +1091,424 @@ class TabularResNetModel(BaseModel):
         return np.concatenate(probs, axis=0)
 
 
+class DisjointSurveyEmbedding(_ModuleBase):
+    """
+    Explicitly separates '0' (N/A) from ordinal 1-5 responses.
+    Prevents metric distortion in the continuous embedding manifold.
+    """
+
+    def __init__(self, num_survey_cols: int, emb_dim: int = 8):
+        super().__init__()
+        self.num_survey_cols = num_survey_cols
+        self.emb_dim = emb_dim
+        # Dedicated N/A embedding vectors for each column
+        self.na_embeddings = nn.Parameter(torch.randn(num_survey_cols, emb_dim) * 0.02)
+        # Ordinal embeddings for 1-5 (size 6 to accommodate 0-5 indexing safely)
+        self.ordinal_embeddings = nn.Embedding(6, emb_dim)
+        nn.init.normal_(self.ordinal_embeddings.weight, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size = x.size(0)
+        out = torch.zeros(
+            batch_size, self.num_survey_cols, self.emb_dim, device=x.device, dtype=torch.float32
+        )
+        is_na = (x == 0)
+        is_ordinal = (x > 0)
+
+        if is_ordinal.any():
+            out[is_ordinal] = self.ordinal_embeddings(x[is_ordinal].clamp(0, 5))
+
+        if is_na.any():
+            na_expanded = self.na_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
+            out[is_na] = na_expanded[is_na]
+
+        return out.reshape(batch_size, -1)
+
+
+class PiecewiseLinearSplineEmbedding(_ModuleBase):
+    """
+    Robust Piecewise Linear Spline embedding for extreme non-linearities.
+    Boundaries are initialized with empirical quantiles from the train set.
+    """
+
+    def __init__(self, num_features: int, num_bins: int = 16):
+        super().__init__()
+        self.num_features = num_features
+        self.num_bins = num_bins
+        initial_b = torch.linspace(0.0, 1.0, num_bins + 1).view(1, 1, -1).repeat(1, num_features, 1)
+        self.register_buffer("boundaries", initial_b)
+
+    def set_boundaries(self, quantiles_matrix: np.ndarray) -> None:
+        """quantiles_matrix shape: (num_features, num_bins + 1)"""
+        tensor_b = torch.tensor(quantiles_matrix, dtype=torch.float32).unsqueeze(0)
+        if self.boundaries.shape != tensor_b.shape:
+            self.boundaries = tensor_b.to(self.boundaries.device)
+        else:
+            self.boundaries.copy_(tensor_b)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_unsqueezed = x.unsqueeze(-1)  # (batch_size, num_features, 1)
+        b_lower = self.boundaries[:, :, :-1]
+        b_upper = self.boundaries[:, :, 1:]
+        widths = b_upper - b_lower
+
+        activations = (x_unsqueezed - b_lower) / (widths + 1e-8)
+        activations = torch.clamp(activations, min=0.0, max=1.0)
+        return activations.reshape(x.size(0), -1)
+
+
+class NTPLinear(_ModuleBase):
+    """
+    Neural Tangent Parametrization Linear Layer.
+    Stabilizes gradient magnitudes independent of layer width: z = (1 / sqrt(d_in)) * W * x + b
+    """
+
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.in_features = in_features
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.zeros(out_features))
+        nn.init.normal_(self.weight, std=1.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        import torch.nn.functional as F
+
+        scale = 1.0 / math.sqrt(self.in_features)
+        return F.linear(x, self.weight * scale, self.bias)
+
+
+class TabM_BatchEnsembleLayer(_ModuleBase):
+    """
+    Parameter-Efficient Ensemble layer utilizing BatchEnsemble principles.
+    LinearBE(X) = ((X * R) W) * S + B
+    """
+
+    def __init__(self, in_features: int, out_features: int, k_ensembles: int = 16):
+        super().__init__()
+        self.k = k_ensembles
+        self.linear = NTPLinear(in_features, out_features)
+
+        # Rank-1 adapters for each of the k ensemble members
+        self.R = nn.Parameter(torch.ones(k_ensembles, in_features))
+        self.S = nn.Parameter(torch.ones(k_ensembles, out_features))
+        self.B = nn.Parameter(torch.zeros(k_ensembles, out_features))
+
+        # TabM-style initialization
+        nn.init.normal_(self.R, mean=1.0, std=0.05)
+        nn.init.normal_(self.S, mean=1.0, std=0.05)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_adapted = x * self.R.unsqueeze(0)
+
+        batch_size = x.size(0)
+        x_flat = x_adapted.view(batch_size * self.k, -1)
+        z_flat = self.linear(x_flat)
+        z = z_flat.view(batch_size, self.k, -1)
+
+        out = z * self.S.unsqueeze(0) + self.B.unsqueeze(0)
+        return out
+
+
+class RealMLP_TabM_Hybrid(_ModuleBase):
+    """
+    Complete hybrid blueprint executing RealMLP-TD inside a TabM structure.
+    Integrates Disjoint Survey Embeddings, Piecewise Linear Spline Embeddings,
+    Soft Feature Selection, and Parametric SELU.
+    """
+
+    def __init__(
+        self,
+        num_survey_cols: int,
+        num_cont_cols: int,
+        emb_dim: int = 8,
+        num_bins: int = 16,
+        hidden_dim: int = 384,
+        k_ensembles: int = 16,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.k = k_ensembles
+        self.dropout = dropout
+
+        self.survey_embedder = DisjointSurveyEmbedding(num_survey_cols, emb_dim=emb_dim)
+        self.ple_embedder = PiecewiseLinearSplineEmbedding(num_cont_cols, num_bins=num_bins)
+
+        in_dim = (num_survey_cols * emb_dim) + (num_cont_cols * num_bins)
+
+        # Soft feature selection scaling
+        self.feature_scaling = nn.Parameter(torch.ones(in_dim))
+        # Ensemble view expansion
+        self.ensemble_expansion = nn.Parameter(torch.ones(k_ensembles, in_dim))
+
+        # Deep TabM backbone
+        self.block1 = TabM_BatchEnsembleLayer(in_dim, hidden_dim, k_ensembles)
+        self.block2 = TabM_BatchEnsembleLayer(hidden_dim, hidden_dim, k_ensembles)
+        self.block3 = TabM_BatchEnsembleLayer(hidden_dim, hidden_dim, k_ensembles)
+
+        self.head = TabM_BatchEnsembleLayer(hidden_dim, 1, k_ensembles)
+
+        # Parametric SELU: (1 - alpha) * x + alpha * F.selu(x)
+        self.alpha1 = nn.Parameter(torch.ones(hidden_dim))
+        self.alpha2 = nn.Parameter(torch.ones(hidden_dim))
+        self.alpha3 = nn.Parameter(torch.ones(hidden_dim))
+
+    def forward(self, survey_x: torch.Tensor, cont_x: torch.Tensor) -> torch.Tensor:
+        import torch.nn.functional as F
+
+        emb_survey = self.survey_embedder(survey_x)
+        emb_cont = self.ple_embedder(cont_x)
+        x = torch.cat([emb_survey, emb_cont], dim=1)
+
+        # Apply soft feature selection
+        x = x * self.feature_scaling.unsqueeze(0)
+
+        # TabM ensemble expansion: (batch_size, k, in_dim)
+        x = x.unsqueeze(1) * self.ensemble_expansion.unsqueeze(0)
+
+        # Backbone pass with parametric SELU
+        x = self.block1(x)
+        x = (1.0 - self.alpha1) * x + self.alpha1 * F.selu(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        x = self.block2(x)
+        x = (1.0 - self.alpha2) * x + self.alpha2 * F.selu(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        x = self.block3(x)
+        x = (1.0 - self.alpha3) * x + self.alpha3 * F.selu(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        logits = self.head(x).squeeze(-1)  # (batch_size, k)
+
+        if self.training:
+            return logits
+        else:
+            return torch.mean(logits, dim=1)
+
+
+class TabMSurrogateAUCLoss(_ModuleBase):
+    """
+    Differentiable margin ranking loss maximizing ROC-AUC directly across TabM ensemble heads.
+    """
+
+    def __init__(self, gamma: float = 15.0):
+        super().__init__()
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(1)
+        targets = targets.unsqueeze(1).expand_as(logits)
+        total_loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
+
+        k_count = logits.size(1)
+        valid_heads = 0
+        for k_idx in range(k_count):
+            k_logits = logits[:, k_idx]
+            k_targets = targets[:, k_idx]
+            pos_logits = k_logits[k_targets == 1]
+            neg_logits = k_logits[k_targets == 0]
+            if len(pos_logits) == 0 or len(neg_logits) == 0:
+                continue
+            diffs = pos_logits.unsqueeze(1) - neg_logits.unsqueeze(0)
+            member_loss = torch.mean((1.0 - torch.sigmoid(self.gamma * diffs)) ** 2)
+            total_loss = total_loss + member_loss
+            valid_heads += 1
+
+        return total_loss / max(1, valid_heads)
+
+
+class RealMLPTabMModel(BaseModel):
+    """
+    RealMLP-TD + TabM (BatchEnsemble) Hybrid Model.
+    Employs Disjoint Survey Embeddings (0-isolation), Piecewise Linear Spline Embeddings,
+    Parametric SELU, and Surrogate AUC loss with k=16 ensemble heads.
+    Directly breaks collinearity with GBDTs.
+    """
+
+    def __init__(self, params: dict[str, Any] = None, device: str = "cpu"):
+        self.params = params.copy() if params else {}
+        self.device_str = device
+        self.model = None
+        self.survey_cols: list[str] = []
+        self.cont_cols: list[str] = []
+        self.quantiles: np.ndarray | None = None
+
+    def fit(self, X_train, y_train, X_val, y_val, sample_weight=None, **kwargs) -> None:
+        import torch
+        from sklearn.metrics import roc_auc_score
+        from torch.utils.data import DataLoader, TensorDataset
+
+        if self.device_str == "cuda" and torch.cuda.is_available():
+            device = torch.device("cuda")
+            use_amp = True
+        else:
+            device = torch.device("cpu")
+            use_amp = False
+
+        logging.info(f"RealMLP-TabM Hybrid initializing on device: {device} (AMP: {use_amp})")
+
+        # 1. Feature Partitioning
+        standard_survey_cols = [
+            "Inflight wifi service",
+            "Departure/Arrival time convenient",
+            "Ease of Online booking",
+            "Gate location",
+            "Food and drink",
+            "Online boarding",
+            "Seat comfort",
+            "Inflight entertainment",
+            "On-board service",
+            "Leg room service",
+            "Baggage handling",
+            "Checkin service",
+            "Cleanliness",
+        ]
+        self.survey_cols = [c for c in standard_survey_cols if c in X_train.columns]
+        self.cont_cols = [c for c in X_train.columns if c not in self.survey_cols]
+
+        num_survey = len(self.survey_cols)
+        num_cont = len(self.cont_cols)
+        num_bins = self.params.get("num_bins", 16)
+        hidden_dim = self.params.get("hidden_dim", 384)
+        k_ensembles = self.params.get("k_ensembles", 16)
+        dropout = self.params.get("dropout", 0.1)
+        lr = self.params.get("lr", 1e-3)
+        weight_decay = self.params.get("weight_decay", 1e-4)
+        batch_size = self.params.get("batch_size", 4096)
+        epochs = self.params.get("epochs", 32)
+        gamma = self.params.get("gamma", 15.0)
+
+        # 2. Compute empirical quantiles for continuous columns
+        X_cont_tr_raw = X_train[self.cont_cols].fillna(0).values.astype(np.float32)
+        q_steps = np.linspace(0.0, 1.0, num_bins + 1)
+        self.quantiles = np.nanquantile(X_cont_tr_raw, q_steps, axis=0).T
+        for row in range(len(self.quantiles)):
+            self.quantiles[row] = np.maximum.accumulate(self.quantiles[row])
+
+        X_cont_va_raw = X_val[self.cont_cols].fillna(0).values.astype(np.float32)
+
+        X_survey_tr = np.clip(X_train[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5)
+        X_survey_va = np.clip(X_val[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5)
+
+        emb_dim = self.params.get("emb_dim", 8)
+        self.model = RealMLP_TabM_Hybrid(
+            num_survey_cols=num_survey,
+            num_cont_cols=num_cont,
+            emb_dim=emb_dim,
+            num_bins=num_bins,
+            hidden_dim=hidden_dim,
+            k_ensembles=k_ensembles,
+            dropout=dropout,
+        )
+        self.model.ple_embedder.set_boundaries(self.quantiles)
+        self.model = self.model.to(device)
+
+        if device.type == "cuda" and torch.cuda.device_count() > 1:
+            logging.info(f"Distributing RealMLP-TabM across {torch.cuda.device_count()} GPUs!")
+            self.model = nn.DataParallel(self.model)
+
+        train_ds = TensorDataset(
+            torch.tensor(X_survey_tr, dtype=torch.long),
+            torch.tensor(X_cont_tr_raw, dtype=torch.float32),
+            torch.tensor(y_train, dtype=torch.float32),
+        )
+
+        n_workers = 2 if device.type == "cuda" else 0
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=n_workers
+        )
+
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        criterion = TabMSurrogateAUCLoss(gamma=gamma)
+        scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and device.type == "cuda"))
+
+        best_auc = 0.0
+        best_state = None
+
+        for epoch in range(1, epochs + 1):
+            self.model.train()
+            train_loss_acc = 0.0
+
+            for b_survey, b_cont, b_y in train_loader:
+                b_survey = b_survey.to(device)
+                b_cont = b_cont.to(device)
+                b_y = b_y.to(device)
+
+                optimizer.zero_grad()
+                with torch.amp.autocast("cuda", enabled=(use_amp and device.type == "cuda")):
+                    logits = self.model(b_survey, b_cont)
+                    loss = criterion(logits, b_y)
+
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                train_loss_acc += loss.item()
+
+            scheduler.step()
+
+            # Validation evaluation
+            self.model.eval()
+            val_probs = []
+            val_chunk = 4096
+            with torch.no_grad():
+                for idx in range(0, len(X_survey_va), val_chunk):
+                    v_s = torch.tensor(X_survey_va[idx : idx + val_chunk], dtype=torch.long).to(device)
+                    v_c = torch.tensor(X_cont_va_raw[idx : idx + val_chunk], dtype=torch.float32).to(device)
+                    with torch.amp.autocast("cuda", enabled=(use_amp and device.type == "cuda")):
+                        mean_logits = self.model(v_s, v_c)
+                    val_probs.append(torch.sigmoid(mean_logits).cpu().numpy())
+
+            val_preds = np.concatenate(val_probs, axis=0)
+            epoch_auc = roc_auc_score(y_val, val_preds)
+
+            if epoch_auc > best_auc:
+                best_auc = epoch_auc
+                m_to_save = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+                best_state = {k: v.cpu().clone() for k, v in m_to_save.state_dict().items()}
+
+            logging.info(
+                f"RealMLP-TabM Epoch [{epoch:02d}/{epochs:02d}] - Train Loss: {train_loss_acc / len(train_loader):.4f} - Val ROC-AUC: {epoch_auc:.5f} (Best: {best_auc:.5f})"
+            )
+
+        if best_state is not None:
+            m_to_save = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+            m_to_save.load_state_dict(best_state)
+            logging.info(f"Loaded Best RealMLP-TabM State (Validation ROC-AUC: {best_auc:.5f})")
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def predict_proba(self, X, **kwargs) -> np.ndarray:
+        import torch
+
+        device = next(self.model.parameters()).device
+        self.model.eval()
+
+        X_survey = np.clip(X[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5)
+        X_cont = X[self.cont_cols].fillna(0).values.astype(np.float32)
+
+        n_gpus = torch.cuda.device_count() if device.type == "cuda" else 1
+        batch_size = 4096 * max(1, n_gpus)
+        probs = []
+
+        with torch.no_grad():
+            for i in range(0, len(X), batch_size):
+                b_s = torch.tensor(X_survey[i : i + batch_size], dtype=torch.long).to(device)
+                b_c = torch.tensor(X_cont[i : i + batch_size], dtype=torch.float32).to(device)
+                mean_logits = self.model(b_s, b_c)
+                p = torch.sigmoid(mean_logits).cpu().numpy()
+                probs.append(p)
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        return np.concatenate(probs, axis=0)
+
+
 def get_model(
     model_name: str, params: dict[str, Any] = None, device: str = "cpu"
 ) -> BaseModel:
@@ -954,9 +1521,14 @@ def get_model(
     elif "xgb" in model_name_lower or "xgboost" in model_name_lower:
         return XGBoostModel(params=params, device=device)
     elif (
+        "realmlp" in model_name_lower
+        or "tabm" in model_name_lower
+        or "hybrid" in model_name_lower
+    ):
+        return RealMLPTabMModel(params=params, device=device)
+    elif (
         "resnet" in model_name_lower
         or "tabular_resnet" in model_name_lower
-        or "realmlp" in model_name_lower
         or "nn" in model_name_lower
     ):
         return TabularResNetModel(params=params, device=device)
@@ -967,5 +1539,5 @@ def get_model(
         return FTTransformerModel(params=params, device=device)
     else:
         raise ValueError(
-            f"Unknown model name: {model_name}. Choose from 'lightgbm', 'catboost', 'xgboost', 'resnet', 'transformer'."
+            f"Unknown model name: {model_name}. Choose from 'lightgbm', 'catboost', 'xgboost', 'realmlp', 'tabm', 'resnet', 'transformer'."
         )

@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize
+from scipy.optimize import minimize, nnls
 from scipy.special import expit, logit
 from scipy.stats import rankdata
 from sklearn.isotonic import IsotonicRegression
@@ -69,8 +69,10 @@ class EnsembleOptimizer:
             "xgb": "xgboost",
             "ft": "ft_transformer",
             "transformer": "ft_transformer",
-            "realmlp": "tabular_resnet",
+            "realmlp": "realmlp",
+            "tabm": "realmlp",
             "resnet": "tabular_resnet",
+            "tabular_resnet": "tabular_resnet",
         }
 
         pattern = os.path.join(self.paths.output_dir, "oof_preds_*.npy")
@@ -162,9 +164,11 @@ class EnsembleOptimizer:
         cal_oof_logits: dict[str, np.ndarray],
         cal_test_logits: dict[str, np.ndarray],
         y_true: np.ndarray,
+        dirichlet_alpha: float = 1.05,
     ) -> tuple[np.ndarray, float, np.ndarray, dict[str, float]]:
         """
-        Direct ROC-AUC Maximization in Calibrated Logit Space via Nelder-Mead.
+        Direct ROC-AUC Maximization in Calibrated Logit Space via Nelder-Mead
+        with Dirichlet shrinkage prior toward uniform weights to prevent single-model domination.
         Formula: z_blend = sum(w_i * z_i), p_blend = sigmoid(z_blend).
         """
         X_oof_logits = np.column_stack([cal_oof_logits[m] for m in model_names])
@@ -178,27 +182,104 @@ class EnsembleOptimizer:
             weights = weights / weights.sum()
             z_blend = np.dot(X_oof_logits, weights)
             p_blend = expit(z_blend)
-            return -roc_auc_score(y_true, p_blend)
+            auc = roc_auc_score(y_true, p_blend)
+            # Dirichlet shrinkage prior penalty
+            dirichlet_penalty = -(dirichlet_alpha - 1.0) * np.sum(np.log(weights + 1e-12))
+            return -auc + 1e-4 * dirichlet_penalty
 
         init_w = np.ones(n) / n
+        bounds = [(0.0, 1.0) for _ in range(n)]
         res = minimize(
             objective,
             init_w,
             method="Nelder-Mead",
+            bounds=bounds,
             options={"maxiter": 1000},
         )
 
         opt_w = np.maximum(0.0, res.x)
-        opt_w = opt_w / np.sum(opt_w)
-        best_auc = -res.fun
+        if opt_w.sum() > 0:
+            opt_w = opt_w / np.sum(opt_w)
+        else:
+            opt_w = np.ones(n) / n
 
         z_oof_final = np.dot(X_oof_logits, opt_w)
         z_test_final = np.dot(X_test_logits, opt_w)
 
         final_oof = expit(z_oof_final)
         final_test = expit(z_test_final)
+        best_auc = roc_auc_score(y_true, final_oof)
         w_dict = {name: float(w) for name, w in zip(model_names, opt_w)}
         return final_oof, best_auc, final_test, w_dict
+
+    def train_nnls(self, X_meta: np.ndarray, y_meta: np.ndarray) -> np.ndarray:
+        """
+        Non-Negative Least Squares (NNLS) meta-learner.
+        Convex minimization: min ||X w - y||_2^2 subject to w >= 0.
+        Eliminates destabilizing negative weights and tail miscalibration.
+        """
+        X = X_meta.astype(np.float64)
+        y = y_meta.astype(np.float64)
+        weights, _ = nnls(X, y)
+        if weights.sum() > 0:
+            weights = weights / weights.sum()
+        else:
+            weights = np.ones(X.shape[1]) / X.shape[1]
+        return weights.astype(np.float32)
+
+    def blend_nnls(
+        self,
+        model_names: list[str],
+        oof_list: list[np.ndarray],
+        test_list: list[np.ndarray],
+        y_true: np.ndarray,
+    ) -> tuple[np.ndarray, float, np.ndarray, dict[str, float]]:
+        """
+        Non-Negative Least Squares (NNLS) Convex Probability Combination.
+        """
+        X_meta_oof = np.column_stack(oof_list)
+        X_meta_test = np.column_stack(test_list)
+
+        opt_w = self.train_nnls(X_meta_oof, y_true)
+        final_oof = np.dot(X_meta_oof, opt_w)
+        final_test = np.dot(X_meta_test, opt_w)
+        auc = roc_auc_score(y_true, final_oof)
+        w_dict = {name: float(w) for name, w in zip(model_names, opt_w)}
+        return final_oof, auc, final_test, w_dict
+
+    def blend_isotonic_stacking(
+        self,
+        model_names: list[str],
+        oof_list: list[np.ndarray],
+        test_list: list[np.ndarray],
+        y_true: np.ndarray,
+    ) -> tuple[np.ndarray, float, np.ndarray]:
+        """
+        Isotonic Stacking Meta-Learner:
+        Combines base predictions via NNLS weights, then applies cross-validated
+        non-parametric Isotonic Regression (PAVA) to correct tail miscalibration (p < 0.02, p > 0.98).
+        """
+        X_meta_oof = np.column_stack(oof_list)
+        X_meta_test = np.column_stack(test_list)
+
+        # 1. Base combination via NNLS
+        weights = self.train_nnls(X_meta_oof, y_true)
+        raw_oof = np.dot(X_meta_oof, weights)
+        raw_test = np.dot(X_meta_test, weights)
+
+        # 2. 5-Fold Cross-Validation Isotonic Calibration
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        cal_oof = np.zeros(len(y_true), dtype=np.float32)
+        cal_test = np.zeros(len(raw_test), dtype=np.float32)
+
+        for tr_idx, va_idx in skf.split(raw_oof, y_true):
+            iso = IsotonicRegression(out_of_bounds="clip")
+            iso.fit(raw_oof[tr_idx], y_true[tr_idx])
+            cal_oof[va_idx] = iso.predict(raw_oof[va_idx])
+            cal_test += iso.predict(raw_test) / 5.0
+
+        auc = roc_auc_score(y_true, cal_oof)
+        return cal_oof, auc, cal_test
 
     def blend_ridge_interactions(
         self,
@@ -322,16 +403,16 @@ class EnsembleOptimizer:
         oof_rank, auc_rank, test_rank, w_rank = self.blend_rank(
             model_names, oof_list, test_list, y_true
         )
-        self.logger.info(f"Strategy 1 (Rank-Averaged Blend)       : OOF ROC-AUC = {auc_rank:.5f}")
+        self.logger.info(f"Strategy 1 (Rank-Averaged Blend)        : OOF ROC-AUC = {auc_rank:.5f}")
 
         # 4. Calibration & Logit Conversion
         cal_oof_logits, cal_test_logits = self.calibrate_and_logit(models_dict, y_true)
 
-        # 5. Strategy 2: Bounded Logit Blending (Nelder-Mead)
+        # 5. Strategy 2: Bounded Logit Blending (Nelder-Mead with Dirichlet Shrinkage)
         oof_slsqp, auc_slsqp, test_slsqp, w_slsqp = self.blend_logit_slsqp(
             model_names, cal_oof_logits, cal_test_logits, y_true
         )
-        self.logger.info(f"Strategy 2 (Nelder-Mead Logit Blend)   : OOF ROC-AUC = {auc_slsqp:.5f}")
+        self.logger.info(f"Strategy 2 (Nelder-Mead Logit Blend)    : OOF ROC-AUC = {auc_slsqp:.5f}")
         for m, w in w_slsqp.items():
             self.logger.info(f"    - Weight for {m:<18}: {w:.4f}")
 
@@ -340,15 +421,31 @@ class EnsembleOptimizer:
             oof_ridge, auc_ridge, test_ridge = self.blend_ridge_interactions(
                 model_names, cal_oof_logits, cal_test_logits, y_true
             )
-            self.logger.info(f"Strategy 3 (Ridge Interaction Stacking): OOF ROC-AUC = {auc_ridge:.5f}")
+            self.logger.info(f"Strategy 3 (Ridge Interaction Stacking) : OOF ROC-AUC = {auc_ridge:.5f}")
         else:
             oof_ridge, auc_ridge, test_ridge = oof_slsqp, auc_slsqp, test_slsqp
 
-        # 7. Selection
+        # 7. Strategy 4: Non-Negative Least Squares (NNLS)
+        oof_nnls, auc_nnls, test_nnls, w_nnls = self.blend_nnls(
+            model_names, oof_list, test_list, y_true
+        )
+        self.logger.info(f"Strategy 4 (Non-Negative Least Squares) : OOF ROC-AUC = {auc_nnls:.5f}")
+        for m, w in w_nnls.items():
+            self.logger.info(f"    - NNLS Weight for {m:<13}: {w:.4f}")
+
+        # 8. Strategy 5: Isotonic Stacking (NNLS + Isotonic PAVA)
+        oof_iso, auc_iso, test_iso = self.blend_isotonic_stacking(
+            model_names, oof_list, test_list, y_true
+        )
+        self.logger.info(f"Strategy 5 (Isotonic Calibrated Stacking): OOF ROC-AUC = {auc_iso:.5f}")
+
+        # 9. Selection
         candidates = {
             "rank": (oof_rank, auc_rank, test_rank),
             "logit": (oof_slsqp, auc_slsqp, test_slsqp),
             "ridge": (oof_ridge, auc_ridge, test_ridge),
+            "nnls": (oof_nnls, auc_nnls, test_nnls),
+            "isotonic": (oof_iso, auc_iso, test_iso),
         }
 
         if chosen_method in candidates:

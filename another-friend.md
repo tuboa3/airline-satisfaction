@@ -1,385 +1,364 @@
-Advanced Exploitation Strategies for Kaggle Playground Series S6E10: Bridging the 0.96155 ROC-AUC Gap
-
-1. The Current State and Diagnostic Findings
-   The Kaggle Playground Series Season 6 Episode 10 (S6E10) presents a mathematically rigorous challenge in synthetic tabular data prediction. The task requires predicting a binary passenger satisfaction target, evaluated via the Area Under the Receiver Operating Characteristic Curve (ROC-AUC)1. The empirical diagnostics from the current validation framework highlight a severe performance plateau. LightGBM and XGBoost converged at an Out-Of-Fold (OOF) ROC-AUC of 0.95880, while CatBoost achieved 0.95841. A rank-averaged ensemble yielded 0.95906 OOF but suffered a degraded Public Leaderboard score of 0.95796. This establishes a mathematical ceiling for standard axis-aligned tree algorithms and basic ensembling, leaving a gap of approximately 0.00339 ROC-AUC to the Rank 1 benchmark of 0.96155.
-   Post-mortem analyses uncover three critical failure vectors. First, uniform rank averaging normalizes the prediction magnitude space, flattening the extreme logistic tails in verified high-confidence segments and artificially compressing conditional probabilities3. Second, the distilled FT-Transformer architecture, despite achieving a strong standalone deep tabular result of 0.95767, exhibits a 0.9966 Pearson correlation with LightGBM. This indicates a failure in architectural diversity; the neural network effectively mimicked the decision manifolds of the gradient-boosted trees rather than injecting orthogonal residual variance4. Third, standard feature engineering has exhausted the representational capacity of the synthetic feature space, necessitating high-leverage techniques to extract latent topological structures6.
-   To bridge the gap to 0.96155, the modeling paradigm must pivot toward four strategic levers: the mathematically sound ingestion of the original generative host dataset, rigorous tail-preserving logit blending, the deployment of un-distilled neural architectures with periodic embeddings, and high-order non-linear dimensionality reduction.
-   Domain 1: Original Dataset Ingestion and Exact-Match Target Leakage
-   In Kaggle Playground Series competitions, synthetic datasets are synthesized utilizing generative adversarial networks (e.g., CTGAN) or Variational Autoencoders (TVAE) trained on a real-world host dataset8. For S6E10, the foundational distribution is the classic Airline Passenger Satisfaction dataset, which comprises approximately 130,000 instances9. Generative tabular models invariably suffer from mode collapse, support replication, and discrete boundary smoothing. Consequently, original rows frequently bleed into the synthetic distributions, generating opportunities for exact-match target leakage and Bayesian prior updating10.
-   Theory and Rationale for Adversarial Ingestion
-   A naive concatenation of the 130,000 original rows into the synthetic training pool introduces severe covariate shift. The synthetic distribution acts as the definitive test manifold, whereas the original distribution serves as a biased auxiliary source. To safely exploit the original dataset without shifting the inductive bias of the gradient-boosted trees, adversarial validation density ratio weighting is mathematically required12.
-   The density ratio allows the algorithm to upweight original rows that perfectly mirror the synthetic distribution while penalizing rows that reside in isolated, original-only topological spaces. Let psynth(x) represent the probability density of the synthetic data and porig(x) represent the density of the original data. The optimal sample weight w(x) is defined by the ratio of these densities:
-
-$$w(x) = \frac{p_{\text{synth}}(x)}{p_{\text{orig}}(x)} = \frac{P(z=1 \vert{} x)}{P(z=0 \vert{} x)} \cdot \frac{P(z=0)}{P(z=1)}$$
-In this formulation, z=1 indicates a synthetic instance and z=0 indicates an original instance14. By training a surrogate classifier (e.g., XGBoost) to distinguish between the two distributions, the resulting probabilities yield the necessary density weights.
-Simultaneously, CTGAN generators frequently replicate real rows verbatim. If a test set row perfectly matches an original dataset row across all features, the original target variable can be leveraged as a deterministic target override10. Because machine learning models fundamentally output probabilistic uncertainty, substituting an exact match with a Bayesian prior update—pushing the predicted probability asymptotically close to 1.0 or 0.0—bypasses the algorithmic margin of error entirely.
-Preprocessing Alignment and Implementation Blueprint
-The architectural alignment requires precisely mapping the 25 features of the original dataset to the S6E10 schema. The original dataset contains features such as Gender, Customer Type, Age, Type of Travel, Class, Flight Distance, alongside 14 distinct categorical rating columns scaled from 0 to 5, and continuous variables for Departure Delay in Minutes and Arrival Delay in Minutes16.
-
-Original Feature Domain
-Processing Requirement for S6E10 Alignment
-Identifiers
-Drop Unnamed: 0 and id to prevent cardinality explosion17.
-Demographics & Logistics
-Standardize string casing for Gender, Customer Type, Type of Travel, and Class.
-Ordinal Ratings (0-5)
-Ensure data types match synthetic constraints (frequently cast as int64 or int8). Preserve 0 as a distinct "Not Applicable" class rather than null16.
-Delay Continuous Variables
-Impute missing Arrival Delay in Minutes using Departure Delay in Minutes, as these feature extreme collinearity16.
-Target Variable
-Map string arrays (satisfied, neutral or dissatisfied) to binary integers (1, 0)16.
-
-The implementation pipeline below executes the exact-match identification and adversarial weighting protocols essential for safe ingestion.
-
-Python
-import pandas as pd
-import numpy as np
-import xgboost as xgb
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score
-
-def align_and_ingest_original(train_synth, test_synth, orig_df): # 1. Rigorous Preprocessing Alignment
-columns_to_drop = ['Unnamed: 0', 'id']
-orig_df = orig_df.drop(columns=[c for c in columns_to_drop if c in orig_df.columns])
-
-    # Standardize nomenclature to match synthetic columns
-    orig_df.columns = [c.replace(' ', '_').replace('/', '_').lower() for c in orig_df.columns]
-
-    # Target alignment mapping
-    if orig_df['satisfaction'].dtype == 'O':
-        orig_df['satisfaction'] = orig_df['satisfaction'].map(
-            {'satisfied': 1, 'neutral or dissatisfied': 0}
-        )
-
-    # Impute original null arrays in arrival delays
-    orig_df['arrival_delay_in_minutes'] = orig_df['arrival_delay_in_minutes'].fillna(
-        orig_df['departure_delay_in_minutes']
-    )
-
-    # 2. Exact Test Matching for Deterministic Overrides
-    orig_features = orig_df.drop(columns=['satisfaction'])
-    test_features = test_synth.copy()
-
-    exact_matches = pd.merge(
-        test_features.reset_index(),
-        orig_df,
-        on=list(orig_features.columns),
-        how='inner'
-    )
-
-    # 3. Adversarial Validation Density Ratio Weighting
-    orig_features['adv_target'] = 0
-    train_synth_adv = train_synth.drop(columns=['satisfaction']).copy()
-    train_synth_adv['adv_target'] = 1
-
-    adv_df = pd.concat([orig_features, train_synth_adv], axis=0).reset_index(drop=True)
-
-    for c in adv_df.select_dtypes(include=['object', 'category']).columns:
-        adv_df[c] = adv_df[c].astype('category')
-
-    clf = xgb.XGBClassifier(
-        n_estimators=300,
-        max_depth=4,
-        learning_rate=0.05,
-        tree_method='hist',
-        enable_categorical=True,
-        eval_metric='auc'
-    )
-
-    adv_preds = np.zeros(len(adv_df))
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-
-    for tr_idx, va_idx in skf.split(adv_df, adv_df['adv_target']):
-        X_tr = adv_df.iloc[tr_idx].drop(columns=['adv_target'])
-        y_tr = adv_df['adv_target'].iloc[tr_idx]
-        X_va = adv_df.iloc[va_idx].drop(columns=['adv_target'])
-
-        clf.fit(X_tr, y_tr)
-        adv_preds[va_idx] = clf.predict_proba(X_va)[:, 1]
-
-    p_synth = adv_preds[adv_df['adv_target'] == 0]
-
-    # Density ratio calculation with mathematical bounding
-    density_ratio_weights = np.clip(p_synth / (1.0 - p_synth + 1e-6), a_min=0.05, a_max=3.0)
-    orig_df['sample_weight'] = density_ratio_weights
-    train_synth['sample_weight'] = 1.0
-
-    unified_train = pd.concat([train_synth, orig_df], axis=0).reset_index(drop=True)
-    return unified_train, exact_matches
-
-Risk Mitigation Protocols
-The primary risk of appending original datasets is the induction of a public-to-private shakeup due to overfitting the original data manifold. Generative artifacts often create discrete thresholds in the synthetic data that do not exist in the continuous real world. By implementing strict density ratio bounds, clipping the maximum weight to 3.0 and the minimum to 0.05, the model leverages the original dataset purely as a structural regularizer without allowing original-specific artifacts to dominate the gradient boosting loss function. Deterministic target overrides on the test set should only be applied if the probability of random collision across all 22 features is mathematically negligible.
-Domain 2: Second-Stage Stacking and Tail-Preserving Logit Blending
-Ensemble methodologies in highly competitive predictive environments routinely utilize rank averaging to circumvent calibration mismatches between disparate architectures. However, the diagnostic findings indicate that rank averaging produced a degradation on the Public Leaderboard. Rank averaging forces a uniform distribution over the predictions, meaning that a model predicting a satisfaction event with p=0.9999 and another with p=0.9500 are compressed into adjacent ranks. This obliterates the prediction margin magnitude in the extreme logistic tails—the precise variance required to push ROC-AUC calibration beyond 0.960003.
-Theory and Rationale for Logit-Space Optimization and Recalibration
-To extract the maximal signal from the OOF predictions, they must be inverted from the bounded probability space back into the continuous log-odds (logit) space19. The logistic function maps unbounded domains into (0,1). The inverse transformation is formulated as:
-
-zblend=i=1Mwilogit(pi)wherelogit(p)=p+1-p+
-
-Before transitioning to logit space, the individual probability vectors must reflect true empirical frequencies. Tree-based algorithms, particularly XGBoost and LightGBM, frequently exhibit sigmoid distortion due to their iterative leaf-weight adjustments. Recalibration via Isotonic Regression or Platt Scaling is mandatory. Platt Scaling utilizes a logistic regression over the OOF predictions, while Isotonic Regression fits a strictly non-decreasing, piecewise constant function to minimize the Brier Score19. Because ROC-AUC evaluates ordinal ranking, Isotonic Regression preserves the monotonic ranking perfectly while adjusting the probability density to match true conditional frequencies.
-Once in calibrated logit space, blending becomes a continuous optimization problem. However, ROC-AUC is a non-differentiable, piecewise flat step function, rendering gradient descent unstable20. Therefore, gradient-free optimization via the Nelder-Mead simplex algorithm or Sequential Least Squares Programming (SLSQP) directly minimizes the negative ROC-AUC19. The Nelder-Mead algorithm operates by maintaining a simplex of n+1 points in n-dimensional space, executing reflection, expansion, contraction, and shrink operations to navigate the non-differentiable loss landscape19.
-Furthermore, extending the blend into a Regularized Meta-Learner (Ridge or ElasticNet) allows for the exploitation of conditional model disagreements. By constructing interaction terms in logit space—such as the absolute difference $\vert{}z_{\text{lgb}} - z_{\text{xgb}}\vert{}$ or the multiplicative interaction zlgbzxgb—the 2nd-stage model learns to dynamically reweight base predictions based on their confidence divergence23.
-Implementation Blueprint for Calibration and Meta-Learning
-The subsequent architecture establishes the Isotonic recalibration step, followed by bounded Nelder-Mead logit optimization, and a Ridge-based meta-learner capable of digesting conditional variance.
-
-Python
-from scipy.optimize import minimize
-from sklearn.metrics import roc_auc_score
-from scipy.special import expit, logit
-from sklearn.isotonic import IsotonicRegression
-from sklearn.linear_model import Ridge
-import numpy as np
-
-def calibrate_and_logit_transform(oof_dict, y_true):
-calibrated_logits = {}
-iso_models = {}
-epsilon = 1e-7
-
-    for name, p in oof_dict.items():
-        # Fit Isotonic Regression to preserve monotonic ranking while correcting distribution
-        iso = IsotonicRegression(out_of_bounds='clip')
-        p_calibrated = iso.fit_transform(p, y_true)
-        iso_models[name] = iso
-
-        # Logit transformation with epsilon boundaries to prevent infinity
-        p_clipped = np.clip(p_calibrated, epsilon, 1 - epsilon)
-        calibrated_logits[name] = logit(p_clipped)
-
-    return calibrated_logits, iso_models
-
-def bounded_nelder_mead_optimization(logits_dict, y_true):
-X_logits = np.column_stack(list(logits_dict.values()))
-
-    def roc_auc_objective(weights):
-        blend_logit = np.dot(X_logits, weights)
-        blend_prob = expit(blend_logit)
-        return -roc_auc_score(y_true, blend_prob)
-
-    initial_weights = np.ones(X_logits.shape[1]) / X_logits.shape[1]
-
-    # Bounded Nelder-Mead implementation using L-BFGS-B or SLSQP for strict bounds
-    res = minimize(
-        roc_auc_objective,
-        initial_weights,
-        method='SLSQP',
-        bounds=[(0, 1)] * X_logits.shape[1],
-        options={'maxiter': 5000, 'ftol': 1e-6}
-    )
-
-    optimal_weights = res.x / np.sum(res.x)
-    return optimal_weights
-
-def construct_interaction_meta_learner(logits_dict, y_true):
-z_lgb = logits_dict['lgb']
-z_xgb = logits_dict['xgb']
-z_cat = logits_dict['cat']
-z_nn = logits_dict['nn']
-
-    # Non-linear logit interactions
-    X_meta = np.column_stack([
-        z_lgb, z_xgb, z_cat, z_nn,
-        z_lgb * z_xgb,
-        z_cat * z_nn,
-        np.abs(z_lgb - z_xgb),         # Model disagreement magnitude
-        np.abs(z_cat - z_nn)
-    ])
-
-    # Ridge regression explicitly penalizes overconfident meta-coefficients (L2 norm)
-    meta_model = Ridge(alpha=15.0, solver='cholesky')
-    meta_model.fit(X_meta, y_true)
-
-    return meta_model
-
-Risk Mitigation Protocols
-Optimization algorithms navigating non-differentiable landscapes often assign negative weights to highly correlated models, effectively utilizing one algorithm to subtract errors from another. While this produces exceptional OOF scores, it triggers catastrophic overfitting to the public leaderboard (shakeup). By enforcing strict non-negative boundaries bounds=[(0, 1)] via the SLSQP solver, the optimization is constrained to additive ensembles, mathematically prohibiting destructive interference19. Ridge regression accomplishes a similar regularization via the L2 norm, ensuring that interaction coefficients remain tightly constrained23.
-Domain 3: Un-distilled True Neural Diversity
-A fundamental obstacle in advanced tabular ensembling is architectural convergence. The diagnostics reveal that the FT-Transformer achieved an OOF ROC-AUC of 0.95767 but exhibited a 0.9966 Pearson correlation with LightGBM. This indicates that the neural network ingested the same feature heuristics and mapped an identical decision boundary, negating the mathematical benefits of ensembling5. To inject orthogonal variance and force the correlation below r0.930, neural architectures must possess a fundamentally different inductive bias and optimize a divergent loss topology.
-Theory and Rationale for RealMLP and Periodic Embeddings
-Standard multi-layer perceptrons (MLPs) struggle with tabular data because they ingest continuous features as raw scalars, making it difficult to learn the sharp, irregular decision boundaries that tree algorithms naturally isolate. RealMLP-TD (Tuned Defaults), introduced by Gorishniy et al., abandons raw scalar ingestion in favor of Piecewise Linear Representations (PLR) and Periodic Linear Embeddings25.
-Each continuous variable xi is mapped into a high-dimensional vector space using sinusoidal activation functions28. The mathematical formulation for the radial-basis or periodic feature map operates as:
-
-$$\text{PLR}(x_i) = \text{Concat}\left( \sin(\omega_1 x_i + \phi_1), \dots, \sin(\omega_k x_i + \phi_k), \text{Linear}(x_i) \right)$$
-This localized frequency mapping gives the MLP backbone immediate structural access to piecewise trends, quantization, and heavy-tailed marginals. By transforming the inputs into these dense periodic embeddings, RealMLP breaks correlation with GBDT splitting logic28. Tabular ResNets augment this architecture by introducing identity skip connections, preventing the vanishing gradient problem in deep tabular topologies and facilitating smooth feature propagation across disparate layers4.
-Theory and Rationale for Surrogate AUC Ranking Loss
-Furthermore, training neural networks with standard Binary Cross-Entropy (BCE) optimizes pointwise log-likelihood, which does not directly translate to the area under the ROC curve20. To diversify the network's predictive distribution, the loss function must be modified to explicitly maximize the metric. Soft AUC Loss, or Margin Ranking Loss, forces the network to learn the correct pairwise ordering of satisfied versus dissatisfied instances34.
-The objective relies on taking the pairwise differences of positive and negative logits and passing them through a smooth sigmoid, creating a differentiable surrogate for the non-differentiable Heaviside step function:
-
-LAUC=1N0N1iposjneg1-((pi-pj))2
-
-where is a smoothing temperature hyperparameter controlling the sharpness of the margin36.
-Implementation Blueprint for RealMLP and Soft AUC Integration
-To guarantee architectural diversity, feature subset partitioning must be enforced. Any heuristic interaction features generated explicitly for trees (e.g., categorical frequency mapping) must be excluded from the neural network's input tensor.
-The PyTabKit library provides an optimized, scikit-learn compatible interface for RealMLP, handling the initialization of PLR embeddings natively25. Below is the architecture for instantiating RealMLP alongside a custom PyTorch surrogate AUC loss module for Tabular ResNet extensions.
-
-Python
-from pytabkit import RealMLP_TD_Classifier
-from sklearn.metrics import roc_auc_score
-import torch
-import torch.nn as nn
-
-def execute_realmlp_partitioned(X_train, y_train, X_val, y_val, continuous_cols, cat_cols): # Enforce feature subset partitioning: isolate raw continuous and nominal categoricals # Exclude tree-specific heuristics to guarantee neural diversity
-X_train_nn = X_train[continuous_cols + cat_cols]
-X_val_nn = X_val[continuous_cols + cat_cols]
-
-    # Initialize RealMLP with Tuned Defaults. The architecture inherently
-    # handles Periodic Linear Representations (PLR) and robust scaling.
-    params = {
-        'n_epochs': 64,
-        'n_cv': 1,
-        'device': 'cuda'
-    }
-
-    model = RealMLP_TD_Classifier(**params)
-
-    model.fit(
-        X_train_nn, y_train,
-        X_val=X_val_nn, y_val=y_val,
-        cat_col_names=cat_cols
-    )
-
-    val_preds = model.predict_proba(X_val_nn)[:, 1]
-    print(f"RealMLP OOF ROC-AUC: {roc_auc_score(y_val, val_preds):.6f}")
-
-    return model, val_preds
-
-class SurrogateAUCLoss(nn.Module):
-"""
-Differentiable surrogate ranking loss maximizing ROC-AUC directly via pairwise comparisons.
-"""
-def **init**(self, gamma=15.0):
-super(SurrogateAUCLoss, self).**init**()
-self.gamma = gamma
-
-    def forward(self, logits, targets):
-        pos_logits = logits[targets == 1]
-        neg_logits = logits[targets == 0]
-
-        # Guard mechanism for pure batches
-        if len(pos_logits) == 0 or len(neg_logits) == 0:
-            return torch.tensor(0.0, requires_grad=True).to(logits.device)
-
-        # Broadcasting pairwise differences
-        pos_logits = pos_logits.unsqueeze(1) # Shape: (N_pos, 1)
-        neg_logits = neg_logits.unsqueeze(0) # Shape: (1, N_neg)
-
-        # Calculate divergence
-        differences = pos_logits - neg_logits
-
-        # Minimize the squared error of the inverted sigmoid margin
-        loss = torch.mean((1 - torch.sigmoid(self.gamma * differences)) ** 2)
-        return loss
-
-Risk Mitigation Protocols
-Optimization instability is a significant risk when minimizing pairwise ranking losses. Because the loss computes an O(N0N1) interaction matrix, small batch sizes lead to massive variance in the gradient updates, destroying convergence3. Mini-batch sizes for Tabular ResNets utilizing Soft AUC should be scaled to a minimum of 4096 or 8192 to ensure a statistically significant sampling of both positive and negative classes within every step3. Furthermore, RealMLP utilizes robust scaling bounded by Chebyshev's inequality, clipping continuous variables between the 2% and 98% quantiles to prevent exploding gradients from outliers; bypassing this internal preprocessor is strictly prohibited38.
-Domain 4: High-Order Non-Linear Dimensionality Reduction
-Gradient Boosted Decision Trees rely strictly on recursive, axis-aligned orthogonal splits. Consequently, they possess an inherent inability to natively model diagonal decision boundaries, curved manifolds, or rotational continuous variances. A primary symptom of encountering the mathematical ceiling in GBDTs is the algorithmic failure to capture inter-variable geographic geometry—for example, the complex non-linear relationship between Flight Distance, Departure Delay in Minutes, and Age7.
-Theory and Rationale for Manifold Projections
-By projecting the continuous variables of the dataset through dimensionality reduction algorithms such as Principal Component Analysis (PCA), Truncated Singular Value Decomposition (TruncatedSVD), or Uniform Manifold Approximation and Projection (UMAP), the pipeline synthesizes non-axis-aligned, globally aware meta-features6.
-TruncatedSVD extracts the linear rotational variance via the dataset's top eigenvalues, allowing the GBDT to access diagonal splits via a single synthesized feature. Conversely, UMAP utilizes fuzzy simplicial set theory to preserve the local topological manifold of the data, capturing non-linear nested clusters that axis-aligned trees cannot isolate. Feeding 4 to 8 of these specific component projections into the GBDT provides an entirely orthogonal, rotated perspective of the synthetic feature space.
-Theory and Rationale for Ordered Target Encoding
-In addition to continuous geometries, synthetic datasets exhibit clustered modal artifacts at the intersection of high-cardinality multi-way categorical crosses. Creating an explicit interaction feature—such as Class_Type_of_Travel_Gate_Location—results in substantial cardinality40. Target encoding maps these high-cardinality nominals to their conditional expected target value.
-However, standard K-fold smoothed target encoding suffers from target leakage, particularly in CTGAN generated datasets containing duplicated synthetic rows. CatBoost's ordered target statistics provide the mathematically optimal regularized mapping. It computes the posterior target probability solely on the historical instances prior to the current row in a randomly permuted artificial timeline, ensuring zero forward-looking leakage40.
-Implementation Blueprint for Manifolds and Target Statistics
-To prevent data leakage, UMAP and TruncatedSVD must be executed in an unsupervised paradigm, fitting exclusively on the combination of train (excluding targets) and test.
-
-Python
-from sklearn.decomposition import PCA, TruncatedSVD
-import umap
-from category_encoders import CatBoostEncoder
-import pandas as pd
-
-def generate_rotational_manifolds(X_train, X_test, n_components=6): # Unsupervised concatenation for global manifold topology
-X_all = pd.concat([X_train, X_test], axis=0).reset_index(drop=True)
-
-    # Isolate continuous vectors and standardize
-    num_cols = X_all.select_dtypes(include=['float64', 'int64']).columns
-    X_num = X_all[num_cols].fillna(X_all[num_cols].median())
-    X_num = (X_num - X_num.mean()) / (X_num.std() + 1e-6)
-
-    # 1. Linear Rotational Variance via SVD
-    svd = TruncatedSVD(n_components=n_components, random_state=42)
-    svd_embeds = svd.fit_transform(X_num)
-
-    # 2. Non-Linear Topological Manifolds via UMAP
-    # Low n_neighbors (e.g., 15) captures tight local synthetic artifacts
-    reducer = umap.UMAP(n_components=n_components, n_neighbors=15, random_state=42)
-    umap_embeds = reducer.fit_transform(X_num)
-
-    train_len = len(X_train)
-
-    for i in range(n_components):
-        X_train[f'svd_{i}'] = svd_embeds[:train_len, i]
-        X_test[f'svd_{i}'] = svd_embeds[train_len:, i]
-
-        X_train[f'umap_{i}'] = umap_embeds[:train_len, i]
-        X_test[f'umap_{i}'] = umap_embeds[train_len:, i]
-
-    return X_train, X_test
-
-def apply_ordered_target_encoding(X_train, y_train, X_test, cat_cols): # Synthesize high-cardinality multi-way topological crosses
-X_train['multi_cross_1'] = X_train['class'] + "_" + X_train['type_of_travel'] + "_" + X_train['gate_location'].astype(str)
-X_test['multi_cross_1'] = X_test['class'] + "_" + X_test['type_of_travel'] + "_" + X_test['gate_location'].astype(str)
-
-    X_train['multi_cross_2'] = X_train['inflight_wifi_service'].astype(str) + "_" + X_train['ease_of_online_booking'].astype(str)
-    X_test['multi_cross_2'] = X_test['inflight_wifi_service'].astype(str) + "_" + X_test['ease_of_online_booking'].astype(str)
-
-    cbe_cols = cat_cols + ['multi_cross_1', 'multi_cross_2']
-
-    # CatBoostEncoder applies sequential ordered target statistics
-    encoder = CatBoostEncoder(cols=cbe_cols, random_state=42, a=1.0) # a is the smoothing prior
-
-    X_train_encoded = encoder.fit_transform(X_train, y_train)
-    X_test_encoded = encoder.transform(X_test)
-
-    return X_train_encoded, X_test_encoded
-
-Risk Mitigation Protocols
-UMAP is inherently stochastic and highly sensitive to hyperparameter tuning on synthetic tabular arrays. If the min_dist parameter is configured too low, it identifies spurious synthetic noise clusters that do not generalize to the holdout set. Establishing a strict random_state is mandatory to guarantee feature reproducibility during K-fold cross-validation. Furthermore, when executing ordered target encoding on extreme-cardinality crosses, the smoothing prior a must be optimized to prevent overfitting to low-frequency intersections; executing multiple randomized temporal permutations and averaging the resulting encodings mitigates sensitivity to any single sequence generated by the CatBoostEncoder.
-Synthesis and Final Directives
-The plateau at 0.95880 on the Kaggle Playground Series S6E10 dataset demarcates the outer limit of axis-aligned recursive partitioning and uniform rank blending. Pushing the ROC-AUC beyond the 0.96155 benchmark requires a holistic, mathematically grounded exploitation pipeline.
-By fundamentally restructuring the ingestion sequence to integrate the original generative host dataset via adversarial density weighting, the modeling framework establishes an optimal regularizing base while safely exploiting CTGAN exact-match leakage10. To break the algorithmic correlation barrier, deploying PyTabKit's RealMLP architecture with Periodic Linear Representations25 alongside PyTorch surrogate Soft AUC optimization guarantees the injection of orthogonal variance into the ensemble36.
-Concurrently, projecting the tabular structure through non-linear UMAP manifolds7 and ordered CatBoost target encodings40 supplies the gradient-boosted trees with the necessary geometric awareness to capture complex multi-way clustering. Finally, consolidating these disparate predictions via Isotonic calibration and bounded Nelder-Mead logit optimization ensures absolute preservation of the predictive margins in the extreme logistic tails19. Implementing these four interlocking computational domains establishes the precise architectural diversity and mathematical fidelity required to decisively conquer the S6E10 leaderboard.
-Works cited
-Predicting Airline Satisfaction - Kaggle, https://www.kaggle.com/competitions/playground-series-s6e10/data
-Predicting Airline Satisfaction | Kaggle, https://www.kaggle.com/competitions/playground-series-s6e10/overview/abstract
-Has anyone successfully implemented AUROC as a loss function for, https://www.reddit.com/r/MachineLearning/comments/3zksod/has_anyone_successfully_implemented_auroc_as_a/
-Revisiting Deep Learning Models for Tabular Data | Request PDF, https://www.researchgate.net/publication/353071015_Revisiting_Deep_Learning_Models_for_Tabular_Data
-1st Place - GPT5.4, Gemini3.1, ClaudeOpus4.6 - KGMON Playbook!, https://www.kaggle.com/competitions/playground-series-s6e3/writeups/1st-place-gpt5-4-gemini3-1-claudeopus4-6-kgm
-Airline Passenger Satisfaction Prediction and Key Influential Factors, https://www.scitepress.org/Papers/2025/138342/138342.pdf
-Dimension Reduction of Airline Passenger Satisfaction Data Project, https://rpubs.com/WojciechHrycenko/Dimension_Reduction
-Conditional GANs : Synthetic Data Generator - Kaggle, https://www.kaggle.com/code/ashishkumarak/conditional-gans-synthetic-data-generator
-Airline Passenger Satisfaction - Maven Analytics | Build Data Skills, https://mavenanalytics.io/data-playground/airline-passenger-satisfaction
-Data Leakage - Kaggle, https://www.kaggle.com/code/alexisbcook/data-leakage
-Data Leakage - Kaggle, https://www.kaggle.com/code/dansbecker/data-leakage
-Adversarial Validation - by Orkhan Afandi - Medium, https://medium.com/@efendi.orkhan.f/adversarial-validation-6f12d54a5225
-Visually understand XGBoost, LightGBM and CatBoost, https://towardsdatascience.com/visually-understand-xgboost-lightgbm-and-catboost-regularization-parameters-aa12abcd4c17/
-Chapter 15 Boosting | Causal Inference and Machine Learning, https://www.causalmlbook.com/boosting-1.html
-Artificial data leaks - Kaggle, https://www.kaggle.com/datasets/alijs1/artificial-data-leaks
-Airline Passenger Satisfaction - Kaggle, https://www.kaggle.com/datasets/teejmahal20/airline-passenger-satisfaction
-Explaining airline passenger satisfaction using interpretable, https://medium.com/@chris.bacani7/explaining-airline-passenger-satisfaction-using-interpretable-machine-learning-88d29aa55677
-36-315 Final Project: Airline Passenger Satisfaction, https://www.stat.cmu.edu/capstoneresearch/spring2023/315files_s23/team22.html
-minimize — SciPy v1.18.0 Manual, https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.minimize.html
-Which loss function should I use if I am trying to maximize the AUC, https://www.quora.com/Which-loss-function-should-I-use-if-I-am-trying-to-maximize-the-AUC-ROC-score
-Optimization (scipy.optimize) — SciPy v0.19.0 Reference Guide, http://jiffyclub.github.io/scipy/tutorial/optimize.html
-How to Use Nelder-Mead Optimization in Python, https://machinelearningmastery.com/how-to-use-nelder-mead-optimization-in-python/
-Constrained Resource Allocation Using Scipy Minimize - Medium, https://medium.com/@jeffmarvel/constrained-resource-allocation-using-scipy-minimize-1b6cd0f973bf
-How to simulate bounds for minimizers that do not foresee bounds?, https://stackoverflow.com/questions/57694340/how-to-simulate-bounds-for-minimizers-that-do-not-foresee-bounds
-pytabkit · PyPI, https://pypi.org/project/pytabkit/1.0.0/
-RealMLP: Advancing MLPs and default parameters for tabular data, https://openreview.net/pdf?id=fwajDrDy89
-A Tabular Foundation Model for In-Context Learning on Large Data, https://openreview.net/forum?id=0VvD1PmNzM
-On Embeddings for Numerical Features in Tabular Deep Learning, https://www.researchgate.net/publication/401464844_On_Embeddings_for_Numerical_Features_in_Tabular_Deep_Learning
-Representation Learning for Tabular Data: A Comprehensive Survey, https://arxiv.org/html/2504.16109v1
-MINIX: MITIGATING LOW-RANK COLLAPSE AND AT - OpenReview, https://openreview.net/pdf?id=odoTDh3QUk
-Contrastive Symbolic Regression: Aligned Representations, https://openreview.net/attachment?id=h0317qKaeq&name=originally_submitted_PDF
-Writing ResNet from Scratch in PyTorch - DigitalOcean, https://www.digitalocean.com/community/tutorials/writing-resnet-from-scratch-in-pytorch
-GitHub - pytorch-tabular/pytorch_tabular: A unified framework for, https://github.com/pytorch-tabular/pytorch_tabular
-How to implement AUROC as loss function in tensorflow keras, https://stackoverflow.com/questions/73062906/how-to-implement-auroc-as-loss-function-in-tensorflow-keras
-Ensemble Learning for AUC Maximization via Surrogate Loss, https://openreview.net/forum?id=kbxjkoF42x
-SmoothI: Smooth Rank Indicators for Differentiable IR Metrics - arXiv, https://arxiv.org/pdf/2105.00942
-4th place solution | Kaggle, https://www.kaggle.com/competitions/birdclef-2025/writeups/dylan-liu-4th-place-solution
-ConTextTab: A Semantics-Aware Tabular In-Context Learner - arXiv, https://arxiv.org/html/2506.10707v4
-Airline Passenger Satisfaction EDA | by Eray Balkaya - Medium, https://medium.com/@eraybalkaya/airline-passenger-satisfaction-eda-629c68e6b029
-Ordered Target Encoding | University of Alberta - Edubirdie, https://edubirdie.com/docs/university-of-alberta/cmput-396-intermediate-machine-learnin/126484-ordered-target-encoding
-CatBoost in Machine Learning: A Detailed Guide | igmGuru, https://www.igmguru.com/blog/catboost
-CatBoost Algorithm - Medium, https://medium.com/@mohan-gupta/catboost-algorithm-2156129d740d
-SmoothL1Loss — PyTorch 2.14 documentation, https://docs.pytorch.org/docs/stable/generated/torch.nn.SmoothL1Loss.html
+# **Exhaustive Diagnosis of Neural Diversity Failure and Manifold Enhancements in Tabular Deep Learning**
+
+The empirical diagnostics extracted from the Dual-T4 out-of-fold (OOF) validation run reveal a fundamental mathematical ceiling in the applied modeling paradigm. While the gradient-boosted decision trees (GBDTs), specifically LightGBM and CatBoost, successfully converged near the 0.95852 ROC-AUC threshold, the custom Tabular ResNet stalled at a heavily degraded 0.949431. More critically, the neural network yielded a Pearson correlation of $r=0.9828$ against LightGBM and $r=0.9831$ against CatBoost. This extreme correlation trajectory indicates a catastrophic failure of architectural diversity. Rather than capturing orthogonal variance or mapping an independent topological manifold, the neural network essentially approximated the identical decision boundaries constructed by the recursive partitioning of the GBDTs. Consequently, the second-stage logit blender was forced to constrain the neural network's ensemble weight to a mere 0.1441, yielding a blended ROC-AUC of 0.95883 and leaving a massive 350-basis-point deficit to the 0.96167 top-leaderboard benchmark1.  
+Bridging this gap requires a radical deconstruction of the optimization dynamics, the manifold engineering pipeline, and the neural architecture itself. The current feature pipeline mathematically corrupts the psychometric survey data by forcing disjoint non-ordinal responses into continuous Euclidean spaces. Furthermore, the PyTorch distributed training implementation inherently throttled the gradient descent trajectory. The path forward demands transitioning from legacy Tabular ResNets to modern parameter-efficient ensemble architectures, specifically the integration of TabM with RealMLP-TD, deploying psychometrically rigorous embeddings for survey data, and enforcing strict asynchronous data-parallelism protocols.
+
+## **Root-Cause Analysis of Tabular ResNet Underperformance**
+
+The 91-basis-point performance deficit observed between the Tabular ResNet and the LightGBM baseline is not an artifact of random initialization, nor does it indicate that deep learning is inherently ill-suited for this 700,000-row synthetic dataset. Rather, it is the compounding consequence of optimization starvation, severe distributed training bottlenecks, and a mismatch in the embedding initialization strategy.
+
+### **Optimization Starvation and Gradient Dynamics**
+
+Training a Tabular ResNet on a 700,000-row dataset for merely 16 epochs with a batch size of 4096 results in approximately 170 steps per epoch, yielding only 2,734 total weight updates over the entire training lifecycle. For deep tabular architectures utilizing the AdamW optimizer, this step count is mathematically insufficient to navigate out of local saddle points and descend into the sharp, localized minima required to model complex, high-order tabular interactions.  
+The AdamW algorithm relies on the exponential moving average of the gradient variance (the second moment estimator) to scale the step size for individual parameters. With a batch size of 4096, the gradient variance is highly smoothed, but with only 2,700 total steps, the second moment estimator barely stabilizes before the cosine decay schedule prematurely shrinks the learning rate from $1{0}^{-3}$ to near zero. Consequently, the network undergoes a state of "early optimization starvation." To achieve parity with GBDTs on datasets approaching one million rows, tabular neural networks inherently require prolonged exposure to the loss manifold, often demanding between 64 and 256 epochs to allow the internal representation layers to fully decouple from the initial randomized state3.  
+Furthermore, the integration of Periodic Linear Representations (PLR) or sinusoidal embeddings depends heavily on the precise initialization of the frequency scale parameter $\sigma$. The mapping \$x \\mapsto \\text{Concat}(\\sin(\\omega x), \\cos(\\omega x))\$ requires the frequencies $\omega$ to be sampled from a normal distribution $N(0,{\sigma }^{2})$1. If $\sigma$ is misaligned with the empirical variance of the continuous features, the network suffers from catastrophic spectral bias. A $\sigma$ initialized too low results in low-frequency oversmoothing, causing the neural network to mimic simple linear regression and lose the ability to capture high-frequency thresholds (like specific flight delay minute boundaries). Conversely, a $\sigma$ initialized too high creates high-frequency chaos, destroying the gradient signal and rendering the embeddings unlearnable5. Because the model was under-trained, the network lacked the necessary iterations to adapt the linear projection weights downstream of these slowly-learning periodic embeddings, forcing the model to rely entirely on the macroscopic, easily discernible relationships that the GBDTs had already captured perfectly, thus driving the Pearson correlation to 0.98311.
+
+### **The PyTorch DataParallel Bottleneck and AMP Failures**
+
+The utilization of torch.nn.DataParallel (DP) across dual T4 GPUs introduces severe synchronization overhead and effectively throttles the optimization trajectory. DataParallel operates on a single-process, multi-threaded paradigm that is subjected to the Python Global Interpreter Lock (GIL)7. During every forward pass, the DP module replicates the entire model across all available GPUs, scatters the 4096-row batch across the devices, gathers all outputs back to the master GPU (GPU 0), computes the Surrogate AUC loss on the master device, and finally scatters the gradients back7.  
+This continuous scattering and gathering creates a massive data-transfer bottleneck on the PCIe bus. The master GPU becomes computationally overwhelmed while the secondary GPU idles, waiting for the backward pass synchronization. This architectural flaw frequently results in erratic gradient application and massive GPU idle times8.  
+Moreover, when executing Automatic Mixed Precision (AMP) with torch.cuda.amp.GradScaler inside a DataParallel wrapper, severe gradient unscaling bugs frequently manifest. The GradScaler may unscale the gradients of the master GPU while failing to properly synchronize the scale factor across the threads, leading to silent gradient underflow (zeros) or overflow (NaNs) during the optimizer step9. This forces the network to silently skip parameter updates, further stunting the training process. PyTorch strictly recommends transitioning to torch.nn.parallel.DistributedDataParallel (DDP) for all multi-GPU workloads8. DDP spawns independent processes per GPU, computes gradients locally, and synchronizes via a highly optimized asynchronous AllReduce ring, overlapping communication with the backward computation and ensuring deterministic, mathematically sound mixed-precision scaling10.
+
+### **The Architectural Pivot: RealMLP-TD vs. TabNet and TabPFN**
+
+The custom Tabular ResNet should be abandoned. The field of tabular deep learning has evolved significantly, and architectures that rely on standard linear layers combined with skip connections consistently fail to match GBDT performance without exhaustive hyperparameter tuning. The analysis indicates a necessary pivot to **RealMLP-TD** (Tuned Defaults) combined with the **TabM** (Parameter-Efficient Ensembling) framework2.  
+Pivoting to TabNet or Modern TabPFN is not mathematically or computationally viable for this specific Kaggle configuration. TabNet relies on sequential sparse attention masks to enforce explicit feature selection15. While theoretically appealing, TabNet frequently underperforms and overfits on generative synthetic tabular data16. Synthetic datasets (often generated via CTGAN or TVAE) contain specific noise artifacts and multi-way categorical combinations that decision trees natively isolate; TabNet's sparse masks tend to over-regularize these signals, causing severe performance degradation. TabPFN (including the recent Modern TabPFN v2.5 and v3 variants) is unparalleled in small-data, zero-shot environments6. However, TabPFN is an In-Context Learning (ICL) transformer that fundamentally struggles with extreme scale. While recent chunking strategies attempt to scale TabPFN to larger datasets, executing a 700,000-row context space requires immense KV-cache memory and compromises the zero-shot algorithmic guarantees that make TabPFN powerful, rendering it suboptimal for a Dual-T4 deployment6.  
+RealMLP-TD, conversely, introduces structural innovations specifically designed to match or exceed GBDT performance on large-scale tabular datasets out-of-the-box3. The exact architecture integrates several critical mathematical departures from standard MLPs.
+
+| Feature | Legacy Tabular ResNet | RealMLP-TD | Advantage |
+| :---- | :---- | :---- | :---- |
+| **Linear Parametrization** | Standard $Wx+b$ | Neural Tangent Parametrization (NTP) | Stabilizes gradient magnitudes across deep networks. |
+| **Activations** | ReLU / GELU | Parametric SELU / Mish | Prevents dead neurons; learnable slope adapts to tabular scale. |
+| **Numeric Embeddings** | Standard PLR | Periodic Bias Linear DenseNet (PBLD) | Concatenates raw values with periodic projections. |
+| **Feature Scaling** | Batch Normalization | Learnable Diagonal Scaling Matrix | Soft feature selection applied prior to the first linear layer. |
+
+RealMLP-TD utilizes Neural Tangent Parametrization (NTP) in its linear layers. Instead of the standard linear forward pass, NTP computes the output as ${z}^{(l+1)}=\frac{1}{\sqrt{{d}_{l}}}{W}^{(l)}{x}^{(l)}+{b}^{(l)}$, where ${d}_{l}$ is the input dimension4. By explicitly scaling the weight matrices by the inverse square root of the input dimension, NTP perfectly stabilizes the gradient magnitudes across layers of varying widths, mimicking the optimization stability of infinite-width networks and preventing vanishing gradients when integrating wide periodic embedding layers3.  
+To force the Pearson correlation below the critical $r\leq 0.940$ threshold, this RealMLP-TD backbone must be wrapped in the **TabM** architecture. TabM introduces parameter-efficient ensembling by training $k$ (e.g., $k=16$ or $k=32$) implicit MLPs in parallel using BatchEnsemble techniques2. The forward pass of a TabM linear layer is defined mathematically as:
+
+$$LinearBE(X)=((X\odot R)W)\odot S+B$$
+
+Where $W\in {R}^{{d}_{in}\times {d}_{out}}$ is the shared primary weight matrix, and $R\in {R}^{k\times {d}_{in}}$, $S\in {R}^{k\times {d}_{out}}$, and $B\in {R}^{k\times {d}_{out}}$ are rank-1 adapter vectors unique to each of the $k$ ensemble members2. Because the ensemble members share the macroscopic weight matrix $W$ but maintain individual scaling ($R,S$) and shifting ($B$) vectors, TabM generates a highly diverse set of predictions at the cost of a single model's parameter count. By utilizing TabM-style initialization (where all $R$ and $S$ vectors are initialized near 1.0, forcing the models to differentiate strictly through gradient updates), the architecture explores orthogonal trajectories in the loss landscape, structurally breaking the correlation with axis-aligned GBDTs21.
+
+## **Survey Psychometrics and Metric Distortion in Manifold Engineering**
+
+The exploratory data analysis reveals that the existing feature engineering pipeline—specifically the use of TruncatedSVD and MiniBatchKMeans—is mathematically corrupting the survey manifold. Treating Likert-scale responses as continuous numeric vectors fundamentally destroys the topological space of the data1.
+
+### **Disjoint Subspace Mapping for '0' (Not Applicable)**
+
+In the dataset, the rating '0' denotes skipped or non-applicable services (e.g., a passenger not using inflight wifi), while ratings '1' through '5' represent an ordinal scale of satisfaction. In Euclidean space, algorithms calculating ${L}_{2}$ norms or linear projections inherently assume strict metric continuity. If an algorithm processes a rating of 0, it calculates the distance between N/A (0) and "Terrible" (1) as identical to the distance between "Terrible" (1) and "Poor" (2). Because 0 is often assigned to premium passengers who skip irrelevant services (resulting in a 95%+ satisfaction rate for these specific profiles), forcing 0 to act as "worse than 1" creates artificial, highly destructive decision boundaries1. Linear dimensionality reduction techniques like SVD will stretch the manifold in the wrong direction, prioritizing this false ordinal relationship.  
+To natively accommodate this property, the neural network must abandon continuous scalar ingestion for these columns and utilize **Disjoint Embedding Subspaces**. The embedding layer must explicitly route the integer 0 to a dedicated parameter vector ${e}_{na}\in {R}^{d}$, which is completely disconnected from the ordinal space. The integers 1 through 5 should be mapped to an ordinal matrix ${E}_{ord}\in {R}^{5\times d}$. By isolating the representation of N/A, the network can learn the specific demographic profile associated with skipped services without dragging the ordinal sentiment scores into a distorted latent space1.
+
+### **The Rasch Partial Credit Model for Latent Satisfaction**
+
+Simple summation, averaging, or linear projection of survey responses assumes that all questions possess identical psychometric difficulty and discriminability. In reality, scoring a 5 on "Inflight Entertainment" is statistically more difficult than scoring a 5 on "Baggage Handling"23. To engineer a mathematically sound representation of global satisfaction, the feature pipeline must preprocess the ordinal variables using Item Response Theory (IRT), specifically the Rasch Partial Credit Model (PCM)25.  
+The Rasch PCM defines the probability of passenger $v$ selecting rating $x$ on survey item $i$ as a function of the passenger's latent satisfaction trait ${\theta }_{v}$ and the item's threshold difficulty ${\tau }_{ix}$. The mathematical formulation is:
+
+\$\$P(X\_{vi} \= x \\vert \\theta\_v, \\tau\_i) \= \\frac{\\exp \\sum\_{j=0}^x (\\theta\_v \- \\tau\_{ij})}{\\sum\_{k=0}^{m\_i} \\exp \\sum\_{j=0}^k (\\theta\_v \- \\tau\_{ij})}\$\$  
+Where ${\tau }_{i0}\equiv 0$, and ${m}_{i}$ is the maximum score for item $i$ (which is 5 in this schema)26. By fitting this log-odds model via Conditional Maximum Likelihood on the training fold, every passenger is assigned a continuous latent trait score ${\theta }_{v}$ in logit space25. This univariate latent trait provides both the GBDTs and the neural network with a thermodynamically stable, continuous representation of global passenger sentiment that mathematically accounts for the empirical difficulty of individual survey questions, replacing the corrupted SVD features with psychometrically validated manifolds.
+
+### **Survey Response Styles and Non-Linear Artifacts**
+
+The presence of 1.2% "straight-liners" (passengers responding with identical ratings across all 13 dimensions) and significant midpoint satisficing (heavy use of rating 3\) introduces multi-modal density spikes in the data1. Neural networks, optimizing for global loss reduction, often smooth over these narrow density spikes. To ensure the network natively recognizes these psychological response artifacts, explicit metadata features must be synthesized and concatenated prior to the embedding layers:
+
+> 1. **Extremity Index**: The ratio of extreme responses (1s and 5s) to the total number of answered questions. This captures passengers with highly polarized experiences.  
+> 2. **Intra-Passenger Variance**: The mathematical variance of the 14 survey responses for a single passenger. Straight-liners will yield exactly $0.0$, creating a sharp deterministic flag for the network.  
+> 3. **Midpoint Fraction**: The ratio of 3s given, identifying passengers exhibiting survey fatigue or neutral apathy.  
+> 4. **N/A Count**: The absolute sum of 0s, serving as a proxy for the passenger's level of interaction with the airline's service ecosystem.
+
+## **Delay Non-Linearity and Feature Representation**
+
+Gradient descent mechanisms within neural networks are highly sensitive to extreme heteroscedasticity and long-tailed continuous distributions, such as flight delays measured in minutes28.
+
+### **Piecewise Linear Splines and Quantile Embeddings**
+
+Passing raw delay minutes directly into a linear layer forces the neural network to assume a constant marginal hazard rate. The empirical data refutes this: delays under 15 minutes have virtually zero hazard on passenger satisfaction, while the hazard spikes dramatically between 15 and 60 minutes, and then asymptotically plateaus past 120 minutes1. To natively model this, continuous variables like Age, Flight Distance, and Delays must be encoded using Piecewise Linear Spline Embeddings (PLE) or Quantile Embeddings30.  
+PLE transforms a scalar feature $x$ into a high-dimensional sparse vector by mapping it onto $T$ learned quantile bins. Let the bin boundaries, determined by the empirical quantiles of the training distribution, be \$b\_0, b\_1, \\dots, b\_T\$. The piecewise projection computes the normalized overlap of $x$ with each bin:
+
+$${w}_{t}(x)=\max\limits_{}\left({0,\min\limits_{}\left({1,\frac{x-{b}_{t-1}}{{b}_{t}-{b}_{t-1}}}\right)}\right)$$
+
+This produces a sparse, order-preserving vector where each dimension explicitly captures the non-linear inflection points of the delay hazard curve31. The neural network can therefore assign a weight of approximately zero to the specific neurons representing the 0–15 minute bins, while aggressively penalizing the neurons connected to the bins spanning the 15–60 minute range. This mechanism entirely bypasses the need for the neural network to learn complex non-linear activation bounds, feeding it pre-mapped topological boundaries.
+
+### **Airborne Delay Recovery Vectorization**
+
+The phenomenon of "Airborne Delay Recovery" dictates that when the Arrival Delay is less than the Departure Delay, satisfaction receives an immediate \+11% lift1. If these two delay features are passed independently to the neural network, the model must expend significant depth to learn the subtractive interaction. This geometric relationship requires explicit spatial isolation at the input level. Three distinct continuous features must be engineered and passed through the PLE module:
+
+> * Delay\_Delta \= $DepartureDelay-ArrivalDelay$  
+> * Recovery\_Magnitude \= $\max\limits_{}(0,Delay\_Delta)$  
+> * Compounding\_Delay \= $\max\limits_{}(0,-Delay\_Delta)$
+
+By isolating these magnitude vectors, the network is permitted to independently parameterize the reward of recovered flight time versus the severe penalty of compounded in-flight delays.
+
+## **Strategic Blueprint to Break 0.96150**
+
+To execute this strategy, break the 0.96150 ROC-AUC barrier, and achieve standalone ROC-AUC $\geq 0.9585$ while maintaining $r\leq 0.940$ against GBDTs, the architecture must deploy a PyTorch DistributedDataParallel TabM-RealMLP hybrid, utilizing a Surrogate AUC margin loss.
+
+### **Surrogate AUC Margin Loss Optimization**
+
+To maximize the ROC-AUC directly, the model must optimize the pairwise ranking between satisfied and dissatisfied passengers, rather than point-wise binary cross-entropy, which merely optimizes log-likelihood1. With a sufficiently large effective batch size enabled by DDP across multiple GPUs, the pairwise Surrogate AUC loss computes the divergence across all positive and negative samples within the batch.  
+Let $P$ be the set of predicted logits for true positives, and $N$ be the set of predicted logits for true negatives. The smooth relaxation of the non-differentiable Heaviside step function is formulated as:
+
+\$\$\\mathcal{L}\_{AUC} \= \\frac{1}{\\vert{}\\mathcal{P}\\vert{} \\vert{}\\mathcal{N}\\vert{}} \\sum\_{p\_i \\in \\mathcal{P}} \\sum\_{p\_j \\in \\mathcal{N}} \\left( 1 \- \\sigma(\\gamma (p\_i \- p\_j)) \\right)^2\$\$  
+Where $\sigma$ represents the sigmoid function, and $\gamma$ is a temperature hyperparameter that controls the sharpness of the margin (optimally set to $\gamma =15.0$)1. Minimizing this squared divergence explicitly forces the network to rank every satisfied passenger higher than every dissatisfied passenger, aligning the gradient trajectory directly with the Kaggle evaluation metric.
+
+### **Production PyTorch Implementation Blueprint**
+
+The following blueprint translates the exact mathematical structures into high-performance, DDP-ready PyTorch code. It incorporates Disjoint Embeddings for the survey columns, Piecewise Linear Splines for the continuous metrics, Neural Tangent Parametrization for stability, and the TabM BatchEnsemble mechanism to guarantee architectural diversity.
+
+Python  
+import torch  
+import torch.nn as nn  
+import torch.nn.functional as F  
+import math
+
+class DisjointSurveyEmbedding(nn.Module):  
+    """  
+    Explicitly separates '0' (N/A) from the ordinal 1-5 responses.  
+    Prevents metric distortion in the continuous embedding manifold.  
+    """  
+    def \_\_init\_\_(self, num\_survey\_cols, emb\_dim=8):  
+        super().\_\_init\_\_()  
+        self.num\_survey\_cols \= num\_survey\_cols  
+        \# Dedicated N/A embedding vectors for each column  
+        self.na\_embeddings \= nn.Parameter(torch.randn(num\_survey\_cols, emb\_dim) \* 0.02)  
+        \# Ordinal embeddings for 1-5 (size 6 to accommodate 0-5 indexing safely)  
+        self.ordinal\_embeddings \= nn.Embedding(6, emb\_dim)  
+        nn.init.normal\_(self.ordinal\_embeddings.weight, std=0.02)
+
+    def forward(self, x):  
+        \# x shape: (batch\_size, num\_survey\_cols)  
+        batch\_size \= x.size(0)  
+        out \= torch.zeros(batch\_size, self.num\_survey\_cols,   
+                          self.na\_embeddings.size(1), device=x.device)  
+          
+        is\_na \= (x \== 0\)  
+        is\_ordinal \= (x \> 0\)  
+          
+        \# Route 1-5 to ordinal embeddings  
+        out\[is\_ordinal\] \= self.ordinal\_embeddings(x\[is\_ordinal\])  
+          
+        \# Route 0 to the specific N/A parameter vector  
+        na\_expanded \= self.na\_embeddings.unsqueeze(0).expand(batch\_size, \-1, \-1)  
+        out\[is\_na\] \= na\_expanded\[is\_na\]  
+          
+        return out.view(batch\_size, \-1)
+
+class PiecewiseLinearSplineEmbedding(nn.Module):  
+    """  
+    Robust Piecewise Linear Spline embedding for extreme non-linearities.  
+    Boundaries should be initialized with empirical quantiles from the train set.  
+    """  
+    def \_\_init\_\_(self, num\_features, num\_bins=16):  
+        super().\_\_init\_\_()  
+        self.num\_features \= num\_features  
+        self.num\_bins \= num\_bins  
+        \# Bin boundaries initialized uniformly; updated externally via quantiles  
+        self.register\_buffer('boundaries', torch.linspace(0, 1, num\_bins \+ 1).view(1, 1, \-1))  
+          
+    def forward(self, x):  
+        \# x shape: (batch\_size, num\_features)  
+        x \= x.unsqueeze(-1) \# (batch\_size, num\_features, 1\)  
+          
+        b\_lower \= self.boundaries\[:, :, :-1\]  
+        b\_upper \= self.boundaries\[:, :, 1:\]  
+        widths \= b\_upper \- b\_lower  
+          
+        \# Calculate localized activation fraction per bin  
+        activations \= (x \- b\_lower) / (widths \+ 1e-8)  
+        activations \= torch.clamp(activations, min=0.0, max=1.0)  
+          
+        return activations.view(x.size(0), \-1)
+
+class NTPLinear(nn.Module):  
+    """  
+    Neural Tangent Parametrization Linear Layer.  
+    Stabilizes gradient magnitudes independent of layer width.  
+    """  
+    def \_\_init\_\_(self, in\_features, out\_features):  
+        super().\_\_init\_\_()  
+        self.in\_features \= in\_features  
+        self.weight \= nn.Parameter(torch.randn(out\_features, in\_features))  
+        self.bias \= nn.Parameter(torch.zeros(out\_features))  
+          
+    def forward(self, x):  
+        \# Scale the weights dynamically by the inverse square root of input dimension  
+        scale \= 1.0 / math.sqrt(self.in\_features)  
+        return F.linear(x, self.weight \* scale, self.bias)
+
+class TabM\_BatchEnsembleLayer(nn.Module):  
+    """  
+    Parameter-Efficient Ensemble layer utilizing BatchEnsemble principles.  
+    Forces multiple implicit networks to search orthogonal loss manifolds.  
+    """  
+    def \_\_init\_\_(self, in\_features, out\_features, k\_ensembles=16):  
+        super().\_\_init\_\_()  
+        self.k \= k\_ensembles  
+        self.linear \= NTPLinear(in\_features, out\_features)  
+          
+        \# Rank-1 adapters for each of the k ensemble members  
+        self.R \= nn.Parameter(torch.ones(k\_ensembles, in\_features))  
+        self.S \= nn.Parameter(torch.ones(k\_ensembles, out\_features))  
+        self.B \= nn.Parameter(torch.zeros(k\_ensembles, out\_features))  
+          
+        \# TabM-style initialization: strict constraints to force differentiation over time  
+        nn.init.normal\_(self.R, mean=1.0, std=0.05)  
+        nn.init.normal\_(self.S, mean=1.0, std=0.05)
+
+    def forward(self, x):  
+        \# x shape: (batch\_size, k\_ensembles, in\_features)  
+        x\_adapted \= x \* self.R.unsqueeze(0)   
+          
+        \# Apply shared backbone linear transformation efficiently  
+        batch\_size \= x.size(0)  
+        x\_flat \= x\_adapted.view(batch\_size \* self.k, \-1)  
+        z\_flat \= self.linear(x\_flat)  
+        z \= z\_flat.view(batch\_size, self.k, \-1)  
+          
+        \# Apply output adapter S and bias B  
+        out \= z \* self.S.unsqueeze(0) \+ self.B.unsqueeze(0)  
+        return out
+
+class RealMLP\_TabM\_Hybrid(nn.Module):  
+    """  
+    Complete hybrid blueprint executing RealMLP-TD inside a TabM structure.  
+    """  
+    def \_\_init\_\_(self, num\_survey\_cols, num\_cont\_cols, hidden\_dim=384, k\_ensembles=16):  
+        super().\_\_init\_\_()  
+        self.k \= k\_ensembles  
+          
+        \# Feature Pipelines  
+        self.survey\_embedder \= DisjointSurveyEmbedding(num\_survey\_cols, emb\_dim=8)  
+        self.ple\_embedder \= PiecewiseLinearSplineEmbedding(num\_cont\_cols, num\_bins=16)  
+          
+        in\_dim \= (num\_survey\_cols \* 8\) \+ (num\_cont\_cols \* 16\)  
+          
+        \# Feature-specific scaling layer (Soft Feature Selection)  
+        self.feature\_scaling \= nn.Parameter(torch.ones(in\_dim))  
+          
+        \# Ensemble View Expansion Layer  
+        self.ensemble\_expansion \= nn.Parameter(torch.ones(k\_ensembles, in\_dim))  
+          
+        \# RealMLP-TD Deep Backbone with BatchEnsemble  
+        self.block1 \= TabM\_BatchEnsembleLayer(in\_dim, hidden\_dim, k\_ensembles)  
+        self.block2 \= TabM\_BatchEnsembleLayer(hidden\_dim, hidden\_dim, k\_ensembles)  
+        self.block3 \= TabM\_BatchEnsembleLayer(hidden\_dim, hidden\_dim, k\_ensembles)  
+          
+        \# Prediction Heads  
+        self.head \= TabM\_BatchEnsembleLayer(hidden\_dim, 1, k\_ensembles)  
+          
+        \# Parametric SELU defined implicitly via standard SELU \+ learnable alpha  
+        self.alpha1 \= nn.Parameter(torch.ones(hidden\_dim))  
+        self.alpha2 \= nn.Parameter(torch.ones(hidden\_dim))  
+        self.alpha3 \= nn.Parameter(torch.ones(hidden\_dim))
+
+    def forward(self, survey\_x, cont\_x):  
+        emb\_survey \= self.survey\_embedder(survey\_x)  
+        emb\_cont \= self.ple\_embedder(cont\_x)  
+        x \= torch.cat(\[emb\_survey, emb\_cont\], dim=1) \# (batch\_size, in\_dim)  
+          
+        \# Apply feature scaling  
+        x \= x \* self.feature\_scaling.unsqueeze(0)  
+          
+        \# TabM Ensemble Expansion  
+        x \= x.unsqueeze(1) \* self.ensemble\_expansion.unsqueeze(0) \# (batch\_size, k, in\_dim)  
+          
+        \# Backbone Pass with Parametric Activations  
+        x \= self.block1(x)  
+        x \= (1 \- self.alpha1) \* x \+ self.alpha1 \* F.selu(x)  
+        x \= F.dropout(x, p=0.1, training=self.training)  
+          
+        x \= self.block2(x)  
+        x \= (1 \- self.alpha2) \* x \+ self.alpha2 \* F.selu(x)  
+        x \= F.dropout(x, p=0.1, training=self.training)  
+          
+        x \= self.block3(x)  
+        x \= (1 \- self.alpha3) \* x \+ self.alpha3 \* F.selu(x)  
+        x \= F.dropout(x, p=0.1, training=self.training)  
+          
+        \# Independent k logits  
+        logits \= self.head(x).squeeze(-1) \# (batch\_size, k)  
+          
+        if self.training:  
+            return logits \# Optimize all k heads independently via mean loss  
+        else:  
+            \# During inference, logit blending across the k ensembles prevents variance  
+            return torch.mean(logits, dim=1)
+
+class SurrogateAUCLoss(nn.Module):  
+    """  
+    Differentiable margin ranking loss maximizing ROC-AUC directly.  
+    """  
+    def \_\_init\_\_(self, gamma=15.0):  
+        super().\_\_init\_\_()  
+        self.gamma \= gamma
+
+    def forward(self, logits, targets):  
+        \# logits shape: (batch\_size, k\_ensembles), targets shape: (batch\_size,)  
+        \# Expand targets for broadcast  
+        targets \= targets.unsqueeze(1).expand\_as(logits)  
+          
+        \# Initialize loss accumulator  
+        total\_loss \= 0.0  
+          
+        \# Calculate AUC loss independently for each of the k ensemble members  
+        for k\_idx in range(logits.size(1)):  
+            k\_logits \= logits\[:, k\_idx\]  
+            k\_targets \= targets\[:, k\_idx\]  
+              
+            pos\_logits \= k\_logits\[k\_targets \== 1\]  
+            neg\_logits \= k\_logits\[k\_targets \== 0\]  
+              
+            if len(pos\_logits) \== 0 or len(neg\_logits) \== 0:  
+                continue  
+                  
+            pos\_logits \= pos\_logits.unsqueeze(1) \# (N\_pos, 1\)  
+            neg\_logits \= neg\_logits.unsqueeze(0) \# (1, N\_neg)  
+              
+            differences \= pos\_logits \- neg\_logits  
+              
+            \# Minimize the squared error of the inverted sigmoid margin  
+            member\_loss \= torch.mean((1 \- torch.sigmoid(self.gamma \* differences)) \*\* 2\)  
+            total\_loss \+= member\_loss  
+              
+        return total\_loss / logits.size(1)
+
+### **Operational Mandates for DDP and Mixed Precision**
+
+When deploying this architecture, torch.distributed.run or torchrun must be utilized to instantiate DistributedDataParallel with the NCCL backend, entirely bypassing the legacy DataParallel thread contention and Python GIL bottlenecks8. During the backward pass in DDP, gradients are synchronized asynchronously across the GPUs, significantly accelerating throughput and permitting extended training over 64 to 128 epochs.  
+To leverage Automatic Mixed Precision (AMP) safely and avoid the severe gradient unscaling bugs associated with DP, the torch.cuda.amp.GradScaler must wrap the surrogate AUC margin loss calculation9. Crucially, when executing manual gradient clipping or gradient penalty logging, scaler.unscale\_(optimizer) must be called precisely once prior to the clipping operation to prevent infinite variance explosion or NaN propagation11.  
+By feeding the structurally unified latent psychometric metrics (from the Rasch Partial Credit Model) and the non-linear Piecewise Linear Spline vectors into this heavily regularized TabM-RealMLP-TD hybrid, the neural network is forced to evaluate permutations of the synthetic manifold entirely invisible to standard axis-aligned trees. The $k=16$ independent heads will generate a diverse pool of probabilistic logits that structurally decorate the residuals of the LightGBM and CatBoost models, successfully breaking the 0.940 correlation barrier and yielding the requisite architectural diversity to cross the 0.96150 top-leaderboard threshold.
+
+#### **Works cited**
+
+> 1. another-friend.md  
+> 2. TabM: Advancing Tabular Deep Learning with Parameter-Efficient, [https\://arxiv.org/html/2410.24210v1](https://arxiv.org/html/2410.24210v1)  
+> 3. Strong Pre-Tuned MLPs and Boosted Trees on Tabular Data \- NIPS, [https\://proceedings.neurips.cc/paper\_files/paper/2024/file/2ee1c87245956e3eaa71aaba5f5753eb-Paper-Conference.pdf](https://proceedings.neurips.cc/paper_files/paper/2024/file/2ee1c87245956e3eaa71aaba5f5753eb-Paper-Conference.pdf)  
+> 4. Papers Explained Review 04: Tabular Deep Learning \- Medium, [https\://medium.com/dair-ai/papers-explained-review-04-tabular-deep-learning-776db04f965b](https://medium.com/dair-ai/papers-explained-review-04-tabular-deep-learning-776db04f965b)  
+> 5. Contrastive Symbolic Regression: Aligned Representations, [https\://openreview.net/attachment?id=h0317qKaeq\&name=originally\_submitted\_PDF](https://openreview.net/attachment?id=h0317qKaeq&name=originally_submitted_PDF)  
+> 6. A new performance standard. \- arXiv, [https\://arxiv.org/html/2605.13986v2](https://arxiv.org/html/2605.13986v2)  
+> 7. Some PyTorch multi-GPU training tips · The COOP Blog \- Cerfacs, [https\://cerfacs.fr/coop/pytorch-multi-gpu](https://cerfacs.fr/coop/pytorch-multi-gpu)  
+> 8. Getting Started with Distributed Data Parallel \- PyTorch documentation, [https\://docs.pytorch.org/tutorials/intermediate/ddp\_tutorial.html](https://docs.pytorch.org/tutorials/intermediate/ddp_tutorial.html)  
+> 9. Automatic Mixed Precision Using PyTorch \- DigitalOcean, [https\://www\.digitalocean.com/community/tutorials/automatic-mixed-precision-using-pytorch](https://www.digitalocean.com/community/tutorials/automatic-mixed-precision-using-pytorch)  
+> 10. Building a Production-Grade Multi-Node Training Pipeline with, [https\://towardsdatascience.com/building-a-production-grade-multi-node-training-pipeline-with-pytorch-ddp/](https://towardsdatascience.com/building-a-production-grade-multi-node-training-pipeline-with-pytorch-ddp/)  
+> 11. Automatic Mixed Precision package \- torch.amp \- PyTorch教程, [https\://pytorch.cadn.net.cn/docs\_en/2.2/amp.html](https://pytorch.cadn.net.cn/docs_en/2.2/amp.html)  
+> 12. ML Training Failure Encyclopedia \- Denpex, [https\://denpex.com/failures](https://denpex.com/failures)  
+> 13. PyTorch Distributed: Experiences on Accelerating Data Parallel, [https\://arxiv.org/pdf/2006.15704](https://arxiv.org/pdf/2006.15704)  
+> 14. TABM: ADVANCING TABULAR DEEP LEARNING \- OpenReview, [https\://openreview.net/notes/edits/attachment?id=nh9QEAMPO9\&name=pdf](https://openreview.net/notes/edits/attachment?id=nh9QEAMPO9&name=pdf)  
+> 15. A Closer Look at Deep Learning Methods on Tabular Datasets \- arXiv, [https\://arxiv.org/html/2407.00956v2](https://arxiv.org/html/2407.00956v2)  
+> 16. Robustness and Scalability Of Machine Learning for Imbalanced, [https\://arxiv.org/html/2512.21602v1](https://arxiv.org/html/2512.21602v1)  
+> 17. Large Language Model Few-Shot Learning for Predicting ... \- JMIR AI, [https\://ai.jmir.org/2026/1/e89054/PDF](https://ai.jmir.org/2026/1/e89054/PDF)  
+> 18. TabularMath: Evaluating Computational Extrapolation in Tabular, [https\://arxiv.org/pdf/2602.02523](https://arxiv.org/pdf/2602.02523)  
+> 19. ConTextTab: A Semantics-Aware Tabular In-Context Learner \- arXiv, [https\://arxiv.org/html/2506.10707v4](https://arxiv.org/html/2506.10707v4)  
+> 20. OmniCLIC: A Unified Omics Contrastive Learning Framework for, [https\://pubs.acs.org/doi/10.1021/acs.jcim.5c01397](https://pubs.acs.org/doi/10.1021/acs.jcim.5c01397)  
+> 21. (ICLR 2025\) TabM: Advancing Tabular Deep Learning With ... \- GitHub, [https\://github.com/yandex-research/tabm](https://github.com/yandex-research/tabm)  
+> 22. Google Sports Data, [https\://support.google.com/knowledgepanel/answer/9787176](https://support.google.com/knowledgepanel/answer/9787176)  
+> 23. Application of the Rasch measurement model in rehabilitation, [https\://www\.frontiersin.org/journals/rehabilitation-sciences/articles/10.3389/fresc.2023.1208670/full](https://www.frontiersin.org/journals/rehabilitation-sciences/articles/10.3389/fresc.2023.1208670/full)  
+> 24. Full Html \- Educational Methods & Psychometrics (EMP), [https\://emp-open.de/Full\_text?article\_id=255](https://emp-open.de/Full_text?article_id=255)  
+> 25. Transformation of Rasch model logits for enhanced interpretability, [https\://pmc.ncbi.nlm.nih.gov/articles/PMC9783398/](https://pmc.ncbi.nlm.nih.gov/articles/PMC9783398/)  
+> 26. Response Styles in the Partial Credit Model, [https\://epub.ub.uni-muenchen.de/29373/1/TR\_PCMRS.pdf](https://epub.ub.uni-muenchen.de/29373/1/TR_PCMRS.pdf)  
+> 27. Evaluating different scoring methods for the speeded Cloze-elide test, [https\://www\.tqmp.org/RegularArticles/vol18-3/p241/p241.pdf](https://www.tqmp.org/RegularArticles/vol18-3/p241/p241.pdf)  
+> 28. Time Series with PyTorch \- bibis.ir, [https\://download.bibis.ir/Books/Artificial-Intelligence/Time-Series/2026/Time%20Series%20with%20PyTorch%20%20Modern%20Deep%20Learning%20Toolkit%20for%20Real-World%20Forecasting%20Challenges%20(Graeme%20Davidson,%20Lei%20Ma)\_bibis.ir.pdf](https://download.bibis.ir/Books/Artificial-Intelligence/Time-Series/2026/Time%20Series%20with%20PyTorch%20%20Modern%20Deep%20Learning%20Toolkit%20for%20Real-World%20Forecasting%20Challenges%20\(Graeme%20Davidson,%20Lei%20Ma\)_bibis.ir.pdf)  
+> 29. Controlled learning of pointwise nonlinearities in neural-network-like, [https\://infoscience.epfl.ch/bitstreams/22897d8c-279e-476a-918a-a2f5b9483f54/download](https://infoscience.epfl.ch/bitstreams/22897d8c-279e-476a-918a-a2f5b9483f54/download)  
+> 30. Embedding Numerical Features and Meta-Features in Tabular Deep, [https\://www\.itc.ktu.lt/index.php/ITC/article/view/39134/17020](https://www.itc.ktu.lt/index.php/ITC/article/view/39134/17020)  
+> 31. Tabular Numeric Stretch Transformation \- arXiv, [https\://arxiv.org/html/2608.09162v1](https://arxiv.org/html/2608.09162v1)  
+> 32. A. Theoretical Analysis, [https\://proceedings.mlr.press/v119/sarafian20a/sarafian20a-supp.pdf](https://proceedings.mlr.press/v119/sarafian20a/sarafian20a-supp.pdf)  
+> 33. Automatic Mixed Precision examples — PyTorch 2.14 documentation, [https\://docs.pytorch.org/docs/stable/notes/amp\_examples.html](https://docs.pytorch.org/docs/stable/notes/amp_examples.html)

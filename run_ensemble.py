@@ -23,8 +23,8 @@ def parse_args():
         "--method",
         type=str,
         default="auto",
-        choices=["auto", "logit", "ridge", "rank"],
-        help="Ensemble strategy: 'auto' (selects highest OOF ROC-AUC), 'logit' (bounded SLSQP logit), 'ridge' (meta-learner), 'rank' (rank-averaging)"
+        choices=["auto", "logit", "ridge", "rank", "nnls", "isotonic"],
+        help="Ensemble strategy: 'auto' (selects highest OOF ROC-AUC), 'logit' (bounded Nelder-Mead/SLSQP logit with Dirichlet prior), 'nnls' (convex non-negative least squares), 'isotonic' (5-fold isotonic stacking), 'ridge' (meta-learner), 'rank' (rank-averaging)"
     )
     parser.add_argument(
         "--data_dir",

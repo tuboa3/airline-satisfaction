@@ -23,6 +23,9 @@ eda_figures/
 eda_outputs/
 models_checkpoints/
 submissions/
+outputs/
+catboost_info/
+scratch/
 *.pkl
 *.joblib
 

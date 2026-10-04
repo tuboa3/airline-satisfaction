@@ -131,15 +131,20 @@ class DatasetIngestion:
         test_abs = os.path.abspath(self.paths.test_path) if self.paths.test_path else ""
         sub_abs = os.path.abspath(self.paths.sample_sub_path) if self.paths.sample_sub_path else ""
 
+        orig_target_abs = os.path.abspath(self.paths.original_path) if self.paths.original_path else ""
+
         for c in candidates:
             c_abs = os.path.abspath(c)
             if c_abs in [train_abs, test_abs, sub_abs]:
                 continue
-            c_base = os.path.basename(c).lower()
-            c_dir = os.path.dirname(c).lower()
-            if "playground-series-s6e10" in c_dir or "competitions" in c_dir:
+            if c_base := os.path.basename(c).lower() in ["sample_submission.csv"]:
                 continue
-            if c_base in ["sample_submission.csv"]:
+            # If explicitly provided by original_path, retain unconditionally
+            if orig_target_abs and (c_abs == orig_target_abs or c_abs.startswith(orig_target_abs)):
+                filtered.append(c)
+                continue
+            c_dir = os.path.dirname(c).lower()
+            if "playground-series-s6e10" in c_dir:
                 continue
             filtered.append(c)
 
@@ -234,8 +239,12 @@ class DatasetIngestion:
             train_synth = self._standardize_columns(train_synth, is_original=False)
             test_synth = self._standardize_columns(test_synth, is_original=False)
 
-            train_synth["is_original"] = 1
-            test_synth["is_original"] = 1
+            train_synth["is_original"] = 0
+            test_synth["is_original"] = 0
+
+            # Drop id from synthetic train data before merging (holds no predictive value)
+            if self.feature_cfg.id_col in train_synth.columns:
+                train_synth = train_synth.drop(columns=[self.feature_cfg.id_col])
 
             orig_df_raw = None
             orig_files = (
@@ -264,7 +273,7 @@ class DatasetIngestion:
                     orig_df = pd.concat(orig_parts, axis=0).reset_index(drop=True)
                     # Deduplicate original rows
                     orig_df = orig_df.drop_duplicates().reset_index(drop=True)
-                    orig_df["is_original"] = 0
+                    orig_df["is_original"] = 1
                     orig_df_raw = orig_df.copy()
 
                     self.logger.info(

@@ -42,11 +42,11 @@ class FeaturePipeline:
         self.mbk_0: MiniBatchKMeans | None = None
         self.mbk_anomaly: MiniBatchKMeans | None = None
 
-        # Domain 4: Rotational SVD Manifolds & Target Encoding
         self.svd: TruncatedSVD | None = None
         self.svd_cols: list[str] = []
         self.svd_mean: np.ndarray | None = None
         self.svd_std: np.ndarray | None = None
+        self.svd_rating_impute: dict[str, float] = {}
         self.target_encoding_maps: dict[str, dict[Any, float]] = {}
         self.global_target_mean: float = 0.5
         self.train_oof_te: dict[str, np.ndarray] = {}
@@ -243,6 +243,14 @@ class FeaturePipeline:
                     svd_data["Arrival Delay in Minutes"] = svd_data["Arrival Delay in Minutes"].fillna(
                         svd_data["Departure Delay in Minutes"]
                     )
+                # Treat survey rating 0 as N/A (replace with answered mean so metric space is not distorted)
+                for rc in self.config.rating_cols:
+                    if rc in svd_data.columns:
+                        pos_vals = svd_data.loc[svd_data[rc] > 0, rc]
+                        mean_val = float(pos_vals.mean()) if len(pos_vals) > 0 else 3.0
+                        self.svd_rating_impute[rc] = mean_val
+                        svd_data[rc] = svd_data[rc].replace(0, mean_val)
+
                 self.svd_mean = svd_data.mean(axis=0).values.astype(np.float32)
                 self.svd_std = (svd_data.std(axis=0) + 1e-6).values.astype(np.float32)
                 X_svd_norm = ((svd_data.values - self.svd_mean) / self.svd_std).astype(np.float32)
@@ -327,8 +335,12 @@ class FeaturePipeline:
             data["has_delay"] = (data["total_delay"] > 0).astype(np.int8)
             data["has_severe_delay"] = (data["total_delay"] > 30).astype(np.int8)
 
-            # Airborne Delay Recovery Delta (+11% satisfaction lift when positive)
-            data["delay_recovery_delta"] = dep_delay - arr_delay
+            # Airborne Delay Recovery & Difference Dynamics (Golden Features from Research)
+            data["Delay_Delta"] = (dep_delay - arr_delay).astype(np.float32)
+            data["arr_minus_dep"] = (arr_delay - dep_delay).astype(np.float32)
+            data["Recovery_Magnitude"] = np.maximum(0.0, dep_delay - arr_delay).astype(np.float32)
+            data["Compounding_Delay"] = np.maximum(0.0, arr_delay - dep_delay).astype(np.float32)
+            data["delay_recovery_delta"] = (dep_delay - arr_delay).astype(np.float32)
             data["worsened_in_air"] = (arr_delay > dep_delay).astype(np.int8)
 
             # Delay Intensity per 100 miles
@@ -443,24 +455,47 @@ class FeaturePipeline:
             )
 
             # -------------------------------------------------------------
-            # 5. PSYCHOMETRICS (RASCH DELIGHT & RESPONSE STYLE)
+            # 5. PSYCHOMETRICS (RASCH DELIGHT, IRT PCM & RESPONSE STYLE FORENSICS)
             # -------------------------------------------------------------
             rasch_score = np.zeros(len(data), dtype=np.float32)
-            for item, difficulty in self.config.rasch_difficulties.items():
-                rasch_score += difficulty * (data[item] >= 4).astype(np.float32)
-            data["rasch_delight_score"] = rasch_score
+            weighted_ratings = np.zeros(len(data), dtype=np.float32)
+            weighted_max = np.zeros(len(data), dtype=np.float32)
 
-            data["midpoint_ratio"] = (
-                (data[self.config.rating_cols] == 3).mean(axis=1).astype(np.float32)
-            )
+            for item, difficulty in self.config.rasch_difficulties.items():
+                if item in data.columns:
+                    rasch_score += difficulty * (data[item] >= 4).astype(np.float32)
+                    w_item = float(1.0 / (1.0 + np.exp(difficulty)))
+                    valid_mask = (data[item] > 0).astype(np.float32)
+                    weighted_ratings += w_item * data[item].astype(np.float32) * valid_mask
+                    weighted_max += w_item * 5.0 * valid_mask
+
+            data["rasch_delight_score"] = rasch_score
+            # Rasch Partial Credit Model (PCM) latent satisfaction trait in logit space
+            p_pcm = (weighted_ratings + 0.5) / (weighted_max + 1.0)
+            data["rasch_pcm_trait"] = np.log(p_pcm / (1.0 - p_pcm)).astype(np.float32)
+
+            # Survey Response Style Forensics (Empirical Behavior Archetypes)
+            rating_matrix = data[self.config.rating_cols]
+            valid_counts = np.maximum(1, (rating_matrix > 0).sum(axis=1))
+
+            # 1. Intra-passenger variance (straight-liners yield exactly 0.0)
+            data["intra_passenger_var"] = rating_matrix.var(axis=1).fillna(0.0).astype(np.float32)
+            data["straight_liner"] = (data["intra_passenger_var"] == 0.0).astype(np.int8)
+
+            # 2. Midpoint satisficing (fraction of 3s given among answered questions)
+            data["midpoint_fraction"] = ((rating_matrix == 3).sum(axis=1) / valid_counts).astype(np.float32)
+            data["midpoint_ratio"] = (rating_matrix == 3).mean(axis=1).astype(np.float32)
+
+            # 3. Extremity index (fraction of 1s and 5s among answered questions)
+            data["extremity_index"] = (
+                ((rating_matrix == 1) | (rating_matrix == 5)).sum(axis=1) / valid_counts
+            ).astype(np.float32)
             data["extremity_ratio"] = (
-                (
-                    (data[self.config.rating_cols] == 1)
-                    | (data[self.config.rating_cols] == 5)
-                )
-                .mean(axis=1)
-                .astype(np.float32)
-            )
+                ((rating_matrix == 1) | (rating_matrix == 5)).mean(axis=1)
+            ).astype(np.float32)
+
+            # 4. N/A count (absolute sum of 0s: proxy for interaction level)
+            data["na_count"] = (rating_matrix == 0).sum(axis=1).astype(np.int8)
 
             # -------------------------------------------------------------
             # 6. SIMPSON'S INVERSION & DEMOGRAPHIC INTERACTIONS
@@ -589,6 +624,11 @@ class FeaturePipeline:
                     svd_data["Arrival Delay in Minutes"] = svd_data["Arrival Delay in Minutes"].fillna(
                         svd_data["Departure Delay in Minutes"]
                     )
+                for rc in self.config.rating_cols:
+                    if rc in svd_data.columns:
+                        impute_val = self.svd_rating_impute.get(rc, 3.0)
+                        svd_data[rc] = svd_data[rc].replace(0, impute_val)
+
                 X_svd_norm = ((svd_data.values - self.svd_mean) / self.svd_std).astype(np.float32)
                 svd_comps = self.svd.transform(X_svd_norm)
                 for i in range(self.config.n_svd_components):

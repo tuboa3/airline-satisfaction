@@ -18,7 +18,7 @@ from sklearn.model_selection import StratifiedKFold
 from src.config import FeatureConfig, PathConfig, TrainConfig
 from src.dataset import DatasetIngestion
 from src.features import FeaturePipeline
-from src.models import get_model
+from src.models import GLMMarginGenerator, get_model
 from src.postprocess import ExactMatchPostprocessor
 from src.utils import detect_hardware, resolve_binary_target, seed_everything, timer
 
@@ -82,8 +82,8 @@ class CrossValidationEngine:
         feature_names = X_train_all.columns.tolist()
         logging.info(f"Engineered Feature Count: {len(feature_names)}")
 
-        # Isolate synthetic indices for leak-proof CV evaluation
-        synth_mask = (unified_train["is_original"] == 1).values
+        # Isolate synthetic indices for leak-proof CV evaluation (0: synthetic, 1: original)
+        synth_mask = (unified_train["is_original"] == 0).values
         synth_indices = np.where(synth_mask)[0]
         orig_indices = np.where(~synth_mask)[0]
         y_synth = y_all[synth_mask]
@@ -113,8 +113,13 @@ class CrossValidationEngine:
         elif "xgb" in model_name_lower or "xgboost" in model_name_lower:
             params = self.train_cfg.xgb_params.copy()
         elif (
+            "realmlp" in model_name_lower
+            or "tabm" in model_name_lower
+            or "hybrid" in model_name_lower
+        ):
+            params = self.train_cfg.tabm_params.copy()
+        elif (
             "resnet" in model_name_lower
-            or "realmlp" in model_name_lower
             or "tabular_resnet" in model_name_lower
             or "nn" in model_name_lower
         ):
@@ -147,6 +152,13 @@ class CrossValidationEngine:
                 teacher_test = np.mean(valid_test, axis=0)
                 logging.info(f"Loaded {len(valid_test)} GBDT teacher models for test consistency.")
 
+        is_tree_model = (
+            "lightgbm" in model_name_lower
+            or "lgb" in model_name_lower
+            or "xgboost" in model_name_lower
+            or "xgb" in model_name_lower
+        )
+
         for fold, (synth_tr_subidx, synth_va_subidx) in enumerate(skf.split(synth_indices, y_synth)):
             logging.info("-" * 50)
             logging.info(f"FOLD {fold + 1} / {self.train_cfg.n_splits}")
@@ -164,6 +176,47 @@ class CrossValidationEngine:
 
             X_va = X_train_all.iloc[val_global_idx]
             y_va = y_all[val_global_idx]
+
+            extra_fit_kwargs = {}
+            margin_va = None
+            margin_te = None
+
+            # Stage 1: GLM Margin Residual Boosting
+            if self.train_cfg.use_glm_margin and is_tree_model:
+                with timer(f"Fold {fold + 1} GLM Margin Generation"):
+                    glm_gen = GLMMarginGenerator(
+                        continuous_cols=self.feature_cfg.numerical_cols,
+                        categorical_cols=self.feature_cfg.categorical_cols,
+                        n_knots=self.train_cfg.glm_params.get("n_knots", 5),
+                        degree=self.train_cfg.glm_params.get("degree", 3),
+                        C=self.train_cfg.glm_params.get("C", 0.1),
+                        random_state=self.train_cfg.random_state,
+                    )
+                    glm_gen.fit(X_tr, y_tr, sample_weight=sw_tr)
+                    margin_tr = glm_gen.predict_margin(X_tr)
+                    margin_va = glm_gen.predict_margin(X_va)
+                    margin_te = glm_gen.predict_margin(X_test)
+
+                    extra_fit_kwargs["base_margin_tr"] = margin_tr
+                    extra_fit_kwargs["base_margin_val"] = margin_va
+
+            # Native Categorical CTR for CatBoost
+            if "cat" in model_name_lower or "cb" in model_name_lower:
+                cat_cols = [
+                    c
+                    for c in [
+                        "Gender",
+                        "Customer Type",
+                        "Type of Travel",
+                        "Class",
+                        "class_x_travel_type",
+                        "gate_x_business",
+                        "multi_cross_1",
+                        "multi_cross_2",
+                    ]
+                    if c in X_tr.columns
+                ]
+                extra_fit_kwargs["cat_features"] = cat_cols
 
             teacher_tr = (
                 teacher_oof[synth_tr_subidx]
@@ -183,9 +236,13 @@ class CrossValidationEngine:
                     teacher_train=teacher_tr,
                     X_test=X_test,
                     teacher_test=teacher_test,
+                    **extra_fit_kwargs,
                 )
 
-            val_preds = model.predict_proba(X_va)
+            if margin_va is not None:
+                val_preds = model.predict_proba(X_va, base_margin=margin_va)
+            else:
+                val_preds = model.predict_proba(X_va)
             oof_preds[synth_va_subidx] = val_preds
 
             fold_auc = roc_auc_score(y_va, val_preds)
@@ -193,7 +250,10 @@ class CrossValidationEngine:
             logging.info(f"--> Fold {fold + 1} ROC-AUC: {fold_auc:.5f}")
 
             # Accumulate test predictions
-            test_preds += model.predict_proba(X_test) / self.train_cfg.n_splits
+            if margin_te is not None:
+                test_preds += model.predict_proba(X_test, base_margin=margin_te) / self.train_cfg.n_splits
+            else:
+                test_preds += model.predict_proba(X_test) / self.train_cfg.n_splits
 
             # Memory garbage collection
             del X_tr, y_tr, sw_tr, X_va, y_va, model
@@ -231,8 +291,10 @@ class CrossValidationEngine:
             "xgb": "xgboost",
             "ft": "ft_transformer",
             "transformer": "ft_transformer",
-            "realmlp": "tabular_resnet",
+            "realmlp": "realmlp",
+            "tabm": "realmlp",
             "resnet": "tabular_resnet",
+            "tabular_resnet": "tabular_resnet",
         }
         canonical_name = canonical_map.get(self.model_name.lower(), self.model_name.lower())
         if canonical_name != self.model_name.lower():
