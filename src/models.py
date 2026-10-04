@@ -277,20 +277,78 @@ class CatBoostModel(BaseModel):
         ]:
             self.params.pop(invalid_key, None)
 
+        # Adapt CTR types for device (GPU vs CPU)
+        # Note: BinarizedTargetMeanValue and Counter are CPU-only;
+        # FloatTargetMeanValue and FeatureFreq are GPU-only.
+        is_gpu = self.params.get("task_type") == "GPU"
+        for ctr_key in ["combinations_ctr", "simple_ctr"]:
+            if ctr_key in self.params:
+                ctrs = self.params[ctr_key]
+                if isinstance(ctrs, str):
+                    ctrs = [ctrs]
+                if isinstance(ctrs, list):
+                    gpu_map = {
+                        "BinarizedTargetMeanValue": "FloatTargetMeanValue",
+                        "Counter": "FeatureFreq",
+                    }
+                    cpu_map = {
+                        "FloatTargetMeanValue": "BinarizedTargetMeanValue",
+                        "FeatureFreq": "Counter",
+                    }
+                    valid_gpu = {"Borders", "Buckets", "FloatTargetMeanValue", "FeatureFreq"}
+                    valid_cpu = {"Borders", "Buckets", "BinarizedTargetMeanValue", "Counter"}
+
+                    adapted = []
+                    for c in ctrs:
+                        c_mapped = gpu_map.get(c, c) if is_gpu else cpu_map.get(c, c)
+                        if (c_mapped in valid_gpu if is_gpu else c_mapped in valid_cpu) and c_mapped not in adapted:
+                            adapted.append(c_mapped)
+                    if adapted:
+                        self.params[ctr_key] = adapted
+                    else:
+                        self.params.pop(ctr_key, None)
+
         self.model = CatBoostClassifier(**self.params)
 
     def fit(self, X_train, y_train, X_val, y_val, sample_weight=None, **kwargs) -> None:
         cat_features = kwargs.get("cat_features", None)
-        self.model.fit(
-            X_train,
-            y_train,
-            sample_weight=sample_weight,
-            eval_set=(X_val, y_val),
-            cat_features=cat_features,
-            early_stopping_rounds=self.early_stopping_rounds,
-            verbose=self.verbose,
-            use_best_model=True,
-        )
+        try:
+            self.model.fit(
+                X_train,
+                y_train,
+                sample_weight=sample_weight,
+                eval_set=(X_val, y_val),
+                cat_features=cat_features,
+                early_stopping_rounds=self.early_stopping_rounds,
+                verbose=self.verbose,
+                use_best_model=True,
+            )
+        except Exception as e:
+            if self.params.get("task_type") == "GPU":
+                logging.warning(
+                    f"CatBoost GPU execution failed ({e}). Re-initializing on multi-core CPU..."
+                )
+                from catboost import CatBoostClassifier
+
+                cpu_params = self.params.copy()
+                cpu_params["task_type"] = "CPU"
+                cpu_params["thread_count"] = -1
+                cpu_params.pop("devices", None)
+                if "combinations_ctr" in cpu_params:
+                    cpu_params["combinations_ctr"] = ["BinarizedTargetMeanValue", "Counter"]
+                self.model = CatBoostClassifier(**cpu_params)
+                self.model.fit(
+                    X_train,
+                    y_train,
+                    sample_weight=sample_weight,
+                    eval_set=(X_val, y_val),
+                    cat_features=cat_features,
+                    early_stopping_rounds=self.early_stopping_rounds,
+                    verbose=self.verbose,
+                    use_best_model=True,
+                )
+            else:
+                raise e
 
     def predict_proba(self, X, **kwargs) -> np.ndarray:
         return self.model.predict_proba(X)[:, 1]
