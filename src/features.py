@@ -111,8 +111,13 @@ class FeaturePipeline:
             else dep_d
         )
         tot_delay = dep_d + arr_d
-        delay_tier = np.select(
-            [tot_delay == 0, tot_delay < 15, tot_delay >= 15], ["0", "1", "2"]
+        delay_tier = pd.Series(
+            np.select(
+                [tot_delay == 0, tot_delay < 15, tot_delay >= 15],
+                [0, 1, 2],
+                default=0,
+            ),
+            index=df.index,
         ).astype(str)
 
         return {
@@ -529,6 +534,7 @@ class FeaturePipeline:
                     data["total_delay"] >= 15,
                 ],
                 [0, 1, 2],
+                default=0,
             ).astype(np.int8)
 
             # -------------------------------------------------------------
