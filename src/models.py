@@ -5,15 +5,17 @@ Model Wrappers: High-Performance LightGBM, CatBoost, and XGBoost with GPU/CPU De
 from __future__ import annotations
 
 import logging
+import math
+import os
 from abc import ABC, abstractmethod
 from typing import Any
 
-import math
 import numpy as np
 
 try:
     import torch
-    import torch.nn as nn
+    from torch import nn
+
     _ModuleBase = nn.Module
 except ImportError:
     torch = None
@@ -67,16 +69,24 @@ class GLMMarginGenerator:
         X_train,
         y_train: np.ndarray,
         sample_weight: np.ndarray | None = None,
-    ) -> "GLMMarginGenerator":
+    ) -> GLMMarginGenerator:
         import pandas as pd
         from sklearn.linear_model import LogisticRegression
-        from sklearn.preprocessing import OneHotEncoder, SplineTransformer, StandardScaler
+        from sklearn.preprocessing import (
+            OneHotEncoder,
+            SplineTransformer,
+            StandardScaler,
+        )
 
         if isinstance(X_train, np.ndarray):
             X_train = pd.DataFrame(X_train)
 
-        self.actual_cont_cols = [c for c in self.continuous_cols if c in X_train.columns]
-        self.actual_cat_cols = [c for c in self.categorical_cols if c in X_train.columns]
+        self.actual_cont_cols = [
+            c for c in self.continuous_cols if c in X_train.columns
+        ]
+        self.actual_cat_cols = [
+            c for c in self.categorical_cols if c in X_train.columns
+        ]
 
         parts = []
         if self.actual_cont_cols:
@@ -119,7 +129,11 @@ class GLMMarginGenerator:
             X = pd.DataFrame(X)
 
         parts = []
-        if self.actual_cont_cols and self.spline is not None and self.scaler is not None:
+        if (
+            self.actual_cont_cols
+            and self.spline is not None
+            and self.scaler is not None
+        ):
             X_cont = X[self.actual_cont_cols].fillna(0).values.astype(np.float32)
             X_cont_scaled = self.scaler.transform(X_cont)
             X_cont_splines = self.spline.transform(X_cont_scaled)
@@ -279,8 +293,15 @@ class CatBoostModel(BaseModel):
             "subsample",
             "tree_method",
             "gamma",
+            "target_border_count",  # invalid for Logloss
+            "TargetBorderCount",  # camelCase variant
         ]:
             self.params.pop(invalid_key, None)
+
+        loss_fn = str(self.params.get("loss_function", "Logloss"))
+        if loss_fn.lower() in ("logloss", "crossentropy", "logloss:bootstrap"):
+            for k in ("target_border_count", "TargetBorderCount"):
+                self.params.pop(k, None)
 
         # Adapt CTR types for device (GPU vs CPU)
         # Note: BinarizedTargetMeanValue and Counter are CPU-only;
@@ -300,13 +321,25 @@ class CatBoostModel(BaseModel):
                         "FloatTargetMeanValue": "BinarizedTargetMeanValue",
                         "FeatureFreq": "Counter",
                     }
-                    valid_gpu = {"Borders", "Buckets", "FloatTargetMeanValue", "FeatureFreq"}
-                    valid_cpu = {"Borders", "Buckets", "BinarizedTargetMeanValue", "Counter"}
+                    valid_gpu = {
+                        "Borders",
+                        "Buckets",
+                        "FloatTargetMeanValue",
+                        "FeatureFreq",
+                    }
+                    valid_cpu = {
+                        "Borders",
+                        "Buckets",
+                        "BinarizedTargetMeanValue",
+                        "Counter",
+                    }
 
                     adapted = []
                     for c in ctrs:
                         c_mapped = gpu_map.get(c, c) if is_gpu else cpu_map.get(c, c)
-                        if (c_mapped in valid_gpu if is_gpu else c_mapped in valid_cpu) and c_mapped not in adapted:
+                        if (
+                            c_mapped in valid_gpu if is_gpu else c_mapped in valid_cpu
+                        ) and c_mapped not in adapted:
                             adapted.append(c_mapped)
                     if adapted:
                         self.params[ctr_key] = adapted
@@ -340,7 +373,10 @@ class CatBoostModel(BaseModel):
                 cpu_params["thread_count"] = -1
                 cpu_params.pop("devices", None)
                 if "combinations_ctr" in cpu_params:
-                    cpu_params["combinations_ctr"] = ["BinarizedTargetMeanValue", "Counter"]
+                    cpu_params["combinations_ctr"] = [
+                        "BinarizedTargetMeanValue",
+                        "Counter",
+                    ]
                 self.model = CatBoostClassifier(**cpu_params)
                 self.model.fit(
                     X_train,
@@ -866,8 +902,12 @@ class PeriodicLinearEmbeddings(_ModuleBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_unsqueezed = x.unsqueeze(-1)
-        angles = 2.0 * np.pi * x_unsqueezed * self.frequencies.unsqueeze(0) + self.phases.unsqueeze(0)
-        periodic = torch.cat([torch.sin(angles), torch.cos(angles), x_unsqueezed], dim=-1)
+        angles = 2.0 * np.pi * x_unsqueezed * self.frequencies.unsqueeze(
+            0
+        ) + self.phases.unsqueeze(0)
+        periodic = torch.cat(
+            [torch.sin(angles), torch.cos(angles), x_unsqueezed], dim=-1
+        )
         return self.proj(periodic)
 
 
@@ -906,7 +946,9 @@ class TabularResNetNet(_ModuleBase):
         super().__init__()
         self.n_num = n_num
         self.plr = (
-            PeriodicLinearEmbeddings(n_num, n_frequencies=n_frequencies, d_embedding=d_embedding)
+            PeriodicLinearEmbeddings(
+                n_num, n_frequencies=n_frequencies, d_embedding=d_embedding
+            )
             if n_num > 0
             else None
         )
@@ -915,7 +957,9 @@ class TabularResNetNet(_ModuleBase):
         )
         total_dim = (n_num + len(cat_cardinalities)) * d_embedding
         self.input_proj = nn.Linear(total_dim, d_block)
-        self.blocks = nn.ModuleList([ResNetBlock(d_block, dropout=dropout) for _ in range(n_blocks)])
+        self.blocks = nn.ModuleList(
+            [ResNetBlock(d_block, dropout=dropout) for _ in range(n_blocks)]
+        )
         self.head_norm = nn.LayerNorm(d_block)
         self.head = nn.Linear(d_block, 1)
 
@@ -964,12 +1008,20 @@ class TabularResNetModel(BaseModel):
             device = torch.device("cpu")
             use_amp = False
 
-        logging.info(f"TabularResNet (PLR) initializing on device: {device} (AMP: {use_amp})")
+        logging.info(
+            f"TabularResNet (PLR) initializing on device: {device} (AMP: {use_amp})"
+        )
 
         # Feature subset partitioning: isolate raw continuous and categoricals
         cat_candidates = [
-            "Gender", "Customer Type", "Type of Travel", "Class",
-            "class_x_travel_type", "gate_x_business", "multi_cross_1", "multi_cross_2",
+            "Gender",
+            "Customer Type",
+            "Type of Travel",
+            "Class",
+            "class_x_travel_type",
+            "gate_x_business",
+            "multi_cross_1",
+            "multi_cross_2",
         ]
         self.cat_cols = [c for c in cat_candidates if c in X_train.columns]
         self.num_cols = [c for c in X_train.columns if c not in self.cat_cols]
@@ -1024,7 +1076,9 @@ class TabularResNetModel(BaseModel):
         ).to(device)
 
         if device.type == "cuda" and torch.cuda.device_count() > 1:
-            logging.info(f"Distributing TabularResNet across {torch.cuda.device_count()} GPUs!")
+            logging.info(
+                f"Distributing TabularResNet across {torch.cuda.device_count()} GPUs!"
+            )
             self.model = nn.DataParallel(self.model)
 
         if sample_weight is not None:
@@ -1044,10 +1098,16 @@ class TabularResNetModel(BaseModel):
 
         n_workers = 2 if device.type == "cuda" else 0
         train_loader = DataLoader(
-            train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=n_workers
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=n_workers,
         )
 
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(), lr=lr, weight_decay=weight_decay
+        )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
         criterion = (
             SurrogateAUCLoss(gamma=self.params.get("gamma", 15.0))
@@ -1055,7 +1115,9 @@ class TabularResNetModel(BaseModel):
             else nn.BCEWithLogitsLoss(reduction="none")
         )
 
-        scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and device.type == "cuda"))
+        scaler = torch.amp.GradScaler(
+            "cuda", enabled=(use_amp and device.type == "cuda")
+        )
 
         best_auc = 0.0
         best_state = None
@@ -1075,13 +1137,19 @@ class TabularResNetModel(BaseModel):
                 b_num, b_cat, b_y = b_num.to(device), b_cat.to(device), b_y.to(device)
                 optimizer.zero_grad()
 
-                with torch.amp.autocast("cuda", enabled=(use_amp and device.type == "cuda")):
+                with torch.amp.autocast(
+                    "cuda", enabled=(use_amp and device.type == "cuda")
+                ):
                     logits = self.model(b_num, b_cat)
                     if loss_type == "surrogate_auc":
                         loss = criterion(logits, b_y)
                     else:
                         loss_raw = criterion(logits, b_y)
-                        loss = torch.mean(loss_raw * b_w) if b_w is not None else torch.mean(loss_raw)
+                        loss = (
+                            torch.mean(loss_raw * b_w)
+                            if b_w is not None
+                            else torch.mean(loss_raw)
+                        )
 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -1096,9 +1164,15 @@ class TabularResNetModel(BaseModel):
             val_chunk = 2048
             with torch.no_grad():
                 for idx in range(0, len(X_val_num), val_chunk):
-                    v_num = torch.tensor(X_val_num[idx : idx + val_chunk], dtype=torch.float32).to(device)
-                    v_cat = torch.tensor(X_val_cat[idx : idx + val_chunk], dtype=torch.long).to(device)
-                    with torch.amp.autocast("cuda", enabled=(use_amp and device.type == "cuda")):
+                    v_num = torch.tensor(
+                        X_val_num[idx : idx + val_chunk], dtype=torch.float32
+                    ).to(device)
+                    v_cat = torch.tensor(
+                        X_val_cat[idx : idx + val_chunk], dtype=torch.long
+                    ).to(device)
+                    with torch.amp.autocast(
+                        "cuda", enabled=(use_amp and device.type == "cuda")
+                    ):
                         logits = self.model(v_num, v_cat)
                     val_probs.append(torch.sigmoid(logits).cpu().numpy())
 
@@ -1107,17 +1181,29 @@ class TabularResNetModel(BaseModel):
 
             if epoch_auc > best_auc:
                 best_auc = epoch_auc
-                m_to_save = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-                best_state = {k: v.cpu().clone() for k, v in m_to_save.state_dict().items()}
+                m_to_save = (
+                    self.model.module
+                    if isinstance(self.model, nn.DataParallel)
+                    else self.model
+                )
+                best_state = {
+                    k: v.cpu().clone() for k, v in m_to_save.state_dict().items()
+                }
 
             logging.info(
                 f"ResNet Epoch [{epoch:02d}/{epochs:02d}] - Train Loss: {train_loss_acc / len(train_loader):.4f} - Val ROC-AUC: {epoch_auc:.5f} (Best: {best_auc:.5f})"
             )
 
         if best_state is not None:
-            m_to_save = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+            m_to_save = (
+                self.model.module
+                if isinstance(self.model, nn.DataParallel)
+                else self.model
+            )
             m_to_save.load_state_dict(best_state)
-            logging.info(f"Loaded Best TabularResNet State (Validation ROC-AUC: {best_auc:.5f})")
+            logging.info(
+                f"Loaded Best TabularResNet State (Validation ROC-AUC: {best_auc:.5f})"
+            )
 
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -1142,8 +1228,12 @@ class TabularResNetModel(BaseModel):
 
         with torch.no_grad():
             for i in range(0, len(X), batch_size):
-                b_num = torch.tensor(X_num[i : i + batch_size], dtype=torch.float32).to(device)
-                b_cat = torch.tensor(X_cat[i : i + batch_size], dtype=torch.long).to(device)
+                b_num = torch.tensor(X_num[i : i + batch_size], dtype=torch.float32).to(
+                    device
+                )
+                b_cat = torch.tensor(X_cat[i : i + batch_size], dtype=torch.long).to(
+                    device
+                )
                 logits = self.model(b_num, b_cat)
                 p = torch.sigmoid(logits).cpu().numpy()
                 probs.append(p)
@@ -1173,10 +1263,14 @@ class DisjointSurveyEmbedding(_ModuleBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size = x.size(0)
         out = torch.zeros(
-            batch_size, self.num_survey_cols, self.emb_dim, device=x.device, dtype=torch.float32
+            batch_size,
+            self.num_survey_cols,
+            self.emb_dim,
+            device=x.device,
+            dtype=torch.float32,
         )
-        is_na = (x == 0)
-        is_ordinal = (x > 0)
+        is_na = x == 0
+        is_ordinal = x > 0
 
         if is_ordinal.any():
             out[is_ordinal] = self.ordinal_embeddings(x[is_ordinal].clamp(0, 5))
@@ -1198,7 +1292,11 @@ class PiecewiseLinearSplineEmbedding(_ModuleBase):
         super().__init__()
         self.num_features = num_features
         self.num_bins = num_bins
-        initial_b = torch.linspace(0.0, 1.0, num_bins + 1).view(1, 1, -1).repeat(1, num_features, 1)
+        initial_b = (
+            torch.linspace(0.0, 1.0, num_bins + 1)
+            .view(1, 1, -1)
+            .repeat(1, num_features, 1)
+        )
         self.register_buffer("boundaries", initial_b)
 
     def set_boundaries(self, quantiles_matrix: np.ndarray) -> None:
@@ -1294,7 +1392,9 @@ class RealMLP_TabM_Hybrid(_ModuleBase):
         self.dropout = dropout
 
         self.survey_embedder = DisjointSurveyEmbedding(num_survey_cols, emb_dim=emb_dim)
-        self.ple_embedder = PiecewiseLinearSplineEmbedding(num_cont_cols, num_bins=num_bins)
+        self.ple_embedder = PiecewiseLinearSplineEmbedding(
+            num_cont_cols, num_bins=num_bins
+        )
 
         in_dim = (num_survey_cols * emb_dim) + (num_cont_cols * num_bins)
 
@@ -1379,9 +1479,7 @@ class DynamicCompositeLoss(_ModuleBase):
         probs = torch.sigmoid(logits)
         pt = targets * probs + (1.0 - targets) * (1.0 - probs)
         focal_weight = (1.0 - pt) ** self.focal_gamma
-        bce_loss = F.binary_cross_entropy_with_logits(
-            logits, targets, reduction="none"
-        )
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
         focal_loss = torch.mean(focal_weight * bce_loss)
 
         # 2. Pairwise AUC Margin Loss across heads
@@ -1437,7 +1535,9 @@ class RealMLPTabMModel(BaseModel):
             device = torch.device("cpu")
             use_amp = False
 
-        logging.info(f"RealMLP-TabM Hybrid initializing on device: {device} (AMP: {use_amp})")
+        logging.info(
+            f"RealMLP-TabM Hybrid initializing on device: {device} (AMP: {use_amp})"
+        )
 
         # 1. Feature Partitioning
         standard_survey_cols = [
@@ -1494,8 +1594,12 @@ class RealMLPTabMModel(BaseModel):
                 if min_v >= 0:
                     X_cont_va_proc[:, c_idx] = np.log1p(X_cont_va_proc[:, c_idx])
 
-        X_survey_tr = np.clip(X_train[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5)
-        X_survey_va = np.clip(X_val[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5)
+        X_survey_tr = np.clip(
+            X_train[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5
+        )
+        X_survey_va = np.clip(
+            X_val[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5
+        )
 
         emb_dim = self.params.get("emb_dim", 8)
         self.model = RealMLP_TabM_Hybrid(
@@ -1511,7 +1615,9 @@ class RealMLPTabMModel(BaseModel):
         self.model = self.model.to(device)
 
         if device.type == "cuda" and torch.cuda.device_count() > 1:
-            logging.info(f"Distributing RealMLP-TabM across {torch.cuda.device_count()} GPUs!")
+            logging.info(
+                f"Distributing RealMLP-TabM across {torch.cuda.device_count()} GPUs!"
+            )
             self.model = nn.DataParallel(self.model)
 
         train_ds = TensorDataset(
@@ -1522,13 +1628,23 @@ class RealMLPTabMModel(BaseModel):
 
         n_workers = 2 if device.type == "cuda" else 0
         train_loader = DataLoader(
-            train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=n_workers
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=n_workers,
         )
 
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(), lr=lr, weight_decay=weight_decay
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epochs, eta_min=1e-5
+        )
         criterion = DynamicCompositeLoss(gamma=gamma)
-        scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and device.type == "cuda"))
+        scaler = torch.amp.GradScaler(
+            "cuda", enabled=(use_amp and device.type == "cuda")
+        )
 
         best_auc = 0.0
         best_state = None
@@ -1552,7 +1668,9 @@ class RealMLPTabMModel(BaseModel):
                 b_y = b_y.to(device)
 
                 optimizer.zero_grad()
-                with torch.amp.autocast("cuda", enabled=(use_amp and device.type == "cuda")):
+                with torch.amp.autocast(
+                    "cuda", enabled=(use_amp and device.type == "cuda")
+                ):
                     logits = self.model(b_survey, b_cont)
                     loss = criterion(logits, b_y, alpha=alpha_t)
 
@@ -1571,9 +1689,15 @@ class RealMLPTabMModel(BaseModel):
             val_chunk = 4096
             with torch.no_grad():
                 for idx in range(0, len(X_survey_va), val_chunk):
-                    v_s = torch.tensor(X_survey_va[idx : idx + val_chunk], dtype=torch.long).to(device)
-                    v_c = torch.tensor(X_cont_va_proc[idx : idx + val_chunk], dtype=torch.float32).to(device)
-                    with torch.amp.autocast("cuda", enabled=(use_amp and device.type == "cuda")):
+                    v_s = torch.tensor(
+                        X_survey_va[idx : idx + val_chunk], dtype=torch.long
+                    ).to(device)
+                    v_c = torch.tensor(
+                        X_cont_va_proc[idx : idx + val_chunk], dtype=torch.float32
+                    ).to(device)
+                    with torch.amp.autocast(
+                        "cuda", enabled=(use_amp and device.type == "cuda")
+                    ):
                         mean_logits = self.model(v_s, v_c)
                     val_probs.append(torch.sigmoid(mean_logits).cpu().numpy())
 
@@ -1582,17 +1706,29 @@ class RealMLPTabMModel(BaseModel):
 
             if epoch_auc > best_auc:
                 best_auc = epoch_auc
-                m_to_save = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-                best_state = {k: v.cpu().clone() for k, v in m_to_save.state_dict().items()}
+                m_to_save = (
+                    self.model.module
+                    if isinstance(self.model, nn.DataParallel)
+                    else self.model
+                )
+                best_state = {
+                    k: v.cpu().clone() for k, v in m_to_save.state_dict().items()
+                }
 
             logging.info(
                 f"RealMLP-TabM Epoch [{epoch:02d}/{epochs:02d}] (alpha: {alpha_t:.2f}) - Train Loss: {train_loss_acc / len(train_loader):.4f} - Val ROC-AUC: {epoch_auc:.5f} (Best: {best_auc:.5f})"
             )
 
         if best_state is not None:
-            m_to_save = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+            m_to_save = (
+                self.model.module
+                if isinstance(self.model, nn.DataParallel)
+                else self.model
+            )
             m_to_save.load_state_dict(best_state)
-            logging.info(f"Loaded Best RealMLP-TabM State (Validation ROC-AUC: {best_auc:.5f})")
+            logging.info(
+                f"Loaded Best RealMLP-TabM State (Validation ROC-AUC: {best_auc:.5f})"
+            )
 
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -1617,8 +1753,12 @@ class RealMLPTabMModel(BaseModel):
 
         with torch.no_grad():
             for i in range(0, len(X), batch_size):
-                b_s = torch.tensor(X_survey[i : i + batch_size], dtype=torch.long).to(device)
-                b_c = torch.tensor(X_cont[i : i + batch_size], dtype=torch.float32).to(device)
+                b_s = torch.tensor(X_survey[i : i + batch_size], dtype=torch.long).to(
+                    device
+                )
+                b_c = torch.tensor(X_cont[i : i + batch_size], dtype=torch.float32).to(
+                    device
+                )
                 mean_logits = self.model(b_s, b_c)
                 p = torch.sigmoid(mean_logits).cpu().numpy()
                 probs.append(p)
@@ -1679,7 +1819,9 @@ class ParallelDCNv2(_ModuleBase):
             deep_dims = [512, 256, 128]
 
         self.survey_embedder = DisjointSurveyEmbedding(num_survey_cols, emb_dim=emb_dim)
-        self.ple_embedder = PiecewiseLinearSplineEmbedding(num_cont_cols, num_bins=num_bins)
+        self.ple_embedder = PiecewiseLinearSplineEmbedding(
+            num_cont_cols, num_bins=num_bins
+        )
 
         d_in = (num_survey_cols * emb_dim) + (num_cont_cols * num_bins)
         rank = max(4, int(d_in * rank_ratio))
@@ -1751,7 +1893,9 @@ class DCNv2Model(BaseModel):
             device = torch.device("cpu")
             use_amp = False
 
-        logging.info(f"Parallel Low-Rank DCN-v2 initializing on device: {device} (AMP: {use_amp})")
+        logging.info(
+            f"Parallel Low-Rank DCN-v2 initializing on device: {device} (AMP: {use_amp})"
+        )
 
         standard_survey_cols = [
             "Inflight wifi service",
@@ -1807,8 +1951,12 @@ class DCNv2Model(BaseModel):
                 if min_v >= 0:
                     X_cont_va_proc[:, c_idx] = np.log1p(X_cont_va_proc[:, c_idx])
 
-        X_survey_tr = np.clip(X_train[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5)
-        X_survey_va = np.clip(X_val[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5)
+        X_survey_tr = np.clip(
+            X_train[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5
+        )
+        X_survey_va = np.clip(
+            X_val[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5
+        )
 
         emb_dim = self.params.get("emb_dim", 8)
         self.model = ParallelDCNv2(
@@ -1825,7 +1973,9 @@ class DCNv2Model(BaseModel):
         self.model = self.model.to(device)
 
         if device.type == "cuda" and torch.cuda.device_count() > 1:
-            logging.info(f"Distributing DCN-v2 across {torch.cuda.device_count()} GPUs!")
+            logging.info(
+                f"Distributing DCN-v2 across {torch.cuda.device_count()} GPUs!"
+            )
             self.model = nn.DataParallel(self.model)
 
         train_ds = TensorDataset(
@@ -1836,13 +1986,23 @@ class DCNv2Model(BaseModel):
 
         n_workers = 2 if device.type == "cuda" else 0
         train_loader = DataLoader(
-            train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=n_workers
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=n_workers,
         )
 
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(), lr=lr, weight_decay=weight_decay
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epochs, eta_min=1e-5
+        )
         criterion = DynamicCompositeLoss(gamma=gamma)
-        scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and device.type == "cuda"))
+        scaler = torch.amp.GradScaler(
+            "cuda", enabled=(use_amp and device.type == "cuda")
+        )
 
         best_auc = 0.0
         best_state = None
@@ -1864,7 +2024,9 @@ class DCNv2Model(BaseModel):
                 b_y = b_y.to(device)
 
                 optimizer.zero_grad()
-                with torch.amp.autocast("cuda", enabled=(use_amp and device.type == "cuda")):
+                with torch.amp.autocast(
+                    "cuda", enabled=(use_amp and device.type == "cuda")
+                ):
                     logits = self.model(b_survey, b_cont)
                     loss = criterion(logits, b_y, alpha=alpha_t)
 
@@ -1883,9 +2045,15 @@ class DCNv2Model(BaseModel):
             val_chunk = 4096
             with torch.no_grad():
                 for idx in range(0, len(X_survey_va), val_chunk):
-                    v_s = torch.tensor(X_survey_va[idx : idx + val_chunk], dtype=torch.long).to(device)
-                    v_c = torch.tensor(X_cont_va_proc[idx : idx + val_chunk], dtype=torch.float32).to(device)
-                    with torch.amp.autocast("cuda", enabled=(use_amp and device.type == "cuda")):
+                    v_s = torch.tensor(
+                        X_survey_va[idx : idx + val_chunk], dtype=torch.long
+                    ).to(device)
+                    v_c = torch.tensor(
+                        X_cont_va_proc[idx : idx + val_chunk], dtype=torch.float32
+                    ).to(device)
+                    with torch.amp.autocast(
+                        "cuda", enabled=(use_amp and device.type == "cuda")
+                    ):
                         logits = self.model(v_s, v_c)
                     val_probs.append(torch.sigmoid(logits).cpu().numpy())
 
@@ -1894,17 +2062,29 @@ class DCNv2Model(BaseModel):
 
             if epoch_auc > best_auc:
                 best_auc = epoch_auc
-                m_to_save = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-                best_state = {k: v.cpu().clone() for k, v in m_to_save.state_dict().items()}
+                m_to_save = (
+                    self.model.module
+                    if isinstance(self.model, nn.DataParallel)
+                    else self.model
+                )
+                best_state = {
+                    k: v.cpu().clone() for k, v in m_to_save.state_dict().items()
+                }
 
             logging.info(
                 f"Parallel DCN-v2 Epoch [{epoch:02d}/{epochs:02d}] (alpha: {alpha_t:.2f}) - Train Loss: {train_loss_acc / len(train_loader):.4f} - Val ROC-AUC: {epoch_auc:.5f} (Best: {best_auc:.5f})"
             )
 
         if best_state is not None:
-            m_to_save = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+            m_to_save = (
+                self.model.module
+                if isinstance(self.model, nn.DataParallel)
+                else self.model
+            )
             m_to_save.load_state_dict(best_state)
-            logging.info(f"Loaded Best DCN-v2 State (Validation ROC-AUC: {best_auc:.5f})")
+            logging.info(
+                f"Loaded Best DCN-v2 State (Validation ROC-AUC: {best_auc:.5f})"
+            )
 
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -1929,8 +2109,12 @@ class DCNv2Model(BaseModel):
 
         with torch.no_grad():
             for i in range(0, len(X), batch_size):
-                b_s = torch.tensor(X_survey[i : i + batch_size], dtype=torch.long).to(device)
-                b_c = torch.tensor(X_cont[i : i + batch_size], dtype=torch.float32).to(device)
+                b_s = torch.tensor(X_survey[i : i + batch_size], dtype=torch.long).to(
+                    device
+                )
+                b_c = torch.tensor(X_cont[i : i + batch_size], dtype=torch.float32).to(
+                    device
+                )
                 logits = self.model(b_s, b_c)
                 p = torch.sigmoid(logits).cpu().numpy()
                 probs.append(p)
@@ -1966,13 +2150,9 @@ def get_model(
         or "nn" in model_name_lower
     ):
         return TabularResNetModel(params=params, device=device)
-    elif (
-        "transformer" in model_name_lower
-        or "ft" in model_name_lower
-    ):
+    elif "transformer" in model_name_lower or "ft" in model_name_lower:
         return FTTransformerModel(params=params, device=device)
     else:
         raise ValueError(
             f"Unknown model name: {model_name}. Choose from 'lightgbm', 'catboost', 'xgboost', 'realmlp', 'tabm', 'dcn_v2', 'resnet', 'transformer'."
         )
-
