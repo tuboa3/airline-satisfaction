@@ -945,6 +945,7 @@ class FeaturePipeline:
 
             # Multi-Way Bayesian Target Encoding (Domain 4 + Extensions)
             if self.target_encoding_maps:
+                te_new = {}
                 for col in self.target_encoding_maps.keys():
                     if col == "Flight Distance":
                         continue
@@ -953,15 +954,19 @@ class FeaturePipeline:
                         and col in self.train_oof_te
                         and len(data) == len(self.train_oof_te[col])
                     ):
-                        data[f"te_{col}"] = self.train_oof_te[col].astype(np.float32)
+                        te_new[f"te_{col}"] = self.train_oof_te[col].astype(np.float32)
                     elif col in self.target_encoding_maps and col in data.columns:
                         m = self.target_encoding_maps[col]
-                        data[f"te_{col}"] = (
+                        te_new[f"te_{col}"] = (
                             data[col]
                             .map(m)
                             .fillna(self.global_target_mean)
                             .astype(np.float32)
                         )
+                if te_new:
+                    data = pd.concat(
+                        [data, pd.DataFrame(te_new, index=data.index)], axis=1
+                    )
 
             # -------------------------------------------------------------
             # 10.8 ORIGINAL DATASET PRIOR FEATURES (Rugved Bane #2 and #3)
