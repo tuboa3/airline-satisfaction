@@ -228,7 +228,6 @@ class TrainConfig:
             "depth": 7,
             "l2_leaf_reg": 3.0,
             "boosting_type": "Plain",
-            "ctr_leaf_reg": 10.0,
             "bagging_temperature": 0.2,
             "random_strength": 1.0,
             "combinations_ctr": ["BinarizedTargetMeanValue", "Counter"],

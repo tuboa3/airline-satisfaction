@@ -571,7 +571,7 @@ class FeaturePipeline:
             data["dep_delay_over_10"] = (dep_delay > 10).astype(np.int8)
             data["delay_diff"] = (arr_delay - dep_delay).astype(np.float32)
             data["route_delay_hazard"] = (
-                arr_delay / np.maximum(10.0, data["Flight Distance"] / 7.5)
+                arr_delay / np.maximum(10.0, np.maximum(0.0, data["Flight Distance"]) / 7.5)
             ).astype(np.float32)
 
             # Airborne Delay Recovery & Difference Dynamics (Golden Features from Research)
@@ -588,7 +588,7 @@ class FeaturePipeline:
 
             # Delay Intensity per 100 miles
             data["delay_intensity"] = data["total_delay"] / np.maximum(
-                1.0, data["Flight Distance"] / 100.0
+                1.0, np.maximum(0.0, data["Flight Distance"]) / 100.0
             )
 
             # The 15-Minute Flatline Law
@@ -762,9 +762,9 @@ class FeaturePipeline:
 
             data["dist_business"] = data["Flight Distance"] * is_business_class
             data["dist_eco"] = data["Flight Distance"] * (1 - is_business_class)
-            data["log_flight_distance"] = np.log1p(data["Flight Distance"]).astype(
-                np.float32
-            )
+            data["log_flight_distance"] = np.log1p(
+                data["Flight Distance"].clip(lower=0)
+            ).astype(np.float32)
             data["age_x_business"] = data["Age"] * is_business_travel
             data["gate_x_business"] = (
                 data["Gate location"].astype(str) + "_" + is_business_travel.astype(str)

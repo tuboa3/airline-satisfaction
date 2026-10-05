@@ -280,10 +280,8 @@ class CatBoostModel(BaseModel):
         # Adapt ctr_leaf_reg to valid CatBoost API parameter if present
         if "ctr_leaf_reg" in self.params:
             self.params.pop("ctr_leaf_reg")
-            if "ctr_target_border_count" not in self.params:
-                self.params["ctr_target_border_count"] = 64
 
-        # Sanitize any accidental foreign hyperparameters (retain valid boosting_type, max_ctr_complexity)
+        # Sanitize any accidental foreign hyperparameters
         for invalid_key in [
             "metric",
             "objective",
@@ -293,14 +291,18 @@ class CatBoostModel(BaseModel):
             "subsample",
             "tree_method",
             "gamma",
-            "target_border_count",  # invalid for Logloss
-            "TargetBorderCount",  # camelCase variant
         ]:
             self.params.pop(invalid_key, None)
 
-        loss_fn = str(self.params.get("loss_function", "Logloss"))
-        if loss_fn.lower() in ("logloss", "crossentropy", "logloss:bootstrap"):
-            for k in ("target_border_count", "TargetBorderCount"):
+        # Enforce Logloss parameter compatibility
+        loss_fn = str(self.params.get("loss_function", "Logloss")).lower()
+        if loss_fn in ("logloss", "crossentropy"):
+            for k in (
+                "target_border_count",
+                "TargetBorderCount",
+                "ctr_target_border_count",
+                "CTRTargetBorderCount",
+            ):
                 self.params.pop(k, None)
 
         # Adapt CTR types for device (GPU vs CPU)
@@ -372,6 +374,8 @@ class CatBoostModel(BaseModel):
                 cpu_params["task_type"] = "CPU"
                 cpu_params["thread_count"] = -1
                 cpu_params.pop("devices", None)
+                for k in ("target_border_count", "TargetBorderCount", "ctr_target_border_count"):
+                    cpu_params.pop(k, None)
                 if "combinations_ctr" in cpu_params:
                     cpu_params["combinations_ctr"] = [
                         "BinarizedTargetMeanValue",
@@ -803,7 +807,8 @@ class FTTransformerModel(BaseModel):
                     vb_logits = self.model(vb_num, vb_cat)
                     val_probs.append(torch.sigmoid(vb_logits).cpu().numpy())
             val_probs = np.concatenate(val_probs, axis=0)
-
+            val_probs = np.nan_to_num(val_probs, nan=0.5, posinf=1.0, neginf=0.0)
+            val_probs = np.clip(val_probs, 0.0, 1.0)
             val_auc = roc_auc_score(y_val, val_probs)
             logging.info(
                 f"Epoch {epoch}/{epochs} | Loss: {running_loss / len(train_loader):.4f} | Val ROC-AUC: {val_auc:.5f}"
@@ -867,7 +872,8 @@ class FTTransformerModel(BaseModel):
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-        return np.concatenate(probs, axis=0)
+        all_p = np.concatenate(probs, axis=0)
+        return np.nan_to_num(all_p, nan=0.5, posinf=1.0, neginf=0.0)
 
 
 class SurrogateAUCLoss(_ModuleBase):
@@ -1177,6 +1183,8 @@ class TabularResNetModel(BaseModel):
                     val_probs.append(torch.sigmoid(logits).cpu().numpy())
 
             val_preds = np.concatenate(val_probs, axis=0)
+            val_preds = np.nan_to_num(val_preds, nan=0.5, posinf=1.0, neginf=0.0)
+            val_preds = np.clip(val_preds, 0.0, 1.0)
             epoch_auc = roc_auc_score(y_val, val_preds)
 
             if epoch_auc > best_auc:
@@ -1241,7 +1249,8 @@ class TabularResNetModel(BaseModel):
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-        return np.concatenate(probs, axis=0)
+        all_p = np.concatenate(probs, axis=0)
+        return np.nan_to_num(all_p, nan=0.5, posinf=1.0, neginf=0.0)
 
 
 class DisjointSurveyEmbedding(_ModuleBase):
@@ -1580,9 +1589,11 @@ class RealMLPTabMModel(BaseModel):
                 min_v = np.nanmin(X_cont_tr_proc[:, c_idx])
                 if min_v >= 0:
                     X_cont_tr_proc[:, c_idx] = np.log1p(X_cont_tr_proc[:, c_idx])
+        X_cont_tr_proc = np.nan_to_num(X_cont_tr_proc, nan=0.0, posinf=0.0, neginf=0.0)
 
         q_steps = np.linspace(0.0, 1.0, num_bins + 1)
         self.quantiles = np.nanquantile(X_cont_tr_proc, q_steps, axis=0).T
+        self.quantiles = np.nan_to_num(self.quantiles, nan=0.0, posinf=0.0, neginf=0.0)
         for row in range(len(self.quantiles)):
             self.quantiles[row] = np.maximum.accumulate(self.quantiles[row])
 
@@ -1593,6 +1604,7 @@ class RealMLPTabMModel(BaseModel):
                 min_v = np.nanmin(X_cont_va_proc[:, c_idx])
                 if min_v >= 0:
                     X_cont_va_proc[:, c_idx] = np.log1p(X_cont_va_proc[:, c_idx])
+        X_cont_va_proc = np.nan_to_num(X_cont_va_proc, nan=0.0, posinf=0.0, neginf=0.0)
 
         X_survey_tr = np.clip(
             X_train[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5
@@ -1702,6 +1714,8 @@ class RealMLPTabMModel(BaseModel):
                     val_probs.append(torch.sigmoid(mean_logits).cpu().numpy())
 
             val_preds = np.concatenate(val_probs, axis=0)
+            val_preds = np.nan_to_num(val_preds, nan=0.5, posinf=1.0, neginf=0.0)
+            val_preds = np.clip(val_preds, 0.0, 1.0)
             epoch_auc = roc_auc_score(y_val, val_preds)
 
             if epoch_auc > best_auc:
@@ -1746,6 +1760,7 @@ class RealMLPTabMModel(BaseModel):
                 min_v = np.nanmin(X_cont[:, c_idx])
                 if min_v >= 0:
                     X_cont[:, c_idx] = np.log1p(X_cont[:, c_idx])
+        X_cont = np.nan_to_num(X_cont, nan=0.0, posinf=0.0, neginf=0.0)
 
         n_gpus = torch.cuda.device_count() if device.type == "cuda" else 1
         batch_size = 4096 * max(1, n_gpus)
@@ -1766,7 +1781,8 @@ class RealMLPTabMModel(BaseModel):
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-        return np.concatenate(probs, axis=0)
+        all_p = np.concatenate(probs, axis=0)
+        return np.nan_to_num(all_p, nan=0.5, posinf=1.0, neginf=0.0)
 
 
 class LowRankCrossLayer(_ModuleBase):
@@ -1785,14 +1801,16 @@ class LowRankCrossLayer(_ModuleBase):
         self.V = nn.Parameter(torch.empty(d_in, rank))
         self.U = nn.Parameter(torch.empty(d_in, rank))
         self.bias = nn.Parameter(torch.zeros(d_in))
+        self.norm = nn.LayerNorm(d_in)
 
-        nn.init.xavier_uniform_(self.V)
-        nn.init.xavier_uniform_(self.U)
+        std = 1.0 / np.sqrt(d_in)
+        nn.init.normal_(self.V, mean=0.0, std=std)
+        nn.init.normal_(self.U, mean=0.0, std=std)
 
     def forward(self, x_0: torch.Tensor, x_l: torch.Tensor) -> torch.Tensor:
         proj = torch.matmul(x_l, self.V)
         proj = torch.matmul(proj, self.U.t()) + self.bias
-        return x_0 * proj + x_l
+        return self.norm(x_0 * proj + x_l)
 
 
 class ParallelDCNv2(_ModuleBase):
@@ -1937,9 +1955,11 @@ class DCNv2Model(BaseModel):
                 min_v = np.nanmin(X_cont_tr_proc[:, c_idx])
                 if min_v >= 0:
                     X_cont_tr_proc[:, c_idx] = np.log1p(X_cont_tr_proc[:, c_idx])
+        X_cont_tr_proc = np.nan_to_num(X_cont_tr_proc, nan=0.0, posinf=0.0, neginf=0.0)
 
         q_steps = np.linspace(0.0, 1.0, num_bins + 1)
         self.quantiles = np.nanquantile(X_cont_tr_proc, q_steps, axis=0).T
+        self.quantiles = np.nan_to_num(self.quantiles, nan=0.0, posinf=0.0, neginf=0.0)
         for row in range(len(self.quantiles)):
             self.quantiles[row] = np.maximum.accumulate(self.quantiles[row])
 
@@ -1950,6 +1970,7 @@ class DCNv2Model(BaseModel):
                 min_v = np.nanmin(X_cont_va_proc[:, c_idx])
                 if min_v >= 0:
                     X_cont_va_proc[:, c_idx] = np.log1p(X_cont_va_proc[:, c_idx])
+        X_cont_va_proc = np.nan_to_num(X_cont_va_proc, nan=0.0, posinf=0.0, neginf=0.0)
 
         X_survey_tr = np.clip(
             X_train[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5
@@ -2058,6 +2079,8 @@ class DCNv2Model(BaseModel):
                     val_probs.append(torch.sigmoid(logits).cpu().numpy())
 
             val_preds = np.concatenate(val_probs, axis=0)
+            val_preds = np.nan_to_num(val_preds, nan=0.5, posinf=1.0, neginf=0.0)
+            val_preds = np.clip(val_preds, 0.0, 1.0)
             epoch_auc = roc_auc_score(y_val, val_preds)
 
             if epoch_auc > best_auc:
@@ -2102,6 +2125,7 @@ class DCNv2Model(BaseModel):
                 min_v = np.nanmin(X_cont[:, c_idx])
                 if min_v >= 0:
                     X_cont[:, c_idx] = np.log1p(X_cont[:, c_idx])
+        X_cont = np.nan_to_num(X_cont, nan=0.0, posinf=0.0, neginf=0.0)
 
         n_gpus = torch.cuda.device_count() if device.type == "cuda" else 1
         batch_size = 4096 * max(1, n_gpus)
@@ -2122,7 +2146,8 @@ class DCNv2Model(BaseModel):
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-        return np.concatenate(probs, axis=0)
+        all_p = np.concatenate(probs, axis=0)
+        return np.nan_to_num(all_p, nan=0.5, posinf=1.0, neginf=0.0)
 
 
 def get_model(
