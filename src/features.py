@@ -3,6 +3,8 @@ Feature Engineering Pipeline: Implements All 10 Empirically Verified Paradigms
 Plus Domain A (Density & Frequency Forensics) and Domain C (Transductive Encodings)
 """
 
+import logging
+
 import numpy as np
 import pandas as pd
 from sklearn.cluster import MiniBatchKMeans
@@ -131,10 +133,22 @@ class FeaturePipeline:
     def _get_multi_crosses(self, df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
         """Generates high-cardinality multi-way topological crosses."""
         cls = df["Class"].astype(str) if "Class" in df.columns else "Unknown"
-        travel = df["Type of Travel"].astype(str) if "Type of Travel" in df.columns else "Unknown"
+        travel = (
+            df["Type of Travel"].astype(str)
+            if "Type of Travel" in df.columns
+            else "Unknown"
+        )
         gate = df["Gate location"].astype(str) if "Gate location" in df.columns else "0"
-        wifi = df["Inflight wifi service"].astype(str) if "Inflight wifi service" in df.columns else "0"
-        booking = df["Ease of Online booking"].astype(str) if "Ease of Online booking" in df.columns else "0"
+        wifi = (
+            df["Inflight wifi service"].astype(str)
+            if "Inflight wifi service" in df.columns
+            else "0"
+        )
+        booking = (
+            df["Ease of Online booking"].astype(str)
+            if "Ease of Online booking" in df.columns
+            else "0"
+        )
 
         mc1 = cls + "_" + travel + "_" + gate
         mc2 = wifi + "_" + booking
@@ -228,9 +242,13 @@ class FeaturePipeline:
                     else None
                 )
 
-                if y_train is not None and (y_train == 1).sum() > 0 and (y_train == 0).sum() > 0:
-                    pos_mask = (y_train == 1)
-                    neg_mask = (y_train == 0)
+                if (
+                    y_train is not None
+                    and (y_train == 1).sum() > 0
+                    and (y_train == 0).sum() > 0
+                ):
+                    pos_mask = y_train == 1
+                    neg_mask = y_train == 0
                     # Positive and negative global centroids
                     self.global_centroid_1 = X_train_scaled[pos_mask].mean(axis=0)
                     self.global_centroid_0 = X_train_scaled[neg_mask].mean(axis=0)
@@ -316,19 +334,25 @@ class FeaturePipeline:
                 le = LabelEncoder()
                 le.fit(col_data_map[col])
                 self.label_encoders[col] = le
-                self.label_encoder_dicts[col] = {val: idx for idx, val in enumerate(le.classes_)}
+                self.label_encoder_dicts[col] = {
+                    val: idx for idx, val in enumerate(le.classes_)
+                }
 
             # 5. Linear Rotational Variance via TruncatedSVD (Domain 4)
             if self.config.enable_svd_manifolds:
                 self.svd_cols = [
-                    c for c in (self.config.numerical_cols + self.config.rating_cols)
+                    c
+                    for c in (self.config.numerical_cols + self.config.rating_cols)
                     if c in full_df.columns
                 ]
                 svd_data = full_df[self.svd_cols].copy()
-                if "Arrival Delay in Minutes" in svd_data.columns and "Departure Delay in Minutes" in svd_data.columns:
-                    svd_data["Arrival Delay in Minutes"] = svd_data["Arrival Delay in Minutes"].fillna(
-                        svd_data["Departure Delay in Minutes"]
-                    )
+                if (
+                    "Arrival Delay in Minutes" in svd_data.columns
+                    and "Departure Delay in Minutes" in svd_data.columns
+                ):
+                    svd_data["Arrival Delay in Minutes"] = svd_data[
+                        "Arrival Delay in Minutes"
+                    ].fillna(svd_data["Departure Delay in Minutes"])
                 # Treat survey rating 0 as N/A (replace with answered mean so metric space is not distorted)
                 for rc in self.config.rating_cols:
                     if rc in svd_data.columns:
@@ -339,7 +363,9 @@ class FeaturePipeline:
 
                 self.svd_mean = svd_data.mean(axis=0).values.astype(np.float32)
                 self.svd_std = (svd_data.std(axis=0) + 1e-6).values.astype(np.float32)
-                X_svd_norm = ((svd_data.values - self.svd_mean) / self.svd_std).astype(np.float32)
+                X_svd_norm = ((svd_data.values - self.svd_mean) / self.svd_std).astype(
+                    np.float32
+                )
 
                 self.svd = TruncatedSVD(
                     n_components=self.config.n_svd_components, random_state=42
@@ -348,21 +374,34 @@ class FeaturePipeline:
 
             # 6. Multi-Way Bayesian Target Encoding with Leak-Free OOF (Domain 4)
             if self.config.target_col in train_df.columns:
-                y_train_num = resolve_binary_target(train_df[self.config.target_col]).astype(np.float32)
+                y_train_num = resolve_binary_target(
+                    train_df[self.config.target_col]
+                ).astype(np.float32)
                 self.global_target_mean = float(y_train_num.mean())
                 smooth_prior = 10.0
 
                 # Build train temporary series for target encoding
-                temp_is_bus_tr = (train_df["Type of Travel"] == "Business travel").astype(np.int8)
+                temp_is_bus_tr = (
+                    train_df["Type of Travel"] == "Business travel"
+                ).astype(np.int8)
                 tr_cols_data = {
-                    "class_x_travel_type": train_df["Class"].astype(str) + "_" + train_df["Type of Travel"].astype(str),
-                    "gate_x_business": train_df["Gate location"].astype(str) + "_" + temp_is_bus_tr.astype(str),
+                    "class_x_travel_type": train_df["Class"].astype(str)
+                    + "_"
+                    + train_df["Type of Travel"].astype(str),
+                    "gate_x_business": train_df["Gate location"].astype(str)
+                    + "_"
+                    + temp_is_bus_tr.astype(str),
                 }
                 mc1_tr, mc2_tr = self._get_multi_crosses(train_df)
                 tr_cols_data["multi_cross_1"] = mc1_tr.astype(str)
                 tr_cols_data["multi_cross_2"] = mc2_tr.astype(str)
 
-                te_target_cols = ["multi_cross_1", "multi_cross_2", "class_x_travel_type", "gate_x_business"]
+                te_target_cols = [
+                    "multi_cross_1",
+                    "multi_cross_2",
+                    "class_x_travel_type",
+                    "gate_x_business",
+                ]
 
                 # Add bounded crosses to target encoding
                 if self.config.enable_bounded_crosses:
@@ -387,7 +426,9 @@ class FeaturePipeline:
                     self.target_encoding_maps[col] = smoothed_map
 
                     # Out-of-fold target encoding for train data
-                    oof_te = np.full(len(train_df), self.global_target_mean, dtype=np.float32)
+                    oof_te = np.full(
+                        len(train_df), self.global_target_mean, dtype=np.float32
+                    )
                     for tr_idx, val_idx in kf.split(train_df):
                         s_tr, y_tr = s.iloc[tr_idx], y_train_num[tr_idx]
                         s_va = s.iloc[val_idx]
@@ -397,11 +438,16 @@ class FeaturePipeline:
                             (sum_tr + smooth_prior * self.global_target_mean)
                             / (c_tr + smooth_prior)
                         ).to_dict()
-                        oof_te[val_idx] = s_va.map(map_tr).fillna(self.global_target_mean).values
+                        oof_te[val_idx] = (
+                            s_va.map(map_tr).fillna(self.global_target_mean).values
+                        )
                     self.train_oof_te[col] = oof_te
 
                 # Route Profiles: Flight Distance target encoding & aggregations (Rugved Bane #1 feature)
-                if self.config.enable_route_profiles and "Flight Distance" in train_df.columns:
+                if (
+                    self.config.enable_route_profiles
+                    and "Flight Distance" in train_df.columns
+                ):
                     dist_s = train_df["Flight Distance"]
                     c_dist = dist_s.value_counts()
                     sum_dist = pd.Series(y_train_num).groupby(dist_s.values).sum()
@@ -411,7 +457,9 @@ class FeaturePipeline:
                         / (c_dist + smooth_prior_dist)
                     ).to_dict()
 
-                    oof_dist_te = np.full(len(train_df), self.global_target_mean, dtype=np.float32)
+                    oof_dist_te = np.full(
+                        len(train_df), self.global_target_mean, dtype=np.float32
+                    )
                     for tr_idx, val_idx in kf.split(train_df):
                         d_tr, y_tr = dist_s.iloc[tr_idx], y_train_num[tr_idx]
                         d_va = dist_s.iloc[val_idx]
@@ -421,16 +469,22 @@ class FeaturePipeline:
                             (sd_tr + smooth_prior_dist * self.global_target_mean)
                             / (cd_tr + smooth_prior_dist)
                         ).to_dict()
-                        oof_dist_te[val_idx] = d_va.map(map_dist_tr).fillna(self.global_target_mean).values
+                        oof_dist_te[val_idx] = (
+                            d_va.map(map_dist_tr).fillna(self.global_target_mean).values
+                        )
                     self.train_oof_te["Flight Distance"] = oof_dist_te
 
-                    self.freq_flight_distance_map = (dist_s.value_counts() / len(train_df)).to_dict()
+                    self.freq_flight_distance_map = (
+                        dist_s.value_counts() / len(train_df)
+                    ).to_dict()
                     self.count_flight_distance_map = dist_s.value_counts().to_dict()
                     arr_del_s = train_df["Arrival Delay in Minutes"].fillna(
                         train_df["Departure Delay in Minutes"]
                     )
                     self.route_mean_arr_map = arr_del_s.groupby(dist_s).mean().to_dict()
-                    self.route_std_arr_map = arr_del_s.groupby(dist_s).std().fillna(0.0).to_dict()
+                    self.route_std_arr_map = (
+                        arr_del_s.groupby(dist_s).std().fillna(0.0).to_dict()
+                    )
 
             # 7. Original Dataset Prior Model (Rugved Bane #2 and #3 features)
             if (
@@ -443,7 +497,12 @@ class FeaturePipeline:
                     from sklearn.ensemble import HistGradientBoostingClassifier
 
                     prior_cols = [
-                        c for c in (self.config.categorical_cols + self.config.numerical_cols + self.config.rating_cols)
+                        c
+                        for c in (
+                            self.config.categorical_cols
+                            + self.config.numerical_cols
+                            + self.config.rating_cols
+                        )
                         if c in orig_df.columns and c in train_df.columns
                     ]
                     X_orig_prior = orig_df[prior_cols].copy()
@@ -454,10 +513,12 @@ class FeaturePipeline:
                         "Arrival Delay in Minutes" in X_orig_prior.columns
                         and "Departure Delay in Minutes" in X_orig_prior.columns
                     ):
-                        X_orig_prior["Arrival Delay in Minutes"] = X_orig_prior["Arrival Delay in Minutes"].fillna(
-                            X_orig_prior["Departure Delay in Minutes"]
-                        )
-                    y_orig_prior = resolve_binary_target(orig_df[self.config.target_col])
+                        X_orig_prior["Arrival Delay in Minutes"] = X_orig_prior[
+                            "Arrival Delay in Minutes"
+                        ].fillna(X_orig_prior["Departure Delay in Minutes"])
+                    y_orig_prior = resolve_binary_target(
+                        orig_df[self.config.target_col]
+                    )
 
                     self.orig_prior_cols = prior_cols
                     self.orig_prior_model = HistGradientBoostingClassifier(
@@ -516,8 +577,12 @@ class FeaturePipeline:
             # Airborne Delay Recovery & Difference Dynamics (Golden Features from Research)
             data["Delay_Delta"] = (dep_delay - arr_delay).astype(np.float32)
             data["arr_minus_dep"] = (arr_delay - dep_delay).astype(np.float32)
-            data["Recovery_Magnitude"] = np.maximum(0.0, dep_delay - arr_delay).astype(np.float32)
-            data["Compounding_Delay"] = np.maximum(0.0, arr_delay - dep_delay).astype(np.float32)
+            data["Recovery_Magnitude"] = np.maximum(0.0, dep_delay - arr_delay).astype(
+                np.float32
+            )
+            data["Compounding_Delay"] = np.maximum(0.0, arr_delay - dep_delay).astype(
+                np.float32
+            )
             data["delay_recovery_delta"] = (dep_delay - arr_delay).astype(np.float32)
             data["worsened_in_air"] = (arr_delay > dep_delay).astype(np.int8)
 
@@ -645,7 +710,9 @@ class FeaturePipeline:
                     rasch_score += difficulty * (data[item] >= 4).astype(np.float32)
                     w_item = float(1.0 / (1.0 + np.exp(difficulty)))
                     valid_mask = (data[item] > 0).astype(np.float32)
-                    weighted_ratings += w_item * data[item].astype(np.float32) * valid_mask
+                    weighted_ratings += (
+                        w_item * data[item].astype(np.float32) * valid_mask
+                    )
                     weighted_max += w_item * 5.0 * valid_mask
 
             data["rasch_delight_score"] = rasch_score
@@ -658,12 +725,20 @@ class FeaturePipeline:
             valid_counts = np.maximum(1, (rating_matrix > 0).sum(axis=1))
 
             # 1. Intra-passenger variance (straight-liners yield exactly 0.0)
-            data["intra_passenger_var"] = rating_matrix.var(axis=1).fillna(0.0).astype(np.float32)
-            data["straight_liner"] = (data["intra_passenger_var"] == 0.0).astype(np.int8)
+            data["intra_passenger_var"] = (
+                rating_matrix.var(axis=1).fillna(0.0).astype(np.float32)
+            )
+            data["straight_liner"] = (data["intra_passenger_var"] == 0.0).astype(
+                np.int8
+            )
 
             # 2. Midpoint satisficing (fraction of 3s given among answered questions)
-            data["midpoint_fraction"] = ((rating_matrix == 3).sum(axis=1) / valid_counts).astype(np.float32)
-            data["midpoint_ratio"] = (rating_matrix == 3).mean(axis=1).astype(np.float32)
+            data["midpoint_fraction"] = (
+                (rating_matrix == 3).sum(axis=1) / valid_counts
+            ).astype(np.float32)
+            data["midpoint_ratio"] = (
+                (rating_matrix == 3).mean(axis=1).astype(np.float32)
+            )
 
             # 3. Extremity index (fraction of 1s and 5s among answered questions)
             data["extremity_index"] = (
@@ -799,16 +874,21 @@ class FeaturePipeline:
             # Linear Rotational Variance via TruncatedSVD
             if self.config.enable_svd_manifolds and self.svd is not None:
                 svd_data = data[self.svd_cols].copy()
-                if "Arrival Delay in Minutes" in svd_data.columns and "Departure Delay in Minutes" in svd_data.columns:
-                    svd_data["Arrival Delay in Minutes"] = svd_data["Arrival Delay in Minutes"].fillna(
-                        svd_data["Departure Delay in Minutes"]
-                    )
+                if (
+                    "Arrival Delay in Minutes" in svd_data.columns
+                    and "Departure Delay in Minutes" in svd_data.columns
+                ):
+                    svd_data["Arrival Delay in Minutes"] = svd_data[
+                        "Arrival Delay in Minutes"
+                    ].fillna(svd_data["Departure Delay in Minutes"])
                 for rc in self.config.rating_cols:
                     if rc in svd_data.columns:
                         impute_val = self.svd_rating_impute.get(rc, 3.0)
                         svd_data[rc] = svd_data[rc].replace(0, impute_val)
 
-                X_svd_norm = ((svd_data.values - self.svd_mean) / self.svd_std).astype(np.float32)
+                X_svd_norm = ((svd_data.values - self.svd_mean) / self.svd_std).astype(
+                    np.float32
+                )
                 svd_comps = self.svd.transform(X_svd_norm)
                 for i in range(self.config.n_svd_components):
                     data[f"svd_{i}"] = svd_comps[:, i].astype(np.float32)
@@ -818,8 +898,14 @@ class FeaturePipeline:
             # -------------------------------------------------------------
             # Route Profiles: Flight Distance target encoding & aggregations
             if self.config.enable_route_profiles and "Flight Distance" in data.columns:
-                if is_train and "Flight Distance" in self.train_oof_te and len(data) == len(self.train_oof_te["Flight Distance"]):
-                    data["te_Flight Distance"] = self.train_oof_te["Flight Distance"].astype(np.float32)
+                if (
+                    is_train
+                    and "Flight Distance" in self.train_oof_te
+                    and len(data) == len(self.train_oof_te["Flight Distance"])
+                ):
+                    data["te_Flight Distance"] = self.train_oof_te[
+                        "Flight Distance"
+                    ].astype(np.float32)
                 elif self.te_flight_distance_map:
                     data["te_Flight Distance"] = (
                         data["Flight Distance"]
@@ -828,16 +914,27 @@ class FeaturePipeline:
                         .astype(np.float32)
                     )
                 data["freq_flight_distance"] = (
-                    data["Flight Distance"].map(self.freq_flight_distance_map).fillna(0.0).astype(np.float32)
+                    data["Flight Distance"]
+                    .map(self.freq_flight_distance_map)
+                    .fillna(0.0)
+                    .astype(np.float32)
                 )
                 data["log_count_flight_distance"] = np.log1p(
-                    data["Flight Distance"].map(self.count_flight_distance_map).fillna(0)
+                    data["Flight Distance"]
+                    .map(self.count_flight_distance_map)
+                    .fillna(0)
                 ).astype(np.float32)
                 data["route_mean_arr_delay"] = (
-                    data["Flight Distance"].map(self.route_mean_arr_map).fillna(arr_delay).astype(np.float32)
+                    data["Flight Distance"]
+                    .map(self.route_mean_arr_map)
+                    .fillna(arr_delay)
+                    .astype(np.float32)
                 )
                 data["route_std_arr_delay"] = (
-                    data["Flight Distance"].map(self.route_std_arr_map).fillna(0.0).astype(np.float32)
+                    data["Flight Distance"]
+                    .map(self.route_std_arr_map)
+                    .fillna(0.0)
+                    .astype(np.float32)
                 )
 
             # Bounded Crosses String Representation
@@ -851,11 +948,20 @@ class FeaturePipeline:
                 for col in self.target_encoding_maps.keys():
                     if col == "Flight Distance":
                         continue
-                    if is_train and col in self.train_oof_te and len(data) == len(self.train_oof_te[col]):
+                    if (
+                        is_train
+                        and col in self.train_oof_te
+                        and len(data) == len(self.train_oof_te[col])
+                    ):
                         data[f"te_{col}"] = self.train_oof_te[col].astype(np.float32)
                     elif col in self.target_encoding_maps and col in data.columns:
                         m = self.target_encoding_maps[col]
-                        data[f"te_{col}"] = data[col].map(m).fillna(self.global_target_mean).astype(np.float32)
+                        data[f"te_{col}"] = (
+                            data[col]
+                            .map(m)
+                            .fillna(self.global_target_mean)
+                            .astype(np.float32)
+                        )
 
             # -------------------------------------------------------------
             # 10.8 ORIGINAL DATASET PRIOR FEATURES (Rugved Bane #2 and #3)
@@ -867,13 +973,21 @@ class FeaturePipeline:
                         if cat_c in X_prior_eval.columns:
                             mapping = self.label_encoder_dicts.get(cat_c, None)
                             if mapping is not None:
-                                X_prior_eval[cat_c] = X_prior_eval[cat_c].map(mapping).fillna(-1)
+                                X_prior_eval[cat_c] = (
+                                    X_prior_eval[cat_c].map(mapping).fillna(-1)
+                                )
                             else:
-                                X_prior_eval[cat_c] = pd.factorize(X_prior_eval[cat_c])[0]
-                    p_prior = self.orig_prior_model.predict_proba(X_prior_eval)[:, 1].astype(np.float32)
+                                X_prior_eval[cat_c] = pd.factorize(X_prior_eval[cat_c])[
+                                    0
+                                ]
+                    p_prior = self.orig_prior_model.predict_proba(X_prior_eval)[
+                        :, 1
+                    ].astype(np.float32)
                     p_prior = np.clip(p_prior, 1e-5, 1.0 - 1e-5)
                     data["orig_proba"] = p_prior
-                    data["orig_logit"] = np.log(p_prior / (1.0 - p_prior)).astype(np.float32)
+                    data["orig_logit"] = np.log(p_prior / (1.0 - p_prior)).astype(
+                        np.float32
+                    )
                 except Exception:
                     data["orig_proba"] = np.float32(0.5)
                     data["orig_logit"] = np.float32(0.0)
