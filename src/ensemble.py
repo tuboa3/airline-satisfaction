@@ -137,24 +137,35 @@ class EnsembleOptimizer:
         oof_ranks = np.column_stack([self.rank_transform(p) for p in oof_list])
         test_ranks = np.column_stack([self.rank_transform(p) for p in test_list])
 
+        n = len(model_names)
+        if len(y_true) > 60000:
+            rng = np.random.RandomState(42)
+            sub_idx = rng.choice(len(y_true), size=60000, replace=False)
+            oof_sub = oof_ranks[sub_idx]
+            y_sub = y_true[sub_idx]
+        else:
+            oof_sub = oof_ranks
+            y_sub = y_true
+
         def objective(w):
             weights = np.maximum(0.0, w)
-            if weights.sum() == 0:
-                weights = np.ones_like(weights)
-            weights = weights / weights.sum()
-            blend = np.dot(oof_ranks, weights)
-            return -roc_auc_score(y_true, blend)
+            s = weights.sum()
+            if s == 0:
+                weights = np.ones_like(weights) / n
+            else:
+                weights = weights / s
+            blend = np.dot(oof_sub, weights)
+            return -roc_auc_score(y_sub, blend)
 
-        n = len(model_names)
         init_w = np.ones(n) / n
-        res = minimize(objective, init_w, method="Nelder-Mead", options={"maxiter": 1000})
+        res = minimize(objective, init_w, method="Nelder-Mead", options={"maxiter": 300})
 
         opt_w = np.maximum(0.0, res.x)
         opt_w = opt_w / opt_w.sum()
-        best_auc = -res.fun
 
         final_oof = np.dot(oof_ranks, opt_w)
         final_test = np.dot(test_ranks, opt_w)
+        best_auc = roc_auc_score(y_true, final_oof)
         w_dict = {name: float(w) for name, w in zip(model_names, opt_w)}
         return final_oof, best_auc, final_test, w_dict
 
@@ -175,15 +186,25 @@ class EnsembleOptimizer:
         X_test_logits = np.column_stack([cal_test_logits[m] for m in model_names])
         n = len(model_names)
 
+        if len(y_true) > 60000:
+            rng = np.random.RandomState(42)
+            sub_idx = rng.choice(len(y_true), size=60000, replace=False)
+            X_sub = X_oof_logits[sub_idx]
+            y_sub = y_true[sub_idx]
+        else:
+            X_sub = X_oof_logits
+            y_sub = y_true
+
         def objective(w):
             weights = np.maximum(0.0, w)
-            if weights.sum() == 0:
-                weights = np.ones_like(weights)
-            weights = weights / weights.sum()
-            z_blend = np.dot(X_oof_logits, weights)
+            s = weights.sum()
+            if s == 0:
+                weights = np.ones_like(weights) / n
+            else:
+                weights = weights / s
+            z_blend = np.dot(X_sub, weights)
             p_blend = expit(z_blend)
-            auc = roc_auc_score(y_true, p_blend)
-            # Dirichlet shrinkage prior penalty
+            auc = roc_auc_score(y_sub, p_blend)
             dirichlet_penalty = -(dirichlet_alpha - 1.0) * np.sum(np.log(weights + 1e-12))
             return -auc + 1e-4 * dirichlet_penalty
 
@@ -194,7 +215,7 @@ class EnsembleOptimizer:
             init_w,
             method="Nelder-Mead",
             bounds=bounds,
-            options={"maxiter": 1000},
+            options={"maxiter": 300},
         )
 
         opt_w = np.maximum(0.0, res.x)
@@ -281,19 +302,116 @@ class EnsembleOptimizer:
         auc = roc_auc_score(y_true, cal_oof)
         return cal_oof, auc, cal_test
 
-    def blend_ridge_interactions(
+    def blend_empirical_wmw(
+        self,
+        model_names: list[str],
+        oof_list: list[np.ndarray],
+        test_list: list[np.ndarray],
+        y_true: np.ndarray,
+        beta: float = 1e-3,
+    ) -> tuple[np.ndarray, float, np.ndarray, dict[str, float]]:
+        """
+        Direct Empirical Wilcoxon-Mann-Whitney (WMW) U-Statistic Optimization (Friend 1).
+        Derivative-free optimization on the probability simplex with a Dirichlet barrier:
+            f(w) = -U(w) - beta * sum_{m=1}^M ln(w_m + 1e-12)
+        Subject to:
+            sum(w) = 1, w >= 0
+        where U(w) is the exact empirical Mann-Whitney U-statistic (computed in O(N log N) via ranking).
+        """
+        n = len(model_names)
+        X_oof = np.column_stack(oof_list)
+        X_test = np.column_stack(test_list)
+
+        pos_mask = (y_true == 1)
+        n1 = int(np.sum(pos_mask))
+        n0 = len(y_true) - n1
+
+        if len(y_true) > 60000:
+            rng = np.random.RandomState(42)
+            sub_idx = rng.choice(len(y_true), size=60000, replace=False)
+            X_sub = X_oof[sub_idx]
+            y_sub = y_true[sub_idx]
+            pos_sub = (y_sub == 1)
+            n1_sub = int(np.sum(pos_sub))
+            n0_sub = len(y_sub) - n1_sub
+            const_sub = n1_sub * (n1_sub + 1) / 2.0
+            denom_sub = float(n0_sub * n1_sub)
+        else:
+            X_sub = X_oof
+            pos_sub = pos_mask
+            n1_sub = n1
+            const_sub = n1 * (n1 + 1) / 2.0
+            denom_sub = float(n0 * n1)
+
+        def objective(w):
+            weights = np.maximum(0.0, w)
+            s = weights.sum()
+            if s == 0:
+                weights = np.ones_like(weights) / n
+            else:
+                weights = weights / s
+
+            p_blend = np.dot(X_sub, weights)
+            ranks = rankdata(p_blend)
+            r1 = np.sum(ranks[pos_sub])
+            u_stat = (r1 - const_sub) / denom_sub
+
+            # Dirichlet barrier to prevent single-model collapse
+            barrier = -beta * np.sum(np.log(weights + 1e-12))
+            return -u_stat + barrier
+
+        best_w = None
+        best_val = float("inf")
+
+        # Multi-start initializations: uniform, NNLS, and best standalone model
+        nnls_w = self.train_nnls(X_oof, y_true)
+        single_best_idx = int(np.argmax([roc_auc_score(y_true, oof) for oof in oof_list]))
+        single_w = np.zeros(n)
+        single_w[single_best_idx] = 1.0
+
+        candidates_init = [
+            np.ones(n) / n,
+            nnls_w,
+            single_w,
+        ]
+
+        bounds = [(0.0, 1.0) for _ in range(n)]
+
+        for init_w in candidates_init:
+            res = minimize(
+                objective,
+                init_w,
+                method="Nelder-Mead",
+                bounds=bounds,
+                options={"maxiter": 300},
+            )
+            if res.fun < best_val:
+                best_val = res.fun
+                best_w = res.x
+
+        opt_w = np.maximum(0.0, best_w)
+        if opt_w.sum() > 0:
+            opt_w = opt_w / np.sum(opt_w)
+        else:
+            opt_w = np.ones(n) / n
+
+        final_oof = np.dot(X_oof, opt_w)
+        final_test = np.dot(X_test, opt_w)
+        best_auc = roc_auc_score(y_true, final_oof)
+        w_dict = {name: float(w) for name, w in zip(model_names, opt_w)}
+        return final_oof, best_auc, final_test, w_dict
+
+    def _build_meta_features(
         self,
         model_names: list[str],
         cal_oof_logits: dict[str, np.ndarray],
         cal_test_logits: dict[str, np.ndarray],
-        y_true: np.ndarray,
-    ) -> tuple[np.ndarray, float, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Second-Stage Regularized Meta-Learner (Ridge) with Interaction Terms.
-        Constructs:
-        - Base calibrated logits: z_i
-        - Pairwise multiplicative interactions: z_i * z_j
-        - Pairwise model disagreement magnitude: |z_i - z_j|
+        Constructs high-dimensional meta-features:
+        1. Base calibrated logits: z_i
+        2. Pairwise multiplicative interactions: z_i * z_j
+        3. Pairwise model disagreement magnitude: |z_i - z_j|
         """
         meta_features_oof = []
         meta_features_test = []
@@ -318,10 +436,107 @@ class EnsembleOptimizer:
                 meta_features_oof.append(np.abs(zi_oof - zj_oof))
                 meta_features_test.append(np.abs(zi_test - zj_test))
 
-        X_meta_oof = np.column_stack(meta_features_oof)
-        X_meta_test = np.column_stack(meta_features_test)
+        X_meta_oof = np.column_stack(meta_features_oof).astype(np.float32)
+        X_meta_test = np.column_stack(meta_features_test).astype(np.float32)
+        return X_meta_oof, X_meta_test
 
-        # 5-fold cross-validation for meta-learner to prevent meta-overfitting
+    def blend_smooth_wmw(
+        self,
+        model_names: list[str],
+        cal_oof_logits: dict[str, np.ndarray],
+        cal_test_logits: dict[str, np.ndarray],
+        y_true: np.ndarray,
+        tau: float = 0.1,
+        l2_reg: float = 1e-4,
+    ) -> tuple[np.ndarray, float, np.ndarray]:
+        """
+        Smooth Sigmoid AUC Surrogate Optimization for High-Dimensional Meta-Features (Friend 1).
+        Optimizes:
+            J(w) = -U_{smooth}(w) + (lambda/2) * ||w||_2^2
+        where U_{smooth}(w) = E_{i in Pos, j in Neg} [ sigma((s_i - s_j)/tau) ].
+        Solves via mini-batch balanced SGD with PyTorch, cross-validated with 5-fold CV to prevent leakage.
+        """
+        import torch
+        import torch.nn as nn
+
+        X_meta_oof, X_meta_test = self._build_meta_features(
+            model_names, cal_oof_logits, cal_test_logits
+        )
+        D = X_meta_oof.shape[1]
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        oof_meta_preds = np.zeros(len(y_true), dtype=np.float32)
+        test_meta_preds = np.zeros(len(X_meta_test), dtype=np.float32)
+
+        batch_size = 512
+        n_steps = 60
+
+        for fold, (tr_idx, va_idx) in enumerate(skf.split(X_meta_oof, y_true)):
+            X_tr, y_tr = X_meta_oof[tr_idx], y_true[tr_idx]
+            X_va = X_meta_oof[va_idx]
+
+            pos_tr_idx = np.where(y_tr == 1)[0]
+            neg_tr_idx = np.where(y_tr == 0)[0]
+
+            X_tr_t = torch.from_numpy(X_tr).to(device)
+            pos_t = torch.from_numpy(pos_tr_idx).to(device)
+            neg_t = torch.from_numpy(neg_tr_idx).to(device)
+
+            linear = nn.Linear(D, 1, bias=True).to(device)
+            with torch.no_grad():
+                linear.weight.zero_()
+                for m_idx in range(len(model_names)):
+                    linear.weight[0, m_idx] = 1.0 / len(model_names)
+                linear.bias.zero_()
+
+            optimizer = torch.optim.AdamW(linear.parameters(), lr=0.01, weight_decay=l2_reg)
+
+            for step in range(n_steps):
+                p_samp = pos_t[torch.randint(0, len(pos_t), (batch_size,), device=device)]
+                n_samp = neg_t[torch.randint(0, len(neg_t), (batch_size,), device=device)]
+
+                x_p = X_tr_t[p_samp]
+                x_n = X_tr_t[n_samp]
+
+                s_p = linear(x_p)
+                s_n = linear(x_n)
+
+                diff = (s_p - s_n.t()) / tau
+                u_smooth = torch.sigmoid(diff).mean()
+                loss = -u_smooth
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            linear.eval()
+            with torch.no_grad():
+                va_tensor = torch.from_numpy(X_va).to(device)
+                te_tensor = torch.from_numpy(X_meta_test).to(device)
+                oof_meta_preds[va_idx] = linear(va_tensor).squeeze(-1).cpu().numpy()
+                test_meta_preds += linear(te_tensor).squeeze(-1).cpu().numpy() / 5.0
+
+        final_oof = expit(oof_meta_preds)
+        final_test = expit(test_meta_preds)
+        best_auc = roc_auc_score(y_true, final_oof)
+        return final_oof, best_auc, final_test
+
+    def blend_ridge_interactions(
+        self,
+        model_names: list[str],
+        cal_oof_logits: dict[str, np.ndarray],
+        cal_test_logits: dict[str, np.ndarray],
+        y_true: np.ndarray,
+    ) -> tuple[np.ndarray, float, np.ndarray]:
+        """
+        Second-Stage Regularized Meta-Learner (Ridge) with Interaction Terms.
+        Uses _build_meta_features to generate base logits, pairwise products, and disagreement magnitudes.
+        """
+        X_meta_oof, X_meta_test = self._build_meta_features(
+            model_names, cal_oof_logits, cal_test_logits
+        )
+
         skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
         oof_meta_preds = np.zeros(len(y_true), dtype=np.float32)
         test_meta_preds = np.zeros(len(X_meta_test), dtype=np.float32)
@@ -416,33 +631,56 @@ class EnsembleOptimizer:
         for m, w in w_slsqp.items():
             self.logger.info(f"    - Weight for {m:<18}: {w:.4f}")
 
-        # 6. Strategy 3: Ridge Meta-Learner with Interactions
+        # 6. Strategy 3: Direct Empirical WMW Optimization (Dirichlet Barrier)
+        oof_wmw, auc_wmw, test_wmw, w_wmw = self.blend_empirical_wmw(
+            model_names, oof_list, test_list, y_true
+        )
+        self.logger.info(f"Strategy 3 (Direct Empirical WMW Blend) : OOF ROC-AUC = {auc_wmw:.5f}")
+        for m, w in w_wmw.items():
+            self.logger.info(f"    - Empirical WMW Weight for {m:<11}: {w:.4f}")
+
+        # 7. Strategy 4: Smooth Sigmoid WMW Surrogate Stacking
+        if len(model_names) > 1:
+            try:
+                oof_swmw, auc_swmw, test_swmw = self.blend_smooth_wmw(
+                    model_names, cal_oof_logits, cal_test_logits, y_true
+                )
+                self.logger.info(f"Strategy 4 (Smooth Sigmoid WMW Stacking): OOF ROC-AUC = {auc_swmw:.5f}")
+            except Exception as e:
+                self.logger.warning(f"Smooth Sigmoid WMW Stacking failed ({e}). Falling back to empirical WMW.")
+                oof_swmw, auc_swmw, test_swmw = oof_wmw, auc_wmw, test_wmw
+        else:
+            oof_swmw, auc_swmw, test_swmw = oof_wmw, auc_wmw, test_wmw
+
+        # 8. Strategy 5: Ridge Meta-Learner with Interactions
         if len(model_names) > 1:
             oof_ridge, auc_ridge, test_ridge = self.blend_ridge_interactions(
                 model_names, cal_oof_logits, cal_test_logits, y_true
             )
-            self.logger.info(f"Strategy 3 (Ridge Interaction Stacking) : OOF ROC-AUC = {auc_ridge:.5f}")
+            self.logger.info(f"Strategy 5 (Ridge Interaction Stacking) : OOF ROC-AUC = {auc_ridge:.5f}")
         else:
             oof_ridge, auc_ridge, test_ridge = oof_slsqp, auc_slsqp, test_slsqp
 
-        # 7. Strategy 4: Non-Negative Least Squares (NNLS)
+        # 9. Strategy 6: Non-Negative Least Squares (NNLS)
         oof_nnls, auc_nnls, test_nnls, w_nnls = self.blend_nnls(
             model_names, oof_list, test_list, y_true
         )
-        self.logger.info(f"Strategy 4 (Non-Negative Least Squares) : OOF ROC-AUC = {auc_nnls:.5f}")
+        self.logger.info(f"Strategy 6 (Non-Negative Least Squares) : OOF ROC-AUC = {auc_nnls:.5f}")
         for m, w in w_nnls.items():
             self.logger.info(f"    - NNLS Weight for {m:<13}: {w:.4f}")
 
-        # 8. Strategy 5: Isotonic Stacking (NNLS + Isotonic PAVA)
+        # 10. Strategy 7: Isotonic Stacking (NNLS + Isotonic PAVA)
         oof_iso, auc_iso, test_iso = self.blend_isotonic_stacking(
             model_names, oof_list, test_list, y_true
         )
-        self.logger.info(f"Strategy 5 (Isotonic Calibrated Stacking): OOF ROC-AUC = {auc_iso:.5f}")
+        self.logger.info(f"Strategy 7 (Isotonic Calibrated Stacking): OOF ROC-AUC = {auc_iso:.5f}")
 
-        # 9. Selection
+        # 11. Selection
         candidates = {
             "rank": (oof_rank, auc_rank, test_rank),
             "logit": (oof_slsqp, auc_slsqp, test_slsqp),
+            "wmw": (oof_wmw, auc_wmw, test_wmw),
+            "smooth_wmw": (oof_swmw, auc_swmw, test_swmw),
             "ridge": (oof_ridge, auc_ridge, test_ridge),
             "nnls": (oof_nnls, auc_nnls, test_nnls),
             "isotonic": (oof_iso, auc_iso, test_iso),

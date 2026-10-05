@@ -24,7 +24,9 @@ def parse_args():
             "lightgbm", "lgbm",
             "catboost", "cb", "cat",
             "xgboost", "xgb",
-            "resnet", "realmlp", "tabm", "tabular_resnet", "nn",
+            "realmlp", "tabm", "hybrid",
+            "dcn_v2", "dcn", "deep_cross",
+            "resnet", "tabular_resnet", "nn",
             "transformer", "ft_transformer", "ft",
         ],
         help="Model architecture to train (default: lightgbm)"
@@ -82,8 +84,8 @@ def parse_args():
     parser.add_argument(
         "--original_weight",
         type=float,
-        default=0.65,
-        help="Sample weight attenuation for original dataset rows (default: 0.65)"
+        default=0.50,
+        help="Sample weight attenuation for original dataset rows (default: 0.50)"
     )
     parser.add_argument(
         "--density_ratio",
@@ -120,14 +122,17 @@ def main():
 
     if args.epochs is not None:
         train_cfg.tabm_params["epochs"] = args.epochs
+        train_cfg.dcn_params["epochs"] = args.epochs
         train_cfg.resnet_params["epochs"] = args.epochs
         train_cfg.ft_params["epochs"] = args.epochs
     if args.batch_size is not None:
         train_cfg.tabm_params["batch_size"] = args.batch_size
+        train_cfg.dcn_params["batch_size"] = args.batch_size
         train_cfg.resnet_params["batch_size"] = args.batch_size
         train_cfg.ft_params["batch_size"] = args.batch_size
     if args.lr is not None:
         train_cfg.tabm_params["lr"] = args.lr
+        train_cfg.dcn_params["lr"] = args.lr
         train_cfg.resnet_params["lr"] = args.lr
         train_cfg.ft_params["lr"] = args.lr
 

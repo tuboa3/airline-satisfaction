@@ -75,8 +75,10 @@ class CrossValidationEngine:
             else np.arange(len(test_synth))
         )
 
-        # 2. Transductive Feature Engineering
-        X_train_all = self.pipeline.fit_transform(unified_train, test_synth)
+        # 2. Transductive Feature Engineering with Original Dataset Prior Integration
+        X_train_all = self.pipeline.fit_transform(
+            unified_train, test_synth, orig_df=orig_df
+        )
         X_test = self.pipeline.transform(test_synth, is_train=False)
 
         feature_names = X_train_all.columns.tolist()
@@ -118,6 +120,8 @@ class CrossValidationEngine:
             or "hybrid" in model_name_lower
         ):
             params = self.train_cfg.tabm_params.copy()
+        elif "dcn" in model_name_lower or "cross" in model_name_lower:
+            params = self.train_cfg.dcn_params.copy()
         elif (
             "resnet" in model_name_lower
             or "tabular_resnet" in model_name_lower
@@ -200,22 +204,24 @@ class CrossValidationEngine:
                     extra_fit_kwargs["base_margin_tr"] = margin_tr
                     extra_fit_kwargs["base_margin_val"] = margin_va
 
-            # Native Categorical CTR for CatBoost
+            # Native Categorical CTR for CatBoost (Bounded Multi-Way Interactions)
             if "cat" in model_name_lower or "cb" in model_name_lower:
-                cat_cols = [
-                    c
-                    for c in [
-                        "Gender",
-                        "Customer Type",
-                        "Type of Travel",
-                        "Class",
-                        "class_x_travel_type",
-                        "gate_x_business",
-                        "multi_cross_1",
-                        "multi_cross_2",
-                    ]
-                    if c in X_tr.columns
+                candidate_cats = [
+                    "Gender",
+                    "Customer Type",
+                    "Type of Travel",
+                    "Class",
+                    "class_x_travel_type",
+                    "gate_x_business",
+                    "multi_cross_1",
+                    "multi_cross_2",
+                    "route_class_travel",
+                    "route_delay_tier",
+                    "route_dissatisfaction",
+                    "service_failure_class",
+                    "age_class_travel",
                 ]
+                cat_cols = [c for c in candidate_cats if c in X_tr.columns]
                 extra_fit_kwargs["cat_features"] = cat_cols
 
             teacher_tr = (

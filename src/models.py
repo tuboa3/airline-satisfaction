@@ -263,11 +263,16 @@ class CatBoostModel(BaseModel):
         self.early_stopping_rounds = self.params.pop("early_stopping_rounds", 100)
         self.verbose = self.params.pop("verbose", 250)
 
-        # Sanitize any accidental foreign hyperparameters
+        # Adapt ctr_leaf_reg to valid CatBoost API parameter if present
+        if "ctr_leaf_reg" in self.params:
+            self.params.pop("ctr_leaf_reg")
+            if "ctr_target_border_count" not in self.params:
+                self.params["ctr_target_border_count"] = 64
+
+        # Sanitize any accidental foreign hyperparameters (retain valid boosting_type, max_ctr_complexity)
         for invalid_key in [
             "metric",
             "objective",
-            "boosting_type",
             "n_estimators",
             "num_leaves",
             "colsample_bytree",
@@ -1344,21 +1349,43 @@ class RealMLP_TabM_Hybrid(_ModuleBase):
             return torch.mean(logits, dim=1)
 
 
-class TabMSurrogateAUCLoss(_ModuleBase):
+class DynamicCompositeLoss(_ModuleBase):
     """
-    Differentiable margin ranking loss maximizing ROC-AUC directly across TabM ensemble heads.
+    Composite Multi-Task Objective (Friend 2):
+    Loss = (1 - alpha_t) * FocalBCE + alpha_t * SurrogateAUC(gamma=15.0)
+    where alpha_t anneals from burn-in (0.1) to final (0.85) over epochs.
+    Anchors logit calibration early and fine-tunes pairwise ranking late.
     """
 
-    def __init__(self, gamma: float = 15.0):
+    def __init__(self, gamma: float = 15.0, focal_gamma: float = 2.0):
         super().__init__()
         self.gamma = gamma
+        self.focal_gamma = focal_gamma
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        alpha: float = 0.5,
+    ) -> torch.Tensor:
+        import torch.nn.functional as F
+
+        # If ensemble heads: logits shape (batch, k) or (batch,)
         if logits.dim() == 1:
             logits = logits.unsqueeze(1)
         targets = targets.unsqueeze(1).expand_as(logits)
-        total_loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
 
+        # 1. Focal Binary Cross Entropy
+        probs = torch.sigmoid(logits)
+        pt = targets * probs + (1.0 - targets) * (1.0 - probs)
+        focal_weight = (1.0 - pt) ** self.focal_gamma
+        bce_loss = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction="none"
+        )
+        focal_loss = torch.mean(focal_weight * bce_loss)
+
+        # 2. Pairwise AUC Margin Loss across heads
+        total_auc_loss = torch.tensor(0.0, device=logits.device)
         k_count = logits.size(1)
         valid_heads = 0
         for k_idx in range(k_count):
@@ -1370,17 +1397,23 @@ class TabMSurrogateAUCLoss(_ModuleBase):
                 continue
             diffs = pos_logits.unsqueeze(1) - neg_logits.unsqueeze(0)
             member_loss = torch.mean((1.0 - torch.sigmoid(self.gamma * diffs)) ** 2)
-            total_loss = total_loss + member_loss
+            total_auc_loss = total_auc_loss + member_loss
             valid_heads += 1
 
-        return total_loss / max(1, valid_heads)
+        auc_loss = total_auc_loss / max(1, valid_heads)
+
+        return (1.0 - alpha) * focal_loss + alpha * auc_loss
+
+
+# Backwards compatibility alias
+TabMSurrogateAUCLoss = DynamicCompositeLoss
 
 
 class RealMLPTabMModel(BaseModel):
     """
     RealMLP-TD + TabM (BatchEnsemble) Hybrid Model.
     Employs Disjoint Survey Embeddings (0-isolation), Piecewise Linear Spline Embeddings,
-    Parametric SELU, and Surrogate AUC loss with k=16 ensemble heads.
+    Parametric SELU, Dynamic Composite Loss (Focal BCE + Surrogate AUC), and k=16 ensemble heads.
     Directly breaks collinearity with GBDTs.
     """
 
@@ -1433,18 +1466,33 @@ class RealMLPTabMModel(BaseModel):
         dropout = self.params.get("dropout", 0.1)
         lr = self.params.get("lr", 1e-3)
         weight_decay = self.params.get("weight_decay", 1e-4)
-        batch_size = self.params.get("batch_size", 4096)
-        epochs = self.params.get("epochs", 32)
+        batch_size = self.params.get("batch_size", 2048)
+        epochs = self.params.get("epochs", 48)
         gamma = self.params.get("gamma", 15.0)
+        alpha_burnin = self.params.get("alpha_burnin", 0.1)
+        alpha_final = self.params.get("alpha_final", 0.85)
 
-        # 2. Compute empirical quantiles for continuous columns
+        # 2. Compute empirical quantiles for continuous columns with log1p stabilization on delay/distance
         X_cont_tr_raw = X_train[self.cont_cols].fillna(0).values.astype(np.float32)
+        X_cont_tr_proc = X_cont_tr_raw.copy()
+        for c_idx, c_name in enumerate(self.cont_cols):
+            if "delay" in c_name.lower() or "distance" in c_name.lower():
+                min_v = np.nanmin(X_cont_tr_proc[:, c_idx])
+                if min_v >= 0:
+                    X_cont_tr_proc[:, c_idx] = np.log1p(X_cont_tr_proc[:, c_idx])
+
         q_steps = np.linspace(0.0, 1.0, num_bins + 1)
-        self.quantiles = np.nanquantile(X_cont_tr_raw, q_steps, axis=0).T
+        self.quantiles = np.nanquantile(X_cont_tr_proc, q_steps, axis=0).T
         for row in range(len(self.quantiles)):
             self.quantiles[row] = np.maximum.accumulate(self.quantiles[row])
 
         X_cont_va_raw = X_val[self.cont_cols].fillna(0).values.astype(np.float32)
+        X_cont_va_proc = X_cont_va_raw.copy()
+        for c_idx, c_name in enumerate(self.cont_cols):
+            if "delay" in c_name.lower() or "distance" in c_name.lower():
+                min_v = np.nanmin(X_cont_va_proc[:, c_idx])
+                if min_v >= 0:
+                    X_cont_va_proc[:, c_idx] = np.log1p(X_cont_va_proc[:, c_idx])
 
         X_survey_tr = np.clip(X_train[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5)
         X_survey_va = np.clip(X_val[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5)
@@ -1468,7 +1516,7 @@ class RealMLPTabMModel(BaseModel):
 
         train_ds = TensorDataset(
             torch.tensor(X_survey_tr, dtype=torch.long),
-            torch.tensor(X_cont_tr_raw, dtype=torch.float32),
+            torch.tensor(X_cont_tr_proc, dtype=torch.float32),
             torch.tensor(y_train, dtype=torch.float32),
         )
 
@@ -1478,16 +1526,25 @@ class RealMLPTabMModel(BaseModel):
         )
 
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-        criterion = TabMSurrogateAUCLoss(gamma=gamma)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+        criterion = DynamicCompositeLoss(gamma=gamma)
         scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and device.type == "cuda"))
 
         best_auc = 0.0
         best_state = None
 
+        burnin_epochs = max(1, int(0.15 * epochs))
+
         for epoch in range(1, epochs + 1):
             self.model.train()
             train_loss_acc = 0.0
+
+            # Dynamic alpha schedule (Friend 2): early burnin calibration, late AUC ranking
+            if epoch <= burnin_epochs:
+                alpha_t = alpha_burnin
+            else:
+                progress = (epoch - burnin_epochs) / max(1, epochs - burnin_epochs)
+                alpha_t = alpha_burnin + progress * (alpha_final - alpha_burnin)
 
             for b_survey, b_cont, b_y in train_loader:
                 b_survey = b_survey.to(device)
@@ -1497,7 +1554,7 @@ class RealMLPTabMModel(BaseModel):
                 optimizer.zero_grad()
                 with torch.amp.autocast("cuda", enabled=(use_amp and device.type == "cuda")):
                     logits = self.model(b_survey, b_cont)
-                    loss = criterion(logits, b_y)
+                    loss = criterion(logits, b_y, alpha=alpha_t)
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -1515,7 +1572,7 @@ class RealMLPTabMModel(BaseModel):
             with torch.no_grad():
                 for idx in range(0, len(X_survey_va), val_chunk):
                     v_s = torch.tensor(X_survey_va[idx : idx + val_chunk], dtype=torch.long).to(device)
-                    v_c = torch.tensor(X_cont_va_raw[idx : idx + val_chunk], dtype=torch.float32).to(device)
+                    v_c = torch.tensor(X_cont_va_proc[idx : idx + val_chunk], dtype=torch.float32).to(device)
                     with torch.amp.autocast("cuda", enabled=(use_amp and device.type == "cuda")):
                         mean_logits = self.model(v_s, v_c)
                     val_probs.append(torch.sigmoid(mean_logits).cpu().numpy())
@@ -1529,7 +1586,7 @@ class RealMLPTabMModel(BaseModel):
                 best_state = {k: v.cpu().clone() for k, v in m_to_save.state_dict().items()}
 
             logging.info(
-                f"RealMLP-TabM Epoch [{epoch:02d}/{epochs:02d}] - Train Loss: {train_loss_acc / len(train_loader):.4f} - Val ROC-AUC: {epoch_auc:.5f} (Best: {best_auc:.5f})"
+                f"RealMLP-TabM Epoch [{epoch:02d}/{epochs:02d}] (alpha: {alpha_t:.2f}) - Train Loss: {train_loss_acc / len(train_loader):.4f} - Val ROC-AUC: {epoch_auc:.5f} (Best: {best_auc:.5f})"
             )
 
         if best_state is not None:
@@ -1548,6 +1605,11 @@ class RealMLPTabMModel(BaseModel):
 
         X_survey = np.clip(X[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5)
         X_cont = X[self.cont_cols].fillna(0).values.astype(np.float32)
+        for c_idx, c_name in enumerate(self.cont_cols):
+            if "delay" in c_name.lower() or "distance" in c_name.lower():
+                min_v = np.nanmin(X_cont[:, c_idx])
+                if min_v >= 0:
+                    X_cont[:, c_idx] = np.log1p(X_cont[:, c_idx])
 
         n_gpus = torch.cuda.device_count() if device.type == "cuda" else 1
         batch_size = 4096 * max(1, n_gpus)
@@ -1559,6 +1621,318 @@ class RealMLPTabMModel(BaseModel):
                 b_c = torch.tensor(X_cont[i : i + batch_size], dtype=torch.float32).to(device)
                 mean_logits = self.model(b_s, b_c)
                 p = torch.sigmoid(mean_logits).cpu().numpy()
+                probs.append(p)
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        return np.concatenate(probs, axis=0)
+
+
+class LowRankCrossLayer(_ModuleBase):
+    """
+    Low-Rank Cross Layer for DCN-v2 (Deep & Cross Network v2).
+    x_{l+1} = x_0 * ((x_l V_l) U_l^T + b_l) + x_l
+    where V_l in R^{d x r}, U_l in R^{d x r}, r = d // 4.
+    Decomposes full d x d cross matrix into low-rank representations,
+    filtering out synthetic noise while engineering multivariate polynomials.
+    """
+
+    def __init__(self, d_in: int, rank: int):
+        super().__init__()
+        self.d_in = d_in
+        self.rank = rank
+        self.V = nn.Parameter(torch.empty(d_in, rank))
+        self.U = nn.Parameter(torch.empty(d_in, rank))
+        self.bias = nn.Parameter(torch.zeros(d_in))
+
+        nn.init.xavier_uniform_(self.V)
+        nn.init.xavier_uniform_(self.U)
+
+    def forward(self, x_0: torch.Tensor, x_l: torch.Tensor) -> torch.Tensor:
+        proj = torch.matmul(x_l, self.V)
+        proj = torch.matmul(proj, self.U.t()) + self.bias
+        return x_0 * proj + x_l
+
+
+class ParallelDCNv2(_ModuleBase):
+    """
+    Parallel Low-Rank Deep & Cross Network v2 (DCN-v2) (Friend 2 Blueprint).
+    Operates explicit Low-Rank Cross layers in parallel with deep MLP layers.
+    Combines polynomial feature cross inductive bias with dense representation learning.
+    Structurally orthogonal to axis-aligned decision trees (r < 0.95 with GBDTs).
+    """
+
+    def __init__(
+        self,
+        num_survey_cols: int,
+        num_cont_cols: int,
+        emb_dim: int = 8,
+        num_bins: int = 16,
+        cross_layers: int = 3,
+        rank_ratio: float = 0.25,
+        deep_dims: list[int] | None = None,
+        dropout: float = 0.15,
+    ):
+        super().__init__()
+        if deep_dims is None:
+            deep_dims = [512, 256, 128]
+
+        self.survey_embedder = DisjointSurveyEmbedding(num_survey_cols, emb_dim=emb_dim)
+        self.ple_embedder = PiecewiseLinearSplineEmbedding(num_cont_cols, num_bins=num_bins)
+
+        d_in = (num_survey_cols * emb_dim) + (num_cont_cols * num_bins)
+        rank = max(4, int(d_in * rank_ratio))
+
+        # Parallel Cross Network
+        self.cross_layers = nn.ModuleList(
+            [LowRankCrossLayer(d_in, rank) for _ in range(cross_layers)]
+        )
+        self.cross_norm = nn.LayerNorm(d_in)
+
+        # Parallel Deep Network
+        mlp_layers = []
+        curr_dim = d_in
+        for h_dim in deep_dims:
+            mlp_layers.append(nn.Linear(curr_dim, h_dim))
+            mlp_layers.append(nn.Mish())
+            mlp_layers.append(nn.LayerNorm(h_dim))
+            mlp_layers.append(nn.Dropout(dropout))
+            curr_dim = h_dim
+        self.deep_network = nn.Sequential(*mlp_layers)
+        self.deep_norm = nn.LayerNorm(curr_dim)
+
+        # Final prediction head
+        self.head = nn.Linear(d_in + curr_dim, 1)
+
+    def forward(self, survey_x: torch.Tensor, cont_x: torch.Tensor) -> torch.Tensor:
+        emb_survey = self.survey_embedder(survey_x)
+        emb_cont = self.ple_embedder(cont_x)
+        x_0 = torch.cat([emb_survey, emb_cont], dim=1)
+
+        # Cross path
+        x_l = x_0
+        for layer in self.cross_layers:
+            x_l = layer(x_0, x_l)
+        x_cross = self.cross_norm(x_l)
+
+        # Deep path
+        h_deep = self.deep_norm(self.deep_network(x_0))
+
+        # Parallel concatenation & output
+        x_final = torch.cat([x_cross, h_deep], dim=1)
+        return self.head(x_final).squeeze(-1)
+
+
+class DCNv2Model(BaseModel):
+    """
+    Secondary Orthogonal Deep Learning Architecture: Parallel Low-Rank DCN-v2.
+    Explicitly solves multivariate polynomials via rank-regularized cross layers,
+    providing non-axis-aligned manifold patterns orthogonal to tree structures.
+    """
+
+    def __init__(self, params: dict[str, Any] = None, device: str = "cpu"):
+        self.params = params.copy() if params else {}
+        self.device_str = device
+        self.model = None
+        self.survey_cols: list[str] = []
+        self.cont_cols: list[str] = []
+        self.quantiles: np.ndarray | None = None
+
+    def fit(self, X_train, y_train, X_val, y_val, sample_weight=None, **kwargs) -> None:
+        import torch
+        from sklearn.metrics import roc_auc_score
+        from torch.utils.data import DataLoader, TensorDataset
+
+        if self.device_str == "cuda" and torch.cuda.is_available():
+            device = torch.device("cuda")
+            use_amp = True
+        else:
+            device = torch.device("cpu")
+            use_amp = False
+
+        logging.info(f"Parallel Low-Rank DCN-v2 initializing on device: {device} (AMP: {use_amp})")
+
+        standard_survey_cols = [
+            "Inflight wifi service",
+            "Departure/Arrival time convenient",
+            "Ease of Online booking",
+            "Gate location",
+            "Food and drink",
+            "Online boarding",
+            "Seat comfort",
+            "Inflight entertainment",
+            "On-board service",
+            "Leg room service",
+            "Baggage handling",
+            "Checkin service",
+            "Cleanliness",
+        ]
+        self.survey_cols = [c for c in standard_survey_cols if c in X_train.columns]
+        self.cont_cols = [c for c in X_train.columns if c not in self.survey_cols]
+
+        num_survey = len(self.survey_cols)
+        num_cont = len(self.cont_cols)
+        num_bins = self.params.get("num_bins", 16)
+        cross_layers = self.params.get("cross_layers", 3)
+        rank_ratio = self.params.get("rank_ratio", 0.25)
+        deep_dims = self.params.get("deep_dims", [512, 256, 128])
+        dropout = self.params.get("dropout", 0.15)
+        lr = self.params.get("lr", 1e-3)
+        weight_decay = self.params.get("weight_decay", 1e-4)
+        batch_size = self.params.get("batch_size", 2048)
+        epochs = self.params.get("epochs", 48)
+        gamma = self.params.get("gamma", 15.0)
+        alpha_burnin = self.params.get("alpha_burnin", 0.1)
+        alpha_final = self.params.get("alpha_final", 0.85)
+
+        X_cont_tr_raw = X_train[self.cont_cols].fillna(0).values.astype(np.float32)
+        X_cont_tr_proc = X_cont_tr_raw.copy()
+        for c_idx, c_name in enumerate(self.cont_cols):
+            if "delay" in c_name.lower() or "distance" in c_name.lower():
+                min_v = np.nanmin(X_cont_tr_proc[:, c_idx])
+                if min_v >= 0:
+                    X_cont_tr_proc[:, c_idx] = np.log1p(X_cont_tr_proc[:, c_idx])
+
+        q_steps = np.linspace(0.0, 1.0, num_bins + 1)
+        self.quantiles = np.nanquantile(X_cont_tr_proc, q_steps, axis=0).T
+        for row in range(len(self.quantiles)):
+            self.quantiles[row] = np.maximum.accumulate(self.quantiles[row])
+
+        X_cont_va_raw = X_val[self.cont_cols].fillna(0).values.astype(np.float32)
+        X_cont_va_proc = X_cont_va_raw.copy()
+        for c_idx, c_name in enumerate(self.cont_cols):
+            if "delay" in c_name.lower() or "distance" in c_name.lower():
+                min_v = np.nanmin(X_cont_va_proc[:, c_idx])
+                if min_v >= 0:
+                    X_cont_va_proc[:, c_idx] = np.log1p(X_cont_va_proc[:, c_idx])
+
+        X_survey_tr = np.clip(X_train[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5)
+        X_survey_va = np.clip(X_val[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5)
+
+        emb_dim = self.params.get("emb_dim", 8)
+        self.model = ParallelDCNv2(
+            num_survey_cols=num_survey,
+            num_cont_cols=num_cont,
+            emb_dim=emb_dim,
+            num_bins=num_bins,
+            cross_layers=cross_layers,
+            rank_ratio=rank_ratio,
+            deep_dims=deep_dims,
+            dropout=dropout,
+        )
+        self.model.ple_embedder.set_boundaries(self.quantiles)
+        self.model = self.model.to(device)
+
+        if device.type == "cuda" and torch.cuda.device_count() > 1:
+            logging.info(f"Distributing DCN-v2 across {torch.cuda.device_count()} GPUs!")
+            self.model = nn.DataParallel(self.model)
+
+        train_ds = TensorDataset(
+            torch.tensor(X_survey_tr, dtype=torch.long),
+            torch.tensor(X_cont_tr_proc, dtype=torch.float32),
+            torch.tensor(y_train, dtype=torch.float32),
+        )
+
+        n_workers = 2 if device.type == "cuda" else 0
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=n_workers
+        )
+
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+        criterion = DynamicCompositeLoss(gamma=gamma)
+        scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and device.type == "cuda"))
+
+        best_auc = 0.0
+        best_state = None
+        burnin_epochs = max(1, int(0.15 * epochs))
+
+        for epoch in range(1, epochs + 1):
+            self.model.train()
+            train_loss_acc = 0.0
+
+            if epoch <= burnin_epochs:
+                alpha_t = alpha_burnin
+            else:
+                progress = (epoch - burnin_epochs) / max(1, epochs - burnin_epochs)
+                alpha_t = alpha_burnin + progress * (alpha_final - alpha_burnin)
+
+            for b_survey, b_cont, b_y in train_loader:
+                b_survey = b_survey.to(device)
+                b_cont = b_cont.to(device)
+                b_y = b_y.to(device)
+
+                optimizer.zero_grad()
+                with torch.amp.autocast("cuda", enabled=(use_amp and device.type == "cuda")):
+                    logits = self.model(b_survey, b_cont)
+                    loss = criterion(logits, b_y, alpha=alpha_t)
+
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                train_loss_acc += loss.item()
+
+            scheduler.step()
+
+            # Validation evaluation
+            self.model.eval()
+            val_probs = []
+            val_chunk = 4096
+            with torch.no_grad():
+                for idx in range(0, len(X_survey_va), val_chunk):
+                    v_s = torch.tensor(X_survey_va[idx : idx + val_chunk], dtype=torch.long).to(device)
+                    v_c = torch.tensor(X_cont_va_proc[idx : idx + val_chunk], dtype=torch.float32).to(device)
+                    with torch.amp.autocast("cuda", enabled=(use_amp and device.type == "cuda")):
+                        logits = self.model(v_s, v_c)
+                    val_probs.append(torch.sigmoid(logits).cpu().numpy())
+
+            val_preds = np.concatenate(val_probs, axis=0)
+            epoch_auc = roc_auc_score(y_val, val_preds)
+
+            if epoch_auc > best_auc:
+                best_auc = epoch_auc
+                m_to_save = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+                best_state = {k: v.cpu().clone() for k, v in m_to_save.state_dict().items()}
+
+            logging.info(
+                f"Parallel DCN-v2 Epoch [{epoch:02d}/{epochs:02d}] (alpha: {alpha_t:.2f}) - Train Loss: {train_loss_acc / len(train_loader):.4f} - Val ROC-AUC: {epoch_auc:.5f} (Best: {best_auc:.5f})"
+            )
+
+        if best_state is not None:
+            m_to_save = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+            m_to_save.load_state_dict(best_state)
+            logging.info(f"Loaded Best DCN-v2 State (Validation ROC-AUC: {best_auc:.5f})")
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def predict_proba(self, X, **kwargs) -> np.ndarray:
+        import torch
+
+        device = next(self.model.parameters()).device
+        self.model.eval()
+
+        X_survey = np.clip(X[self.survey_cols].fillna(0).values.astype(np.int64), 0, 5)
+        X_cont = X[self.cont_cols].fillna(0).values.astype(np.float32)
+        for c_idx, c_name in enumerate(self.cont_cols):
+            if "delay" in c_name.lower() or "distance" in c_name.lower():
+                min_v = np.nanmin(X_cont[:, c_idx])
+                if min_v >= 0:
+                    X_cont[:, c_idx] = np.log1p(X_cont[:, c_idx])
+
+        n_gpus = torch.cuda.device_count() if device.type == "cuda" else 1
+        batch_size = 4096 * max(1, n_gpus)
+        probs = []
+
+        with torch.no_grad():
+            for i in range(0, len(X), batch_size):
+                b_s = torch.tensor(X_survey[i : i + batch_size], dtype=torch.long).to(device)
+                b_c = torch.tensor(X_cont[i : i + batch_size], dtype=torch.float32).to(device)
+                logits = self.model(b_s, b_c)
+                p = torch.sigmoid(logits).cpu().numpy()
                 probs.append(p)
 
         if device.type == "cuda":
@@ -1584,6 +1958,8 @@ def get_model(
         or "hybrid" in model_name_lower
     ):
         return RealMLPTabMModel(params=params, device=device)
+    elif "dcn" in model_name_lower or "cross" in model_name_lower:
+        return DCNv2Model(params=params, device=device)
     elif (
         "resnet" in model_name_lower
         or "tabular_resnet" in model_name_lower
@@ -1597,5 +1973,6 @@ def get_model(
         return FTTransformerModel(params=params, device=device)
     else:
         raise ValueError(
-            f"Unknown model name: {model_name}. Choose from 'lightgbm', 'catboost', 'xgboost', 'realmlp', 'tabm', 'resnet', 'transformer'."
+            f"Unknown model name: {model_name}. Choose from 'lightgbm', 'catboost', 'xgboost', 'realmlp', 'tabm', 'dcn_v2', 'resnet', 'transformer'."
         )
+

@@ -51,7 +51,77 @@ class FeaturePipeline:
         self.global_target_mean: float = 0.5
         self.train_oof_te: dict[str, np.ndarray] = {}
 
+        # Advanced Domain Extensions (Rugved Bane 0.96059 LB + Friend 1/2/3 Findings)
+        self.orig_prior_model = None
+        self.orig_prior_cols: list[str] = []
+        self.te_flight_distance_map: dict[float, float] = {}
+        self.freq_flight_distance_map: dict[float, float] = {}
+        self.count_flight_distance_map: dict[float, int] = {}
+        self.route_mean_arr_map: dict[float, float] = {}
+        self.route_std_arr_map: dict[float, float] = {}
+        self.bounded_composite_cols: list[str] = [
+            "route_class_travel",
+            "route_delay_tier",
+            "route_dissatisfaction",
+            "service_failure_class",
+            "age_class_travel",
+        ]
+
         self.fitted: bool = False
+
+    def _get_bounded_crosses(self, df: pd.DataFrame) -> dict[str, pd.Series]:
+        """
+        Creates bounded high-cardinality composite interactions (1,000-3,000 state capacity)
+        for CatBoost CTR stability and LightGBM orthogonalization.
+        """
+        flight_dist = (
+            df["Flight Distance"]
+            if "Flight Distance" in df.columns
+            else pd.Series(1000, index=df.index)
+        )
+        dist_tier = (flight_dist // 250).clip(0, 19).astype(str)
+
+        age = df["Age"] if "Age" in df.columns else pd.Series(40, index=df.index)
+        age_tier = (age // 10).clip(0, 8).astype(str)
+
+        cls = df["Class"].astype(str) if "Class" in df.columns else "Eco"
+        travel = (
+            df["Type of Travel"].astype(str)
+            if "Type of Travel" in df.columns
+            else "Business travel"
+        )
+
+        rating_cols = [c for c in self.config.rating_cols if c in df.columns]
+        if rating_cols:
+            ratings = df[rating_cols]
+            dissat_count = (
+                ((ratings <= 2) & (ratings > 0)).sum(axis=1).clip(0, 5).astype(str)
+            )
+        else:
+            dissat_count = pd.Series("0", index=df.index)
+
+        dep_d = (
+            df["Departure Delay in Minutes"].fillna(0)
+            if "Departure Delay in Minutes" in df.columns
+            else pd.Series(0, index=df.index)
+        )
+        arr_d = (
+            df["Arrival Delay in Minutes"].fillna(dep_d)
+            if "Arrival Delay in Minutes" in df.columns
+            else dep_d
+        )
+        tot_delay = dep_d + arr_d
+        delay_tier = np.select(
+            [tot_delay == 0, tot_delay < 15, tot_delay >= 15], ["0", "1", "2"]
+        ).astype(str)
+
+        return {
+            "route_class_travel": dist_tier + "_" + cls + "_" + travel,
+            "route_delay_tier": dist_tier + "_" + delay_tier,
+            "route_dissatisfaction": dist_tier + "_" + dissat_count,
+            "service_failure_class": dissat_count + "_" + cls + "_" + travel,
+            "age_class_travel": age_tier + "_" + cls + "_" + travel,
+        }
 
     def _get_multi_crosses(self, df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
         """Generates high-cardinality multi-way topological crosses."""
@@ -105,9 +175,12 @@ class FeaturePipeline:
         return {"key1": key1, "key2": key2, "key3": key3, "key4": key4}
 
     def fit(
-        self, train_df: pd.DataFrame, test_df: pd.DataFrame | None = None
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame | None = None,
+        orig_df: pd.DataFrame | None = None,
     ) -> "FeaturePipeline":
-        """Fits transductive frequency statistics, geometric centroids, and label encoders."""
+        """Fits transductive frequency statistics, geometric centroids, route profiles, and label encoders."""
         with timer(
             "Fitting FeaturePipeline (Transductive Density & Geometric Forensics)"
         ):
@@ -226,6 +299,14 @@ class FeaturePipeline:
                 "multi_cross_2": mc2_full.astype(str),
             }
 
+            # Bounded high-cardinality composite interactions for CatBoost CTR stability
+            if self.config.enable_bounded_crosses:
+                bounded_full = self._get_bounded_crosses(full_df)
+                for b_col, b_series in bounded_full.items():
+                    if b_col not in cat_columns:
+                        cat_columns.append(b_col)
+                    col_data_map[b_col] = b_series.astype(str)
+
             for col in cat_columns:
                 le = LabelEncoder()
                 le.fit(col_data_map[col])
@@ -277,6 +358,15 @@ class FeaturePipeline:
                 tr_cols_data["multi_cross_2"] = mc2_tr.astype(str)
 
                 te_target_cols = ["multi_cross_1", "multi_cross_2", "class_x_travel_type", "gate_x_business"]
+
+                # Add bounded crosses to target encoding
+                if self.config.enable_bounded_crosses:
+                    bounded_tr = self._get_bounded_crosses(train_df)
+                    for b_col in ["route_class_travel", "route_dissatisfaction"]:
+                        tr_cols_data[b_col] = bounded_tr[b_col].astype(str)
+                        if b_col not in te_target_cols:
+                            te_target_cols.append(b_col)
+
                 kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
                 for col in te_target_cols:
@@ -304,6 +394,80 @@ class FeaturePipeline:
                         ).to_dict()
                         oof_te[val_idx] = s_va.map(map_tr).fillna(self.global_target_mean).values
                     self.train_oof_te[col] = oof_te
+
+                # Route Profiles: Flight Distance target encoding & aggregations (Rugved Bane #1 feature)
+                if self.config.enable_route_profiles and "Flight Distance" in train_df.columns:
+                    dist_s = train_df["Flight Distance"]
+                    c_dist = dist_s.value_counts()
+                    sum_dist = pd.Series(y_train_num).groupby(dist_s.values).sum()
+                    smooth_prior_dist = 20.0
+                    self.te_flight_distance_map = (
+                        (sum_dist + smooth_prior_dist * self.global_target_mean)
+                        / (c_dist + smooth_prior_dist)
+                    ).to_dict()
+
+                    oof_dist_te = np.full(len(train_df), self.global_target_mean, dtype=np.float32)
+                    for tr_idx, val_idx in kf.split(train_df):
+                        d_tr, y_tr = dist_s.iloc[tr_idx], y_train_num[tr_idx]
+                        d_va = dist_s.iloc[val_idx]
+                        cd_tr = d_tr.value_counts()
+                        sd_tr = pd.Series(y_tr).groupby(d_tr.values).sum()
+                        map_dist_tr = (
+                            (sd_tr + smooth_prior_dist * self.global_target_mean)
+                            / (cd_tr + smooth_prior_dist)
+                        ).to_dict()
+                        oof_dist_te[val_idx] = d_va.map(map_dist_tr).fillna(self.global_target_mean).values
+                    self.train_oof_te["Flight Distance"] = oof_dist_te
+
+                    self.freq_flight_distance_map = (dist_s.value_counts() / len(train_df)).to_dict()
+                    self.count_flight_distance_map = dist_s.value_counts().to_dict()
+                    arr_del_s = train_df["Arrival Delay in Minutes"].fillna(
+                        train_df["Departure Delay in Minutes"]
+                    )
+                    self.route_mean_arr_map = arr_del_s.groupby(dist_s).mean().to_dict()
+                    self.route_std_arr_map = arr_del_s.groupby(dist_s).std().fillna(0.0).to_dict()
+
+            # 7. Original Dataset Prior Model (Rugved Bane #2 and #3 features)
+            if (
+                self.config.enable_orig_prior
+                and orig_df is not None
+                and len(orig_df) > 0
+                and self.config.target_col in orig_df.columns
+            ):
+                try:
+                    from sklearn.ensemble import HistGradientBoostingClassifier
+
+                    prior_cols = [
+                        c for c in (self.config.categorical_cols + self.config.numerical_cols + self.config.rating_cols)
+                        if c in orig_df.columns and c in train_df.columns
+                    ]
+                    X_orig_prior = orig_df[prior_cols].copy()
+                    for cc in self.config.categorical_cols:
+                        if cc in X_orig_prior.columns:
+                            X_orig_prior[cc] = pd.factorize(X_orig_prior[cc])[0]
+                    if (
+                        "Arrival Delay in Minutes" in X_orig_prior.columns
+                        and "Departure Delay in Minutes" in X_orig_prior.columns
+                    ):
+                        X_orig_prior["Arrival Delay in Minutes"] = X_orig_prior["Arrival Delay in Minutes"].fillna(
+                            X_orig_prior["Departure Delay in Minutes"]
+                        )
+                    y_orig_prior = resolve_binary_target(orig_df[self.config.target_col])
+
+                    self.orig_prior_cols = prior_cols
+                    self.orig_prior_model = HistGradientBoostingClassifier(
+                        max_iter=250,
+                        min_samples_leaf=20,
+                        l2_regularization=1.0,
+                        random_state=42,
+                    )
+                    self.orig_prior_model.fit(X_orig_prior, y_orig_prior)
+                    logging.info(
+                        f"Fitted Original Dataset Prior Model (HistGradientBoosting on {len(orig_df)} rows across {len(prior_cols)} features)."
+                    )
+                except Exception as e:
+                    logging.warning(f"Could not fit Original Dataset Prior Model: {e}")
+                    self.orig_prior_model = None
 
             self.fitted = True
             return self
@@ -334,6 +498,15 @@ class FeaturePipeline:
             data["total_delay"] = dep_delay + arr_delay
             data["has_delay"] = (data["total_delay"] > 0).astype(np.int8)
             data["has_severe_delay"] = (data["total_delay"] > 30).astype(np.int8)
+
+            # Delay Inflection Thresholds & Airborne Dynamics (Rugved Bane & Friends 1/2/3)
+            data["delay_over_10"] = (data["total_delay"] > 10).astype(np.int8)
+            data["arr_delay_over_10"] = (arr_delay > 10).astype(np.int8)
+            data["dep_delay_over_10"] = (dep_delay > 10).astype(np.int8)
+            data["delay_diff"] = (arr_delay - dep_delay).astype(np.float32)
+            data["route_delay_hazard"] = (
+                arr_delay / np.maximum(10.0, data["Flight Distance"] / 7.5)
+            ).astype(np.float32)
 
             # Airborne Delay Recovery & Difference Dynamics (Golden Features from Research)
             data["Delay_Delta"] = (dep_delay - arr_delay).astype(np.float32)
@@ -634,41 +807,91 @@ class FeaturePipeline:
                 for i in range(self.config.n_svd_components):
                     data[f"svd_{i}"] = svd_comps[:, i].astype(np.float32)
 
-            # Multi-Way Bayesian Target Encoding (Domain 4)
+            # -------------------------------------------------------------
+            # 10.5 ROUTE PROFILES & BOUNDED CROSSES (Rugved Bane & Friend 1)
+            # -------------------------------------------------------------
+            # Route Profiles: Flight Distance target encoding & aggregations
+            if self.config.enable_route_profiles and "Flight Distance" in data.columns:
+                if is_train and "Flight Distance" in self.train_oof_te and len(data) == len(self.train_oof_te["Flight Distance"]):
+                    data["te_Flight Distance"] = self.train_oof_te["Flight Distance"].astype(np.float32)
+                elif self.te_flight_distance_map:
+                    data["te_Flight Distance"] = (
+                        data["Flight Distance"]
+                        .map(self.te_flight_distance_map)
+                        .fillna(self.global_target_mean)
+                        .astype(np.float32)
+                    )
+                data["freq_flight_distance"] = (
+                    data["Flight Distance"].map(self.freq_flight_distance_map).fillna(0.0).astype(np.float32)
+                )
+                data["log_count_flight_distance"] = np.log1p(
+                    data["Flight Distance"].map(self.count_flight_distance_map).fillna(0)
+                ).astype(np.float32)
+                data["route_mean_arr_delay"] = (
+                    data["Flight Distance"].map(self.route_mean_arr_map).fillna(arr_delay).astype(np.float32)
+                )
+                data["route_std_arr_delay"] = (
+                    data["Flight Distance"].map(self.route_std_arr_map).fillna(0.0).astype(np.float32)
+                )
+
+            # Bounded Crosses String Representation
+            if self.config.enable_bounded_crosses:
+                bounded_dict = self._get_bounded_crosses(data)
+                for b_col, b_series in bounded_dict.items():
+                    data[b_col] = b_series.astype(str)
+
+            # Multi-Way Bayesian Target Encoding (Domain 4 + Extensions)
             if self.target_encoding_maps:
-                for col in ["multi_cross_1", "multi_cross_2", "class_x_travel_type", "gate_x_business"]:
+                for col in self.target_encoding_maps.keys():
+                    if col == "Flight Distance":
+                        continue
                     if is_train and col in self.train_oof_te and len(data) == len(self.train_oof_te[col]):
                         data[f"te_{col}"] = self.train_oof_te[col].astype(np.float32)
-                    elif col in self.target_encoding_maps:
+                    elif col in self.target_encoding_maps and col in data.columns:
                         m = self.target_encoding_maps[col]
                         data[f"te_{col}"] = data[col].map(m).fillna(self.global_target_mean).astype(np.float32)
 
             # -------------------------------------------------------------
+            # 10.8 ORIGINAL DATASET PRIOR FEATURES (Rugved Bane #2 and #3)
+            # -------------------------------------------------------------
+            if self.orig_prior_model is not None and self.orig_prior_cols:
+                try:
+                    X_prior_eval = data[self.orig_prior_cols].copy()
+                    for cat_c in self.config.categorical_cols:
+                        if cat_c in X_prior_eval.columns:
+                            mapping = self.label_encoder_dicts.get(cat_c, None)
+                            if mapping is not None:
+                                X_prior_eval[cat_c] = X_prior_eval[cat_c].map(mapping).fillna(-1)
+                            else:
+                                X_prior_eval[cat_c] = pd.factorize(X_prior_eval[cat_c])[0]
+                    p_prior = self.orig_prior_model.predict_proba(X_prior_eval)[:, 1].astype(np.float32)
+                    p_prior = np.clip(p_prior, 1e-5, 1.0 - 1e-5)
+                    data["orig_proba"] = p_prior
+                    data["orig_logit"] = np.log(p_prior / (1.0 - p_prior)).astype(np.float32)
+                except Exception:
+                    data["orig_proba"] = np.float32(0.5)
+                    data["orig_logit"] = np.float32(0.0)
+            else:
+                data["orig_proba"] = np.float32(0.5)
+                data["orig_logit"] = np.float32(0.0)
+
+            # -------------------------------------------------------------
             # 11. CATEGORICAL ENCODING
             # -------------------------------------------------------------
-            cat_columns = [
-                "Gender",
-                "Customer Type",
-                "Type of Travel",
-                "Class",
-                "class_x_travel_type",
-                "gate_x_business",
-                "multi_cross_1",
-                "multi_cross_2",
-            ]
-
+            cat_columns = list(self.label_encoders.keys())
             for col in cat_columns:
-                mapping = self.label_encoder_dicts.get(col)
-                if mapping is not None:
-                    data[col] = (
-                        data[col]
-                        .astype(str)
-                        .map(mapping)
-                        .fillna(-1)
-                        .astype(np.int16)
-                    )
-                else:
-                    data[col] = pd.factorize(data[col])[0].astype(np.int16)
+                if col in data.columns:
+                    mapping = self.label_encoder_dicts.get(col)
+                    if mapping is not None:
+                        data[col] = (
+                            data[col]
+                            .astype(str)
+                            .map(mapping)
+                            .fillna(-1)
+                            .astype(np.int16)
+                        )
+                    else:
+                        data[col] = pd.factorize(data[col])[0].astype(np.int16)
 
             # Drop identifier if present
             if self.config.id_col in data.columns:
@@ -683,8 +906,11 @@ class FeaturePipeline:
             return data
 
     def fit_transform(
-        self, train_df: pd.DataFrame, test_df: pd.DataFrame | None = None
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame | None = None,
+        orig_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Fits transductive statistics and transforms training data."""
-        self.fit(train_df, test_df)
+        self.fit(train_df, test_df, orig_df=orig_df)
         return self.transform(train_df, is_train=True)

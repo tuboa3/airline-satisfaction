@@ -162,6 +162,11 @@ class FeatureConfig:
     kmeans_clusters_per_class: int = 8
     kmeans_anomaly_clusters: int = 16
 
+    # Advanced Domain Extensions (Rugved Bane 0.96059 LB + Friend 1/2/3 Findings)
+    enable_orig_prior: bool = True
+    enable_route_profiles: bool = True
+    enable_bounded_crosses: bool = True
+
 
 @dataclass
 class TrainConfig:
@@ -175,7 +180,7 @@ class TrainConfig:
 
     # Domain 1: Original Host Dataset Ingestion & Weight Attenuation
     use_original_data: bool = True
-    original_sample_weight: float = 0.65
+    original_sample_weight: float = 0.50
     use_density_ratio_weighting: bool = False
     density_ratio_clip_min: float = 0.05
     density_ratio_clip_max: float = 3.0
@@ -222,6 +227,8 @@ class TrainConfig:
             "learning_rate": 0.05,
             "depth": 7,
             "l2_leaf_reg": 3.0,
+            "boosting_type": "Plain",
+            "ctr_leaf_reg": 10.0,
             "bagging_temperature": 0.2,
             "random_strength": 1.0,
             "combinations_ctr": ["BinarizedTargetMeanValue", "Counter"],
@@ -258,9 +265,29 @@ class TrainConfig:
             "dropout": 0.1,
             "lr": 1e-3,
             "weight_decay": 1e-4,
-            "batch_size": 4096,
-            "epochs": 32,
+            "batch_size": 2048,
+            "epochs": 48,
             "gamma": 15.0,
+            "alpha_burnin": 0.1,
+            "alpha_final": 0.85,
+            "random_state": 42,
+        }
+    )
+
+    # Secondary Orthogonal Neural Architecture: Parallel Low-Rank DCN-v2
+    dcn_params: dict[str, Any] = field(
+        default_factory=lambda: {
+            "cross_layers": 3,
+            "rank_ratio": 0.25,
+            "deep_dims": [512, 256, 128],
+            "dropout": 0.15,
+            "lr": 1e-3,
+            "weight_decay": 1e-4,
+            "batch_size": 2048,
+            "epochs": 48,
+            "gamma": 15.0,
+            "alpha_burnin": 0.1,
+            "alpha_final": 0.85,
             "random_state": 42,
         }
     )
@@ -324,3 +351,7 @@ class TrainConfig:
     @property
     def realmlp_params(self) -> dict[str, Any]:
         return self.tabm_params
+
+    @property
+    def dcn_v2_params(self) -> dict[str, Any]:
+        return self.dcn_params
