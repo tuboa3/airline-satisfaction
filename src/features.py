@@ -982,9 +982,13 @@ class FeaturePipeline:
             # Bounded Crosses String Representation
             if self.config.enable_bounded_crosses:
                 bounded_dict = self._get_bounded_crosses(data)
-                for b_col, b_series in bounded_dict.items():
-                    data[b_col] = b_series.astype(str)
-                data = data.copy()
+                new_cols = {
+                    b_col: b_series.astype(str)
+                    for b_col, b_series in bounded_dict.items()
+                }
+                data = pd.concat(
+                    [data, pd.DataFrame(new_cols, index=data.index)], axis=1
+                )
 
             # Multi-Way Bayesian Target Encoding (Domain 4 + Extensions)
             if self.target_encoding_maps:
