@@ -1,10 +1,11 @@
 # PROJECT_STATE: Airline Passenger Satisfaction Optimization
 
 **Target Metric:** ROC-AUC  
-**Current Best Leaderboard (LB):** `0.95824` (Phase 1 Nelder-Mead Logit Blend)  
-**Target Top-1 Leaderboard:** `0.96167` (Deficit: ~34 bps)  
-**Phase 2 Individual OOF Scores:** LightGBM `0.95993`, XGBoost `0.96003`, RealMLP `0.95957`  
-**Current Codebase Commit:** [`186ac07`](https://github.com/tuboa3/airline-satisfaction/commit/186ac07) (`main` synced with `origin/main`)  
+**Current Best Leaderboard (LB):** `0.96008` (Phase 2 Nelder-Mead Logit Blend, Rank 382/868)  
+**Target Top-1 Leaderboard:** `0.96177` (Deficit: ~169 bps)  
+**Phase 2 Individual OOF Scores:** CatBoost `0.96029`, XGBoost `0.96003`, LightGBM `0.95993`, RealMLP `0.95957`, DCN-v2 `0.95913`  
+**Phase 3 Status:** All GBDT improvements committed and pushed. Awaiting Kaggle training run.  
+**Current Codebase Commit:** [`ac1e678`](https://github.com/tuboa3/airline-satisfaction/commit/ac1e678) (`main` synced with `origin/main`)  
 **Timestamp:** October 6, 2026  
 
 ---
