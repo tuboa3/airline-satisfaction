@@ -166,3 +166,77 @@ class ExactMatchPostprocessor:
         sub.to_csv(out_file, index=False)
         self.logger.info(f"Saved leak-overridden submission to: {out_file}")
         return sub
+
+
+class HybridPostCalibrator:
+    """
+    Hybrid Post-Calibration Engine (Friend 1):
+    1. Empirical Quantile Mapping:
+       F_test(p) -> Quantile_OOF(p)
+       Maps test predictions to the empirical distribution of OOF predictions.
+       Guarantees exact preservation of 100% of ROC-AUC test rankings while aligning
+       test probabilities to the OOF distribution, fixing extreme tail compression.
+    2. Monotonic Beta Calibration on synthetic validation slices:
+       p_cal = sigma(a * log(s) - b * log(1-s) + c), a, b > 0
+    """
+
+    def __init__(self):
+        self.logger = get_logger("HybridPostCalibrator")
+
+    @staticmethod
+    def empirical_quantile_align(
+        oof_preds: np.ndarray, test_preds: np.ndarray
+    ) -> np.ndarray:
+        """
+        Non-parametric empirical quantile mapping.
+        Ranks test predictions uniformly and maps them to the empirical quantiles of OOF.
+        Strictly monotonic: ROC-AUC is completely invariant.
+        """
+        n_test = len(test_preds)
+        ranks = pd.Series(test_preds).rank(method="average").values / float(n_test + 1)
+        oof_sorted = np.sort(oof_preds)
+        mapped = np.quantile(oof_sorted, ranks).astype(np.float32)
+        return mapped
+
+    @staticmethod
+    def beta_calibrate(
+        oof_preds: np.ndarray,
+        y_true: np.ndarray,
+        test_preds: np.ndarray,
+        eps: float = 1e-6,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Monotonic Beta / Logit calibration fitted on OOF predictions.
+        Solves: min_{a, b > 0} BCE(y_true, sigma(a * log(s) - b * log(1 - s) + c))
+        Returns: (calibrated_oof, calibrated_test)
+        """
+        from scipy.optimize import minimize
+        from scipy.special import expit
+
+        s_oof = np.clip(oof_preds, eps, 1.0 - eps)
+        s_test = np.clip(test_preds, eps, 1.0 - eps)
+
+        log_s_oof = np.log(s_oof)
+        log_1ms_oof = np.log(1.0 - s_oof)
+
+        log_s_test = np.log(s_test)
+        log_1ms_test = np.log(1.0 - s_test)
+
+        def loss_fn(params):
+            a, b, c = params
+            z = a * log_s_oof - b * log_1ms_oof + c
+            p = expit(z)
+            p = np.clip(p, eps, 1.0 - eps)
+            bce = -np.mean(y_true * np.log(p) + (1.0 - y_true) * np.log(1.0 - p))
+            return bce
+
+        init_params = [1.0, 1.0, 0.0]
+        bounds = [(0.01, 10.0), (0.01, 10.0), (-5.0, 5.0)]
+
+        res = minimize(loss_fn, init_params, method="L-BFGS-B", bounds=bounds)
+        a_opt, b_opt, c_opt = res.x
+
+        cal_oof = expit(a_opt * log_s_oof - b_opt * log_1ms_oof + c_opt).astype(np.float32)
+        cal_test = expit(a_opt * log_s_test - b_opt * log_1ms_test + c_opt).astype(np.float32)
+
+        return cal_oof, cal_test

@@ -1,364 +1,127 @@
-# **Exhaustive Diagnosis of Neural Diversity Failure and Manifold Enhancements in Tabular Deep Learning**
+# **Architecting the Next-Generation Tabular Deep Learning Pipeline: Latent Psychometrics, Flat Minima Optimization, and Neural Manifold Regularization**
 
-The empirical diagnostics extracted from the Dual-T4 out-of-fold (OOF) validation run reveal a fundamental mathematical ceiling in the applied modeling paradigm. While the gradient-boosted decision trees (GBDTs), specifically LightGBM and CatBoost, successfully converged near the 0.95852 ROC-AUC threshold, the custom Tabular ResNet stalled at a heavily degraded 0.949431. More critically, the neural network yielded a Pearson correlation of $r=0.9828$ against LightGBM and $r=0.9831$ against CatBoost. This extreme correlation trajectory indicates a catastrophic failure of architectural diversity. Rather than capturing orthogonal variance or mapping an independent topological manifold, the neural network essentially approximated the identical decision boundaries constructed by the recursive partitioning of the GBDTs. Consequently, the second-stage logit blender was forced to constrain the neural network's ensemble weight to a mere 0.1441, yielding a blended ROC-AUC of 0.95883 and leaving a massive 350-basis-point deficit to the 0.96167 top-leaderboard benchmark1.  
-Bridging this gap requires a radical deconstruction of the optimization dynamics, the manifold engineering pipeline, and the neural architecture itself. The current feature pipeline mathematically corrupts the psychometric survey data by forcing disjoint non-ordinal responses into continuous Euclidean spaces. Furthermore, the PyTorch distributed training implementation inherently throttled the gradient descent trajectory. The path forward demands transitioning from legacy Tabular ResNets to modern parameter-efficient ensemble architectures, specifically the integration of TabM with RealMLP-TD, deploying psychometrically rigorous embeddings for survey data, and enforcing strict asynchronous data-parallelism protocols.
+The integration of advanced tabular deep learning backbones into classical gradient-boosted decision tree (GBDT) pipelines has become a primary catalyst for breaking performance asymptotes in structured data competitions and enterprise applications. While models such as RealMLP-TabM, achieving a 0.95957 out-of-fold (OOF) score, and Parallel Low-Rank DCN-v2, reaching a 0.95913 OOF score, have demonstrated state-of-the-art predictive capabilities, they currently face diminishing returns in ensemble blending. The observed 17.23% blend weight allocation for these neural models is a direct consequence of their high prediction correlation with GBDTs, measured between \$r \= 0.9911\$ and \$0.9960\$. To successfully cross the 0.96177 Top-1 threshold from the current 0.96058 OOF ensemble state, the neural pipeline must learn feature manifolds and decision boundaries that are fundamentally inaccessible to orthogonal recursive partitioning algorithms.  
+This comprehensive architectural report presents a highly specialized blueprint to decouple the neural representations from GBDT inductive biases. The framework addresses three critical dimensions necessary for the next neural representation leap. First, it details the mathematical transformation of ordinal survey data into orthogonal psychometric latent variables utilizing Item Response Theory (IRT) and Structural Equation Variational Autoencoders (SE-VAE). Second, it outlines the stabilization of parameter-efficient ensembles (TabM) and explicit cross networks (DCN-v2) via Sharpness-Aware Minimization (SAM) and homoscedastic multi-task uncertainty weighting. Finally, it establishes the regularization protocols for neural manifold preprocessing via Piecewise Linear Encodings (PLE) to prevent synthetic distribution overfitting and maximize test-set transferability.
 
-## **Root-Cause Analysis of Tabular ResNet Underperformance**
+## **1\. Psychometric Latent Subscales and Item Response Theory**
 
-The 91-basis-point performance deficit observed between the Tabular ResNet and the LightGBM baseline is not an artifact of random initialization, nor does it indicate that deep learning is inherently ill-suited for this 700,000-row synthetic dataset. Rather, it is the compounding consequence of optimization starvation, severe distributed training bottlenecks, and a mismatch in the embedding initialization strategy.
+The dataset in question contains 14 ordinal Likert features, with ratings constrained between 0 and 5\. Treating these as independent continuous numerical features or unordered categorical variables forces the neural network to approximate multidimensional step-functions—a task at which GBDTs inherently excel due to their recursive splitting logic. By transforming these raw ordinal inputs into continuous, orthogonal psychological latent spaces, the neural network is provided with a smooth, continuous manifold that decision trees cannot easily mimic or reproduce.
 
-### **Optimization Starvation and Gradient Dynamics**
+### **1.1 The Multidimensional Graded Response Model Formulation**
 
-Training a Tabular ResNet on a 700,000-row dataset for merely 16 epochs with a batch size of 4096 results in approximately 170 steps per epoch, yielding only 2,734 total weight updates over the entire training lifecycle. For deep tabular architectures utilizing the AdamW optimizer, this step count is mathematically insufficient to navigate out of local saddle points and descend into the sharp, localized minima required to model complex, high-order tabular interactions.  
-The AdamW algorithm relies on the exponential moving average of the gradient variance (the second moment estimator) to scale the step size for individual parameters. With a batch size of 4096, the gradient variance is highly smoothed, but with only 2,700 total steps, the second moment estimator barely stabilizes before the cosine decay schedule prematurely shrinks the learning rate from $1{0}^{-3}$ to near zero. Consequently, the network undergoes a state of "early optimization starvation." To achieve parity with GBDTs on datasets approaching one million rows, tabular neural networks inherently require prolonged exposure to the loss manifold, often demanding between 64 and 256 epochs to allow the internal representation layers to fully decouple from the initial randomized state3.  
-Furthermore, the integration of Periodic Linear Representations (PLR) or sinusoidal embeddings depends heavily on the precise initialization of the frequency scale parameter $\sigma$. The mapping \$x \\mapsto \\text{Concat}(\\sin(\\omega x), \\cos(\\omega x))\$ requires the frequencies $\omega$ to be sampled from a normal distribution $N(0,{\sigma }^{2})$1. If $\sigma$ is misaligned with the empirical variance of the continuous features, the network suffers from catastrophic spectral bias. A $\sigma$ initialized too low results in low-frequency oversmoothing, causing the neural network to mimic simple linear regression and lose the ability to capture high-frequency thresholds (like specific flight delay minute boundaries). Conversely, a $\sigma$ initialized too high creates high-frequency chaos, destroying the gradient signal and rendering the embeddings unlearnable5. Because the model was under-trained, the network lacked the necessary iterations to adapt the linear projection weights downstream of these slowly-learning periodic embeddings, forcing the model to rely entirely on the macroscopic, easily discernible relationships that the GBDTs had already captured perfectly, thus driving the Pearson correlation to 0.98311.
+To accurately model ordered polytomous responses, the Multidimensional Graded Response Model (MGRM)—a sophisticated extension of Samejima's original framework—provides the most robust theoretical foundation for the neural architecture1. The MGRM operates on the psychometric assumption that a discrete ordinal response is the manifestation of an underlying, continuous latent trait that dictates passenger behavior.  
+For a randomly selected passenger \$i\$, the probability of selecting category \$k\$ (where \$k \\in \\{0, 1, 2, 3, 4, 5\\}\$) for a given survey item \$j\$ is defined by the difference between two cumulative boundary response functions, \$P^+\_{jk}(\\theta)\$ and \$P^+\_{j, k+1}(\\theta)\$1. Let \$\\theta\$ be a vector of length \$H=4\$ representing the target latent traits, specifically Physical Comfort, Digital/Online Experience, Ground/Inflight Service, and Flight Logistics. The boundary response function using a multidimensional two-parameter logistic (2PL) link is mathematically formulated as:
 
-### **The PyTorch DataParallel Bottleneck and AMP Failures**
+\$\$P^+\_{jk}(\\theta) \= \\frac{1}{1 \+ \\exp\\left\[-D \\sum\_{h=1}^H a\_{jh}(\\theta\_h \- b\_{jk})\\right\]}\$\$  
+In this formulation, \$P^+\_{jk}(\\theta)\$ represents the probability of passenger \$i\$ rating item \$j\$ in category \$k\$ or higher1. The variable \$a\_{jh}\$ acts as the item discrimination parameter for item \$j\$ on the \$h\$-th dimension, dictating how well the survey item differentiates passengers along the continuous latent trait2. The variable \$b\_{jk}\$ serves as the boundary location, or threshold parameter, for category \$k\$, representing the specific latent trait level required to have exactly a 50% probability of choosing category \$k\$ or higher1. The scaling constant \$D\$ is typically set to 1.7 to seamlessly approximate the normal ogive model, or 1.0 when maintaining a standard logistic metric1.  
+To implement this psychometric model efficiently within a deep learning architecture, the network adopts the \$a-c\$ parameterization. Under this transformation, \$c\_{jk} \= \- \\sum\_h a\_{jh} b\_{jk}\$, treating \$c\_{jk}\$ as an intercept term that can be directly learned via standard linear layers within the neural network's initial embedding blocks1. This allows the neural network to natively compute IRT probability distributions without requiring an external classical statistical solver.
 
-The utilization of torch.nn.DataParallel (DP) across dual T4 GPUs introduces severe synchronization overhead and effectively throttles the optimization trajectory. DataParallel operates on a single-process, multi-threaded paradigm that is subjected to the Python Global Interpreter Lock (GIL)7. During every forward pass, the DP module replicates the entire model across all available GPUs, scatters the 4096-row batch across the devices, gathers all outputs back to the master GPU (GPU 0), computes the Surrogate AUC loss on the master device, and finally scatters the gradients back7.  
-This continuous scattering and gathering creates a massive data-transfer bottleneck on the PCIe bus. The master GPU becomes computationally overwhelmed while the secondary GPU idles, waiting for the backward pass synchronization. This architectural flaw frequently results in erratic gradient application and massive GPU idle times8.  
-Moreover, when executing Automatic Mixed Precision (AMP) with torch.cuda.amp.GradScaler inside a DataParallel wrapper, severe gradient unscaling bugs frequently manifest. The GradScaler may unscale the gradients of the master GPU while failing to properly synchronize the scale factor across the threads, leading to silent gradient underflow (zeros) or overflow (NaNs) during the optimizer step9. This forces the network to silently skip parameter updates, further stunting the training process. PyTorch strictly recommends transitioning to torch.nn.parallel.DistributedDataParallel (DDP) for all multi-GPU workloads8. DDP spawns independent processes per GPU, computes gradients locally, and synchronizes via a highly optimized asynchronous AllReduce ring, overlapping communication with the backward computation and ensuring deterministic, mathematically sound mixed-precision scaling10.
+### **1.2 Formulating Orthogonal Latent Indices via SE-VAE**
 
-### **The Architectural Pivot: RealMLP-TD vs. TabNet and TabPFN**
+While the MGRM provides the necessary likelihood function for ordinal data, estimating four explicitly orthogonal indices requires a constrained representation learning framework. To achieve this, the architecture constructs a Structural Equation Variational Autoencoder (SE-VAE), which enforces disentangled, highly interpretable representations specifically optimized for tabular data4.  
+The SE-VAE architecture maps the 14 Likert items into four specific groups based on a predefined structural equation prior. The network employs a grouped encoder design, processing the full input vector \$X\$ to generate construct-specific latent variables \$z\_k\$ alongside a global nuisance latent \$z\_m\$4. The variational lower bound, or ELBO, optimized by the SE-VAE incorporates a heavily penalized \$\\beta\$-VAE formulation to enhance feature disentanglement8, defined mathematically as:  
+\$\$ \\mathcal{L}*{ELBO} \= \\mathbb{E}*{q\_\\phi(z\\vert{}x)}\[\\log p\_\\theta(x\\vert{}z)\] \- \\beta D\_{KL}(q\_\\phi(z\\vert{}x) \\vert{} \\vert{} p(z)) \$\$  
+To guarantee that the four derived indices are mathematically orthogonal, and thus provide completely non-redundant, low-correlation information to the TabM and DCN-v2 backbones, the architecture applies an explicit orthogonality constraint during the training phase4. By minimizing the cross-correlation matrix of the latent factors, the model ensures that the expected dot product between different latent dimensions is zero, expressed as \$\\mathbb{E}\[z\_k^\\top z\_j\] \= 0\$ for all \$k \\neq j\$4.  
+The structural mapping of the 14 Likert features to the four orthogonal latent indices, guided by the MGRM discrimination objective, is established in the following table:
 
-The custom Tabular ResNet should be abandoned. The field of tabular deep learning has evolved significantly, and architectures that rely on standard linear layers combined with skip connections consistently fail to match GBDT performance without exhaustive hyperparameter tuning. The analysis indicates a necessary pivot to **RealMLP-TD** (Tuned Defaults) combined with the **TabM** (Parameter-Efficient Ensembling) framework2.  
-Pivoting to TabNet or Modern TabPFN is not mathematically or computationally viable for this specific Kaggle configuration. TabNet relies on sequential sparse attention masks to enforce explicit feature selection15. While theoretically appealing, TabNet frequently underperforms and overfits on generative synthetic tabular data16. Synthetic datasets (often generated via CTGAN or TVAE) contain specific noise artifacts and multi-way categorical combinations that decision trees natively isolate; TabNet's sparse masks tend to over-regularize these signals, causing severe performance degradation. TabPFN (including the recent Modern TabPFN v2.5 and v3 variants) is unparalleled in small-data, zero-shot environments6. However, TabPFN is an In-Context Learning (ICL) transformer that fundamentally struggles with extreme scale. While recent chunking strategies attempt to scale TabPFN to larger datasets, executing a 700,000-row context space requires immense KV-cache memory and compromises the zero-shot algorithmic guarantees that make TabPFN powerful, rendering it suboptimal for a Dual-T4 deployment6.  
-RealMLP-TD, conversely, introduces structural innovations specifically designed to match or exceed GBDT performance on large-scale tabular datasets out-of-the-box3. The exact architecture integrates several critical mathematical departures from standard MLPs.
+| Orthogonal Latent Index (zh​) | Associated Ordinal Likert Features (xj​) | MGRM Discrimination Objective |
+| :---- | :---- | :---- |
+| **\$z\_1\$: Physical Comfort** | Seat comfort, Leg room service, Cleanliness, Food and drink | Maximizes \$a\_{j1}\$ for somatic and sensory evaluation attributes, isolating physical friction. |
+| **\$z\_2\$: Digital/Online Experience** | Inflight wifi service, Ease of Online booking, Online boarding | Maximizes \$a\_{j2}\$ for UI/UX friction, digital accessibility, and pre-flight connectivity metrics. |
+| **\$z\_3\$: Ground/Inflight Service** | Inflight service, Baggage handling, Checkin service, On-board service | Maximizes \$a\_{j3}\$ for human-to-human interaction, staff responsiveness, and hospitality metrics. |
+| **\$z\_4\$: Flight Logistics** | Departure/Arrival time convenient, Gate location, Inflight entertainment | Maximizes \$a\_{j4}\$ for temporal efficiency, spatial convenience, and logistical execution metrics. |
 
-| Feature | Legacy Tabular ResNet | RealMLP-TD | Advantage |
-| :---- | :---- | :---- | :---- |
-| **Linear Parametrization** | Standard $Wx+b$ | Neural Tangent Parametrization (NTP) | Stabilizes gradient magnitudes across deep networks. |
-| **Activations** | ReLU / GELU | Parametric SELU / Mish | Prevents dead neurons; learnable slope adapts to tabular scale. |
-| **Numeric Embeddings** | Standard PLR | Periodic Bias Linear DenseNet (PBLD) | Concatenates raw values with periodic projections. |
-| **Feature Scaling** | Batch Normalization | Learnable Diagonal Scaling Matrix | Soft feature selection applied prior to the first linear layer. |
+### **1.3 Formulating Passenger-Level Behavioral Metrics**
 
-RealMLP-TD utilizes Neural Tangent Parametrization (NTP) in its linear layers. Instead of the standard linear forward pass, NTP computes the output as ${z}^{(l+1)}=\frac{1}{\sqrt{{d}_{l}}}{W}^{(l)}{x}^{(l)}+{b}^{(l)}$, where ${d}_{l}$ is the input dimension4. By explicitly scaling the weight matrices by the inverse square root of the input dimension, NTP perfectly stabilizes the gradient magnitudes across layers of varying widths, mimicking the optimization stability of infinite-width networks and preventing vanishing gradients when integrating wide periodic embedding layers3.  
-To force the Pearson correlation below the critical $r\leq 0.940$ threshold, this RealMLP-TD backbone must be wrapped in the **TabM** architecture. TabM introduces parameter-efficient ensembling by training $k$ (e.g., $k=16$ or $k=32$) implicit MLPs in parallel using BatchEnsemble techniques2. The forward pass of a TabM linear layer is defined mathematically as:
+Beyond generating structural latent traits, passenger rating behaviors themselves provide profound inductive biases that decision trees struggle to contextualize. Passengers utilize ordinal scales highly subjectively; a rating of '3' from a traditionally lenient passenger signifies deep dissatisfaction, whereas a '3' from a highly critical passenger indicates baseline acceptability. The following psychometric meta-features must be engineered and fed directly into the neural manifold to capture these nuances.  
+To capture the specific leniency versus criticality of a respondent, the architecture calculates the intra-passenger rating variance (\$V\_i\$) across all valid Likert items for passenger \$i\$. This variance is formulated as the mean squared deviation from the passenger's own average rating, \$V\_i \= \\frac{1}{J} \\sum\_{j=1}^J (x\_{ij} \- \\bar{x}\_i)^2\$. A low variance combined with a high average rating indicates a uniformly lenient passenger, rendering a slightly lower score on a specific feature a massive negative signal. Conversely, a high variance indicates elevated sensitivity to specific service failures, allowing the neural network to calibrate the weight of each rating dynamically.  
+Survey entropy (\$H\_i\$) is calculated to quantify the uniformity of a passenger's rating distribution, detecting "straight-lining" behaviors where respondents click the same rating down the entire survey out of fatigue or apathy. Entropy is calculated as \$H\_i \= \- \\sum\_{k=0}^5 p\_{ik} \\log(p\_{ik})\$, where \$p\_{ik}\$ is the empirical probability of passenger \$i\$ choosing category \$k\$ across the 14 items. Passengers presenting an entropy nearing zero provide remarkably low information gain, and the neural network utilizes this metric to down-weight their influence dynamically, preventing noise from contaminating the decision boundary11.  
+Furthermore, the architecture must resolve the zero-inflation problem inherent in tabular survey datasets. In ordinal survey data, a rating of '0' frequently conflates two entirely distinct phenomena: "Not Applicable," representing a structural zero such as rating in-flight wifi on an aircraft without routers installed, versus "Abysmal Service," representing a sampling zero reflecting genuine failure12. To mathematically disentangle this, the pipeline fits a Zero-Inflated Ordered Probit model, yielding two critical probabilities per relevant item. The first is the modeled probability that the zero is structural, heavily correlated with features like short-haul flight distance or older aircraft types. The second is the modeled probability that the zero is a genuine, lowest-tier quality rating. By feeding these distinct, continuous probability scores into the embedding layers, the neural network learns context-aware penalty mechanics rather than treating all zeroes as equivalent negative scalars.
 
-$$LinearBE(X)=((X\odot R)W)\odot S+B$$
+## **2\. Upgrading RealMLP-TabM and DCN-v2 for Standalone Performance**
 
-Where $W\in {R}^{{d}_{in}\times {d}_{out}}$ is the shared primary weight matrix, and $R\in {R}^{k\times {d}_{in}}$, $S\in {R}^{k\times {d}_{out}}$, and $B\in {R}^{k\times {d}_{out}}$ are rank-1 adapter vectors unique to each of the $k$ ensemble members2. Because the ensemble members share the macroscopic weight matrix $W$ but maintain individual scaling ($R,S$) and shifting ($B$) vectors, TabM generates a highly diverse set of predictions at the cost of a single model's parameter count. By utilizing TabM-style initialization (where all $R$ and $S$ vectors are initialized near 1.0, forcing the models to differentiate strictly through gradient updates), the architecture explores orthogonal trajectories in the loss landscape, structurally breaking the correlation with axis-aligned GBDTs21.
+Achieving a 0.9605+ standalone OOF score necessitates that the architectures of RealMLP-TabM and DCN-v2 undergo significant enhancements via advanced optimization landscapes and multi-task representation learning. Tabular deep learning models are uniquely prone to falling into sharp, highly overfitting local minima14. Standard gradient descent executed on heavily engineered features frequently converges to fragile solutions that fail to generalize out-of-fold, requiring targeted geometric interventions.
 
-## **Survey Psychometrics and Metric Distortion in Manifold Engineering**
+### **2.1 Integrating Sharpness-Aware Minimization (SAM) and BatchEnsemble**
 
-The exploratory data analysis reveals that the existing feature engineering pipeline—specifically the use of TruncatedSVD and MiniBatchKMeans—is mathematically corrupting the survey manifold. Treating Likert-scale responses as continuous numeric vectors fundamentally destroys the topological space of the data1.
+The TabM architecture achieves remarkable parameter-efficient ensembling by implicitly imitating an ensemble of MLPs, utilizing \$k=16\$ distinct heads, through BatchEnsemble techniques16. Instead of maintaining \$k\$ completely distinct models, TabM utilizes a shared central weight matrix \$W\$ and \$k\$ rank-1 multiplicative adapters, defined by vectors \$r\_i\$ and \$s\_i\$. The forward pass for a specific ensemble member is formulated as \$\\ell\_i(x\_i) \= (r\_i \\odot (W(s\_i \\odot x))) \+ b\_i\$18. This shared-weight paradigm acts as an inherent regularizer, forcing the ensemble members to learn diverse representations within a tightly constrained parameter space, while deterministic initialization of the adapters further stabilizes the early training phase18.  
+Despite this efficiency, tabular networks rapidly converge to sharp minima that harm test-set transferability15. Sharpness-Aware Minimization (SAM) explicitly penalizes this sharpness by seeking parameters that minimize the maximum loss within a localized neighborhood of radius \$\\rho\$11. The core SAM objective is defined as \$\\min\_{\\theta} \\max\_{\\vert{}\\vert{}\\epsilon\\vert{}\\vert{}\_2 \\le \\rho} L(\\theta \+ \\epsilon)\$, where the standard implementation utilizes a first-order Taylor expansion to approximate the worst-case adversarial perturbation \$\\epsilon^\*\$ as \$\\rho \\frac{\\nabla\_\\theta L(\\theta)}{\\vert{}\\vert{}\\nabla\_\\theta L(\\theta)\\vert{}\\vert{}\_2}\$14.  
+However, applying standard SAM homogeneously to the entire TabM architecture undermines the necessary diversity of the BatchEnsemble. If the multiplicative adapters (\$r\_i, s\_i\$) are heavily penalized for sharpness, they collapse into homogeneous, overlapping representations, entirely defeating the ensemble's purpose20. To prevent this, the architecture implements a decoupled SAM variant known as Split-FG SAM20. This methodology partitions the model parameters into a shared trunk (\$\\theta\_{trunk} \= W\$) and independent heads and adapters (\$\\theta\_{head} \= \\{r, s, b\\}\$)20. The adversarial perturbation \$\\epsilon\$ is calculated and applied exclusively to \$\\theta\_{trunk}\$. Consequently, the shared representation is forced into a wide, flat, and highly generalizable basin, while the \$k\$ independent adapters are updated via standard AdamW optimization, allowing them to flexibly capture diverse local variations without being constrained by the flatness penalty20.  
+Similarly, the Parallel Low-Rank DCN-v2 architecture benefits from localized flatness optimization. The DCN-v2 explicitly models bounded-degree feature interactions using a low-rank cross network, formulated as \$x\_{l+1} \= x\_0 \\odot (U V^\\top x\_l \+ b) \+ x\_l\$25. By utilizing Adaptive SAM (ASAM), which adjusts the perturbation radius based on a scale-invariant metric of the parameter norms, the cross network avoids memorizing high-frequency synthetic artifacts present in the massive training set14.
 
-### **Disjoint Subspace Mapping for '0' (Not Applicable)**
+### **2.2 SWA and Cosine Annealing on 830k Rows**
 
-In the dataset, the rating '0' denotes skipped or non-applicable services (e.g., a passenger not using inflight wifi), while ratings '1' through '5' represent an ordinal scale of satisfaction. In Euclidean space, algorithms calculating ${L}_{2}$ norms or linear projections inherently assume strict metric continuity. If an algorithm processes a rating of 0, it calculates the distance between N/A (0) and "Terrible" (1) as identical to the distance between "Terrible" (1) and "Poor" (2). Because 0 is often assigned to premium passengers who skip irrelevant services (resulting in a 95%+ satisfaction rate for these specific profiles), forcing 0 to act as "worse than 1" creates artificial, highly destructive decision boundaries1. Linear dimensionality reduction techniques like SVD will stretch the manifold in the wrong direction, prioritizing this false ordinal relationship.  
-To natively accommodate this property, the neural network must abandon continuous scalar ingestion for these columns and utilize **Disjoint Embedding Subspaces**. The embedding layer must explicitly route the integer 0 to a dedicated parameter vector ${e}_{na}\in {R}^{d}$, which is completely disconnected from the ordinal space. The integers 1 through 5 should be mapped to an ordinal matrix ${E}_{ord}\in {R}^{5\times d}$. By isolating the representation of N/A, the network can learn the specific demographic profile associated with skipped services without dragging the ordinal sentiment scores into a distorted latent space1.
+When training on expansive tabular datasets containing 830k rows over extended schedules spanning 64 to 80 epochs, standard optimizers frequently oscillate around complex saddle points. To counteract this, the architecture integrates Stochastic Weight Averaging (SWA) tightly coupled with a Cosine Annealing learning rate schedule.  
+The Cosine Annealing schedule rapidly reduces the learning rate to allow convergence into a local minimum, but periodically restarts the learning rate to bounce the model out of suboptimal, sharp minima. During the final 20% of the training epochs, the pipeline maintains this cyclical learning rate and samples the network weights at the nadir of each cycle. SWA then computes the simple average of these sampled weights, defined as \$W\_{SWA} \= \\frac{1}{T} \\sum\_{t=1}^T W\_t\$. Because the cyclical trajectory orbits a wide, flat region of the loss landscape, the geometric center of this orbit—the SWA weight—reliably rests at the optimal, flattest point. When applied to DCN-v2's explicit cross-network matrices \$U\$ and \$V\$, SWA severely dampens the high-frequency noise inherent in high-order explicit feature crosses, acting as a massive regularizer and significantly boosting standalone Top-1 accuracy.
 
-### **The Rasch Partial Credit Model for Latent Satisfaction**
+### **2.3 Auxiliary Multi-Task Loss Formulation**
 
-Simple summation, averaging, or linear projection of survey responses assumes that all questions possess identical psychometric difficulty and discriminability. In reality, scoring a 5 on "Inflight Entertainment" is statistically more difficult than scoring a 5 on "Baggage Handling"23. To engineer a mathematically sound representation of global satisfaction, the feature pipeline must preprocess the ordinal variables using Item Response Theory (IRT), specifically the Rasch Partial Credit Model (PCM)25.  
-The Rasch PCM defines the probability of passenger $v$ selecting rating $x$ on survey item $i$ as a function of the passenger's latent satisfaction trait ${\theta }_{v}$ and the item's threshold difficulty ${\tau }_{ix}$. The mathematical formulation is:
+To fundamentally decouple the neural representations from those of decision trees, the network must be forced to learn the underlying causal structure of the data manifold rather than exclusively fitting a direct input-to-target mapping. This structural decoupling is achieved through the implementation of a highly specialized auxiliary multi-task loss formulation.  
+The architecture is equipped with three distinct prediction heads branching from the final shared representation layer. The primary head predicts Passenger Satisfaction, executing the core binary classification task. The second head executes a Self-Supervised Masking Reconstruction task; during the forward pass, 15% of the continuous and ordinal inputs are dynamically replaced with a \[MASK\] token or zeroed. This reconstruction head predicts the masked values, forcing the network to learn deep inter-feature correlations, such as inferring latent 'Inflight Service' quality based solely on 'Physical Comfort' and 'Flight Distance' metrics. The third head serves as an auxiliary classifier, predicting 'Travel Type' (Business versus Personal) or 'Passenger Class' based exclusively on the behavioral and psychometric latent variables extracted earlier in the pipeline.  
+Combining these diverse tasks via a simple weighted sum, where \$L\_{total} \= w\_1 L\_1 \+ w\_2 L\_2 \+ w\_3 L\_3\$, requires intractable hyperparameter tuning and frequently leads to gradient domination, where the high-magnitude reconstruction loss washes out the primary classification objective28. To resolve this, the architecture implements Kendall's homoscedastic task-dependent uncertainty weighting28.  
+By framing the multi-task problem probabilistically, the optimal weighting parameters (\$\\sigma\_i\$) for each task are learned dynamically during the training process via maximum likelihood estimation29. The joint multi-task loss is mathematically formulated as:
 
-\$\$P(X\_{vi} \= x \\vert \\theta\_v, \\tau\_i) \= \\frac{\\exp \\sum\_{j=0}^x (\\theta\_v \- \\tau\_{ij})}{\\sum\_{k=0}^{m\_i} \\exp \\sum\_{j=0}^k (\\theta\_v \- \\tau\_{ij})}\$\$  
-Where ${\tau }_{i0}\equiv 0$, and ${m}_{i}$ is the maximum score for item $i$ (which is 5 in this schema)26. By fitting this log-odds model via Conditional Maximum Likelihood on the training fold, every passenger is assigned a continuous latent trait score ${\theta }_{v}$ in logit space25. This univariate latent trait provides both the GBDTs and the neural network with a thermodynamically stable, continuous representation of global passenger sentiment that mathematically accounts for the empirical difficulty of individual survey questions, replacing the corrupted SVD features with psychometrically validated manifolds.
+\$\$\\mathcal{L}\_{total}(\\theta, \\sigma\_1, \\sigma\_2, \\sigma\_3) \= \\sum\_{i=1}^3 \\left( \\frac{1}{2\\sigma\_i^2} \\mathcal{L}\_i(\\theta) \+ \\log(\\sigma\_i) \\right)\$\$  
+Under this formulation, as the reconstruction loss (\$\\mathcal{L}\_2\$) becomes excessively noisy or uncertain during early training phases, the network autonomously increases the parameter \$\\sigma\_2\$, which subsequently decreases the coefficient \$\\frac{1}{2\\sigma\_2^2}\$, dynamically down-weighting the task's influence on the overall gradient28. The \$\\log(\\sigma\_i)\$ term acts as a regularizer to prevent the network from simply predicting infinite uncertainty to drive the loss to zero. This dynamic restraint guarantees that the self-supervised manifold learning serves strictly as a stabilizing inductive bias for the primary satisfaction target without overwhelming the optimizer, yielding a uniquely dense, context-aware embedding space that GBDTs are structurally incapable of constructing.
 
-### **Survey Response Styles and Non-Linear Artifacts**
+## **3\. Neural Manifold Preprocessing and Regularization**
 
-The presence of 1.2% "straight-liners" (passengers responding with identical ratings across all 13 dimensions) and significant midpoint satisficing (heavy use of rating 3\) introduces multi-modal density spikes in the data1. Neural networks, optimizing for global loss reduction, often smooth over these narrow density spikes. To ensure the network natively recognizes these psychological response artifacts, explicit metadata features must be synthesized and concatenated prior to the embedding layers:
+Tabular neural networks are hyper-sensitive to the parameterization of continuous and categorical variables. If left unregularized, numerical spline embeddings and high-cardinality categorical vectors will overfit the synthetic nuances of the 830k training distribution, destroying the model's transferability to the hold-out test set31.
 
-> 1. **Extremity Index**: The ratio of extreme responses (1s and 5s) to the total number of answered questions. This captures passengers with highly polarized experiences.  
-> 2. **Intra-Passenger Variance**: The mathematical variance of the 14 survey responses for a single passenger. Straight-liners will yield exactly $0.0$, creating a sharp deterministic flag for the network.  
-> 3. **Midpoint Fraction**: The ratio of 3s given, identifying passengers exhibiting survey fatigue or neutral apathy.  
-> 4. **N/A Count**: The absolute sum of 0s, serving as a proxy for the passenger's level of interaction with the airline's service ecosystem.
+### **3.1 Piecewise Linear Encodings (PLE)**
 
-## **Delay Non-Linearity and Feature Representation**
+As demonstrated heavily in the literature surrounding tabular deep learning, representing a scalar numerical feature as an embedded vector drastically improves the performance of MLP-like architectures31. For continuous variables such as Flight Distance and Departure Delay, the architecture implements Piecewise Linear Encoding (PLE)33.  
+In the PLE framework, a numerical feature \$x\$ is not fed directly into the network as a single scalar. Instead, its empirical training distribution is split into \$T\$ intervals, or bins, with boundaries \$b\_0, b\_1, \\dots, b\_T\$33. The scalar \$x\$ is subsequently encoded into a \$T\$-dimensional vector \$e\$, where each component \$e\_t\$ represents the local position of \$x\$ within the designated bin33. Specifically, if \$x \> b\_t\$, the component \$e\_t \= 1\$; if \$x \\le b\_{t-1}\$, the component \$e\_t \= 0\$; and if \$b\_{t-1} \< x \\le b\_t\$, the component \$e\_t\$ is calculated as the fractional distance \$\\frac{x \- b\_{t-1}}{b\_t \- b\_{t-1}}\$33.  
+This methodology creates a continuous, spline-like thermometer encoding that preserves ordinal relationships while expanding dimensionality. A subsequent independent linear layer projects this \$T\$-dimensional vector into the required model dimension \$d\$, formulated mathematically as \$f\_i(x) \= v\_0 \+ \\sum\_{t=1}^T e\_t \\cdot v\_t \= \\text{Linear}(\\text{PLE}(x))\$33. This specific transformation endows the RealMLP and DCN-v2 architectures with the ability to fit non-linear, piecewise trends that tree-based models natively discover via recursive splitting, directly bridging the inductive bias gap33.
 
-Gradient descent mechanisms within neural networks are highly sensitive to extreme heteroscedasticity and long-tailed continuous distributions, such as flight delays measured in minutes28.
+### **3.2 Embedding Regularization and Activation Parametrization**
 
-### **Piecewise Linear Splines and Quantile Embeddings**
+The primary risk associated with PLE and wide categorical embeddings is massive parameter expansion; embedding a high-cardinality categorical feature into a dimension of \$d=64\$ introduces thousands of isolated weights that are prone to memorizing training noise31. To maximize generalization, several rigorous regularization layers are mandatory.  
+Following the RealMLP architectural paradigm, all embeddings are passed through a highly controlled normalization and activation scheme18. The pipeline applies Layer Normalization immediately after the PLE projection to stabilize the forward variance of the expanded vectors. Subsequently, the network utilizes Parametric SELU (Scaled Exponential Linear Unit) activations18. The parametric activation function is defined as:
 
-Passing raw delay minutes directly into a linear layer forces the neural network to assume a constant marginal hazard rate. The empirical data refutes this: delays under 15 minutes have virtually zero hazard on passenger satisfaction, while the hazard spikes dramatically between 15 and 60 minutes, and then asymptotically plateaus past 120 minutes1. To natively model this, continuous variables like Age, Flight Distance, and Delays must be encoded using Piecewise Linear Spline Embeddings (PLE) or Quantile Embeddings30.  
-PLE transforms a scalar feature $x$ into a high-dimensional sparse vector by mapping it onto $T$ learned quantile bins. Let the bin boundaries, determined by the empirical quantiles of the training distribution, be \$b\_0, b\_1, \\dots, b\_T\$. The piecewise projection computes the normalized overlap of $x$ with each bin:
-
-$${w}_{t}(x)=\max\limits_{}\left({0,\min\limits_{}\left({1,\frac{x-{b}_{t-1}}{{b}_{t}-{b}_{t-1}}}\right)}\right)$$
-
-This produces a sparse, order-preserving vector where each dimension explicitly captures the non-linear inflection points of the delay hazard curve31. The neural network can therefore assign a weight of approximately zero to the specific neurons representing the 0–15 minute bins, while aggressively penalizing the neurons connected to the bins spanning the 15–60 minute range. This mechanism entirely bypasses the need for the neural network to learn complex non-linear activation bounds, feeding it pre-mapped topological boundaries.
-
-### **Airborne Delay Recovery Vectorization**
-
-The phenomenon of "Airborne Delay Recovery" dictates that when the Arrival Delay is less than the Departure Delay, satisfaction receives an immediate \+11% lift1. If these two delay features are passed independently to the neural network, the model must expend significant depth to learn the subtractive interaction. This geometric relationship requires explicit spatial isolation at the input level. Three distinct continuous features must be engineered and passed through the PLE module:
-
-> * Delay\_Delta \= $DepartureDelay-ArrivalDelay$  
-> * Recovery\_Magnitude \= $\max\limits_{}(0,Delay\_Delta)$  
-> * Compounding\_Delay \= $\max\limits_{}(0,-Delay\_Delta)$
-
-By isolating these magnitude vectors, the network is permitted to independently parameterize the reward of recovered flight time versus the severe penalty of compounded in-flight delays.
-
-## **Strategic Blueprint to Break 0.96150**
-
-To execute this strategy, break the 0.96150 ROC-AUC barrier, and achieve standalone ROC-AUC $\geq 0.9585$ while maintaining $r\leq 0.940$ against GBDTs, the architecture must deploy a PyTorch DistributedDataParallel TabM-RealMLP hybrid, utilizing a Surrogate AUC margin loss.
-
-### **Surrogate AUC Margin Loss Optimization**
-
-To maximize the ROC-AUC directly, the model must optimize the pairwise ranking between satisfied and dissatisfied passengers, rather than point-wise binary cross-entropy, which merely optimizes log-likelihood1. With a sufficiently large effective batch size enabled by DDP across multiple GPUs, the pairwise Surrogate AUC loss computes the divergence across all positive and negative samples within the batch.  
-Let $P$ be the set of predicted logits for true positives, and $N$ be the set of predicted logits for true negatives. The smooth relaxation of the non-differentiable Heaviside step function is formulated as:
-
-\$\$\\mathcal{L}\_{AUC} \= \\frac{1}{\\vert{}\\mathcal{P}\\vert{} \\vert{}\\mathcal{N}\\vert{}} \\sum\_{p\_i \\in \\mathcal{P}} \\sum\_{p\_j \\in \\mathcal{N}} \\left( 1 \- \\sigma(\\gamma (p\_i \- p\_j)) \\right)^2\$\$  
-Where $\sigma$ represents the sigmoid function, and $\gamma$ is a temperature hyperparameter that controls the sharpness of the margin (optimally set to $\gamma =15.0$)1. Minimizing this squared divergence explicitly forces the network to rank every satisfied passenger higher than every dissatisfied passenger, aligning the gradient trajectory directly with the Kaggle evaluation metric.
-
-### **Production PyTorch Implementation Blueprint**
-
-The following blueprint translates the exact mathematical structures into high-performance, DDP-ready PyTorch code. It incorporates Disjoint Embeddings for the survey columns, Piecewise Linear Splines for the continuous metrics, Neural Tangent Parametrization for stability, and the TabM BatchEnsemble mechanism to guarantee architectural diversity.
-
-Python  
-import torch  
-import torch.nn as nn  
-import torch.nn.functional as F  
-import math
-
-class DisjointSurveyEmbedding(nn.Module):  
-    """  
-    Explicitly separates '0' (N/A) from the ordinal 1-5 responses.  
-    Prevents metric distortion in the continuous embedding manifold.  
-    """  
-    def \_\_init\_\_(self, num\_survey\_cols, emb\_dim=8):  
-        super().\_\_init\_\_()  
-        self.num\_survey\_cols \= num\_survey\_cols  
-        \# Dedicated N/A embedding vectors for each column  
-        self.na\_embeddings \= nn.Parameter(torch.randn(num\_survey\_cols, emb\_dim) \* 0.02)  
-        \# Ordinal embeddings for 1-5 (size 6 to accommodate 0-5 indexing safely)  
-        self.ordinal\_embeddings \= nn.Embedding(6, emb\_dim)  
-        nn.init.normal\_(self.ordinal\_embeddings.weight, std=0.02)
-
-    def forward(self, x):  
-        \# x shape: (batch\_size, num\_survey\_cols)  
-        batch\_size \= x.size(0)  
-        out \= torch.zeros(batch\_size, self.num\_survey\_cols,   
-                          self.na\_embeddings.size(1), device=x.device)  
-          
-        is\_na \= (x \== 0\)  
-        is\_ordinal \= (x \> 0\)  
-          
-        \# Route 1-5 to ordinal embeddings  
-        out\[is\_ordinal\] \= self.ordinal\_embeddings(x\[is\_ordinal\])  
-          
-        \# Route 0 to the specific N/A parameter vector  
-        na\_expanded \= self.na\_embeddings.unsqueeze(0).expand(batch\_size, \-1, \-1)  
-        out\[is\_na\] \= na\_expanded\[is\_na\]  
-          
-        return out.view(batch\_size, \-1)
-
-class PiecewiseLinearSplineEmbedding(nn.Module):  
-    """  
-    Robust Piecewise Linear Spline embedding for extreme non-linearities.  
-    Boundaries should be initialized with empirical quantiles from the train set.  
-    """  
-    def \_\_init\_\_(self, num\_features, num\_bins=16):  
-        super().\_\_init\_\_()  
-        self.num\_features \= num\_features  
-        self.num\_bins \= num\_bins  
-        \# Bin boundaries initialized uniformly; updated externally via quantiles  
-        self.register\_buffer('boundaries', torch.linspace(0, 1, num\_bins \+ 1).view(1, 1, \-1))  
-          
-    def forward(self, x):  
-        \# x shape: (batch\_size, num\_features)  
-        x \= x.unsqueeze(-1) \# (batch\_size, num\_features, 1\)  
-          
-        b\_lower \= self.boundaries\[:, :, :-1\]  
-        b\_upper \= self.boundaries\[:, :, 1:\]  
-        widths \= b\_upper \- b\_lower  
-          
-        \# Calculate localized activation fraction per bin  
-        activations \= (x \- b\_lower) / (widths \+ 1e-8)  
-        activations \= torch.clamp(activations, min=0.0, max=1.0)  
-          
-        return activations.view(x.size(0), \-1)
-
-class NTPLinear(nn.Module):  
-    """  
-    Neural Tangent Parametrization Linear Layer.  
-    Stabilizes gradient magnitudes independent of layer width.  
-    """  
-    def \_\_init\_\_(self, in\_features, out\_features):  
-        super().\_\_init\_\_()  
-        self.in\_features \= in\_features  
-        self.weight \= nn.Parameter(torch.randn(out\_features, in\_features))  
-        self.bias \= nn.Parameter(torch.zeros(out\_features))  
-          
-    def forward(self, x):  
-        \# Scale the weights dynamically by the inverse square root of input dimension  
-        scale \= 1.0 / math.sqrt(self.in\_features)  
-        return F.linear(x, self.weight \* scale, self.bias)
-
-class TabM\_BatchEnsembleLayer(nn.Module):  
-    """  
-    Parameter-Efficient Ensemble layer utilizing BatchEnsemble principles.  
-    Forces multiple implicit networks to search orthogonal loss manifolds.  
-    """  
-    def \_\_init\_\_(self, in\_features, out\_features, k\_ensembles=16):  
-        super().\_\_init\_\_()  
-        self.k \= k\_ensembles  
-        self.linear \= NTPLinear(in\_features, out\_features)  
-          
-        \# Rank-1 adapters for each of the k ensemble members  
-        self.R \= nn.Parameter(torch.ones(k\_ensembles, in\_features))  
-        self.S \= nn.Parameter(torch.ones(k\_ensembles, out\_features))  
-        self.B \= nn.Parameter(torch.zeros(k\_ensembles, out\_features))  
-          
-        \# TabM-style initialization: strict constraints to force differentiation over time  
-        nn.init.normal\_(self.R, mean=1.0, std=0.05)  
-        nn.init.normal\_(self.S, mean=1.0, std=0.05)
-
-    def forward(self, x):  
-        \# x shape: (batch\_size, k\_ensembles, in\_features)  
-        x\_adapted \= x \* self.R.unsqueeze(0)   
-          
-        \# Apply shared backbone linear transformation efficiently  
-        batch\_size \= x.size(0)  
-        x\_flat \= x\_adapted.view(batch\_size \* self.k, \-1)  
-        z\_flat \= self.linear(x\_flat)  
-        z \= z\_flat.view(batch\_size, self.k, \-1)  
-          
-        \# Apply output adapter S and bias B  
-        out \= z \* self.S.unsqueeze(0) \+ self.B.unsqueeze(0)  
-        return out
-
-class RealMLP\_TabM\_Hybrid(nn.Module):  
-    """  
-    Complete hybrid blueprint executing RealMLP-TD inside a TabM structure.  
-    """  
-    def \_\_init\_\_(self, num\_survey\_cols, num\_cont\_cols, hidden\_dim=384, k\_ensembles=16):  
-        super().\_\_init\_\_()  
-        self.k \= k\_ensembles  
-          
-        \# Feature Pipelines  
-        self.survey\_embedder \= DisjointSurveyEmbedding(num\_survey\_cols, emb\_dim=8)  
-        self.ple\_embedder \= PiecewiseLinearSplineEmbedding(num\_cont\_cols, num\_bins=16)  
-          
-        in\_dim \= (num\_survey\_cols \* 8\) \+ (num\_cont\_cols \* 16\)  
-          
-        \# Feature-specific scaling layer (Soft Feature Selection)  
-        self.feature\_scaling \= nn.Parameter(torch.ones(in\_dim))  
-          
-        \# Ensemble View Expansion Layer  
-        self.ensemble\_expansion \= nn.Parameter(torch.ones(k\_ensembles, in\_dim))  
-          
-        \# RealMLP-TD Deep Backbone with BatchEnsemble  
-        self.block1 \= TabM\_BatchEnsembleLayer(in\_dim, hidden\_dim, k\_ensembles)  
-        self.block2 \= TabM\_BatchEnsembleLayer(hidden\_dim, hidden\_dim, k\_ensembles)  
-        self.block3 \= TabM\_BatchEnsembleLayer(hidden\_dim, hidden\_dim, k\_ensembles)  
-          
-        \# Prediction Heads  
-        self.head \= TabM\_BatchEnsembleLayer(hidden\_dim, 1, k\_ensembles)  
-          
-        \# Parametric SELU defined implicitly via standard SELU \+ learnable alpha  
-        self.alpha1 \= nn.Parameter(torch.ones(hidden\_dim))  
-        self.alpha2 \= nn.Parameter(torch.ones(hidden\_dim))  
-        self.alpha3 \= nn.Parameter(torch.ones(hidden\_dim))
-
-    def forward(self, survey\_x, cont\_x):  
-        emb\_survey \= self.survey\_embedder(survey\_x)  
-        emb\_cont \= self.ple\_embedder(cont\_x)  
-        x \= torch.cat(\[emb\_survey, emb\_cont\], dim=1) \# (batch\_size, in\_dim)  
-          
-        \# Apply feature scaling  
-        x \= x \* self.feature\_scaling.unsqueeze(0)  
-          
-        \# TabM Ensemble Expansion  
-        x \= x.unsqueeze(1) \* self.ensemble\_expansion.unsqueeze(0) \# (batch\_size, k, in\_dim)  
-          
-        \# Backbone Pass with Parametric Activations  
-        x \= self.block1(x)  
-        x \= (1 \- self.alpha1) \* x \+ self.alpha1 \* F.selu(x)  
-        x \= F.dropout(x, p=0.1, training=self.training)  
-          
-        x \= self.block2(x)  
-        x \= (1 \- self.alpha2) \* x \+ self.alpha2 \* F.selu(x)  
-        x \= F.dropout(x, p=0.1, training=self.training)  
-          
-        x \= self.block3(x)  
-        x \= (1 \- self.alpha3) \* x \+ self.alpha3 \* F.selu(x)  
-        x \= F.dropout(x, p=0.1, training=self.training)  
-          
-        \# Independent k logits  
-        logits \= self.head(x).squeeze(-1) \# (batch\_size, k)  
-          
-        if self.training:  
-            return logits \# Optimize all k heads independently via mean loss  
-        else:  
-            \# During inference, logit blending across the k ensembles prevents variance  
-            return torch.mean(logits, dim=1)
-
-class SurrogateAUCLoss(nn.Module):  
-    """  
-    Differentiable margin ranking loss maximizing ROC-AUC directly.  
-    """  
-    def \_\_init\_\_(self, gamma=15.0):  
-        super().\_\_init\_\_()  
-        self.gamma \= gamma
-
-    def forward(self, logits, targets):  
-        \# logits shape: (batch\_size, k\_ensembles), targets shape: (batch\_size,)  
-        \# Expand targets for broadcast  
-        targets \= targets.unsqueeze(1).expand\_as(logits)  
-          
-        \# Initialize loss accumulator  
-        total\_loss \= 0.0  
-          
-        \# Calculate AUC loss independently for each of the k ensemble members  
-        for k\_idx in range(logits.size(1)):  
-            k\_logits \= logits\[:, k\_idx\]  
-            k\_targets \= targets\[:, k\_idx\]  
-              
-            pos\_logits \= k\_logits\[k\_targets \== 1\]  
-            neg\_logits \= k\_logits\[k\_targets \== 0\]  
-              
-            if len(pos\_logits) \== 0 or len(neg\_logits) \== 0:  
-                continue  
-                  
-            pos\_logits \= pos\_logits.unsqueeze(1) \# (N\_pos, 1\)  
-            neg\_logits \= neg\_logits.unsqueeze(0) \# (1, N\_neg)  
-              
-            differences \= pos\_logits \- neg\_logits  
-              
-            \# Minimize the squared error of the inverted sigmoid margin  
-            member\_loss \= torch.mean((1 \- torch.sigmoid(self.gamma \* differences)) \*\* 2\)  
-            total\_loss \+= member\_loss  
-              
-        return total\_loss / logits.size(1)
-
-### **Operational Mandates for DDP and Mixed Precision**
-
-When deploying this architecture, torch.distributed.run or torchrun must be utilized to instantiate DistributedDataParallel with the NCCL backend, entirely bypassing the legacy DataParallel thread contention and Python GIL bottlenecks8. During the backward pass in DDP, gradients are synchronized asynchronously across the GPUs, significantly accelerating throughput and permitting extended training over 64 to 128 epochs.  
-To leverage Automatic Mixed Precision (AMP) safely and avoid the severe gradient unscaling bugs associated with DP, the torch.cuda.amp.GradScaler must wrap the surrogate AUC margin loss calculation9. Crucially, when executing manual gradient clipping or gradient penalty logging, scaler.unscale\_(optimizer) must be called precisely once prior to the clipping operation to prevent infinite variance explosion or NaN propagation11.  
-By feeding the structurally unified latent psychometric metrics (from the Rasch Partial Credit Model) and the non-linear Piecewise Linear Spline vectors into this heavily regularized TabM-RealMLP-TD hybrid, the neural network is forced to evaluate permutations of the synthetic manifold entirely invisible to standard axis-aligned trees. The $k=16$ independent heads will generate a diverse pool of probabilistic logits that structurally decorate the residuals of the LightGBM and CatBoost models, successfully breaking the 0.940 correlation barrier and yielding the requisite architectural diversity to cross the 0.96150 top-leaderboard threshold.
+\$\$\\sigma\_{\\alpha\_i}(x\_i) \= (1 \- \\alpha\_i)x\_i \+ \\alpha\_i \\text{SELU}(x\_i)\$\$  
+In this equation, \$\\alpha\_i\$ represents a learnable parameter initialized per neuron. If the optimization landscape dictates that \$\\alpha\_i \\to 0\$, the network seamlessly defaults to a linear transformation, allowing the architecture to dynamically switch off non-linearities for tabular features that strictly require simple monotonic scaling18. This flexibility prevents the severe overfitting associated with forcing deep, highly non-linear transformations on inherently noisy tabular data.  
+To balance the gradients flowing backward into the massive PLE and categorical matrices, the linear layers are initialized and scaled using Neural Tangent Parameterization (NTP)18. A linear layer computes the forward pass as \$z^{(l+1)} \= W^{(l)} x^{(l)} \+ b^{(l)}\$, but under NTP, this is subjected to a forward scaling factor of \$\\frac{1}{\\sqrt{d\_l}}\$18. By actively scaling the output by the inverse square root of the input dimension, NTP prevents excessively large gradient steps in high-dimensional embedding spaces, stabilizing the entire manifold learning process. Furthermore, heavy Spatial Dropout—which drops entire bins or specific categorical embedding dimensions simultaneously across the entire batch—is applied post-embedding18. This dropout strategy flawlessly mimics the feature-fraction masking inherent in XGBoost and LightGBM, ensuring that the downstream TabM adapters and DCN-v2 cross networks cannot rely on a single memorized embedding dimension to accurately predict passenger satisfaction.  
+Finally, Spectral Normalization is strictly applied to the explicit feature crossing matrices within the DCN-v2 architecture. Because the Parallel Low-Rank DCN-v2 network computes explicit feature crosses via the \$U V^\\top\$ factorization, these interaction matrices can easily memorize high-frequency synthetic artifacts from the input distribution25. Spectral Normalization strictly bounds the Lipschitz constant of the cross network, ensuring that a minuscule perturbation in the numerical input—such as a slight, insignificant shift in flight delay time—does not result in an exponentially magnified shift in the output logits. This dramatically improves the stability and reliability of the out-of-fold predictions.  
+The architectural synthesis of these methodologies directly targets the representation bottleneck preventing the pipeline from crossing the 0.96177 Top-1 limit. By transforming the input manifold through Multidimensional Graded Response Models and SE-VAE, ordinal Likert data is converted into mathematically orthogonal, psychometrically valid continuous indices. Processing this enriched manifold through Piecewise Linear Encodings with Parametric SELU and NTP scaling creates a robust, variance-stabilized feature space. The integration of Split-FG Sharpness-Aware Minimization on the shared trunk of TabM, combined with Cosine Annealing and SWA, forces the optimizer out of sharp, GBDT-like local minima. Ultimately, the Kendall homoscedastic multi-task loss forces the network to learn the underlying causal structure of passenger satisfaction, bridging the inductive bias gap, decoupling the neural representation from standard gradient boosting, and paving the way to a 0.9605+ standalone OOF and a significantly heavier ensemble blending weight.
 
 #### **Works cited**
 
-> 1. another-friend.md  
-> 2. TabM: Advancing Tabular Deep Learning with Parameter-Efficient, [https\://arxiv.org/html/2410.24210v1](https://arxiv.org/html/2410.24210v1)  
-> 3. Strong Pre-Tuned MLPs and Boosted Trees on Tabular Data \- NIPS, [https\://proceedings.neurips.cc/paper\_files/paper/2024/file/2ee1c87245956e3eaa71aaba5f5753eb-Paper-Conference.pdf](https://proceedings.neurips.cc/paper_files/paper/2024/file/2ee1c87245956e3eaa71aaba5f5753eb-Paper-Conference.pdf)  
-> 4. Papers Explained Review 04: Tabular Deep Learning \- Medium, [https\://medium.com/dair-ai/papers-explained-review-04-tabular-deep-learning-776db04f965b](https://medium.com/dair-ai/papers-explained-review-04-tabular-deep-learning-776db04f965b)  
-> 5. Contrastive Symbolic Regression: Aligned Representations, [https\://openreview.net/attachment?id=h0317qKaeq\&name=originally\_submitted\_PDF](https://openreview.net/attachment?id=h0317qKaeq&name=originally_submitted_PDF)  
-> 6. A new performance standard. \- arXiv, [https\://arxiv.org/html/2605.13986v2](https://arxiv.org/html/2605.13986v2)  
-> 7. Some PyTorch multi-GPU training tips · The COOP Blog \- Cerfacs, [https\://cerfacs.fr/coop/pytorch-multi-gpu](https://cerfacs.fr/coop/pytorch-multi-gpu)  
-> 8. Getting Started with Distributed Data Parallel \- PyTorch documentation, [https\://docs.pytorch.org/tutorials/intermediate/ddp\_tutorial.html](https://docs.pytorch.org/tutorials/intermediate/ddp_tutorial.html)  
-> 9. Automatic Mixed Precision Using PyTorch \- DigitalOcean, [https\://www\.digitalocean.com/community/tutorials/automatic-mixed-precision-using-pytorch](https://www.digitalocean.com/community/tutorials/automatic-mixed-precision-using-pytorch)  
-> 10. Building a Production-Grade Multi-Node Training Pipeline with, [https\://towardsdatascience.com/building-a-production-grade-multi-node-training-pipeline-with-pytorch-ddp/](https://towardsdatascience.com/building-a-production-grade-multi-node-training-pipeline-with-pytorch-ddp/)  
-> 11. Automatic Mixed Precision package \- torch.amp \- PyTorch教程, [https\://pytorch.cadn.net.cn/docs\_en/2.2/amp.html](https://pytorch.cadn.net.cn/docs_en/2.2/amp.html)  
-> 12. ML Training Failure Encyclopedia \- Denpex, [https\://denpex.com/failures](https://denpex.com/failures)  
-> 13. PyTorch Distributed: Experiences on Accelerating Data Parallel, [https\://arxiv.org/pdf/2006.15704](https://arxiv.org/pdf/2006.15704)  
-> 14. TABM: ADVANCING TABULAR DEEP LEARNING \- OpenReview, [https\://openreview.net/notes/edits/attachment?id=nh9QEAMPO9\&name=pdf](https://openreview.net/notes/edits/attachment?id=nh9QEAMPO9&name=pdf)  
-> 15. A Closer Look at Deep Learning Methods on Tabular Datasets \- arXiv, [https\://arxiv.org/html/2407.00956v2](https://arxiv.org/html/2407.00956v2)  
-> 16. Robustness and Scalability Of Machine Learning for Imbalanced, [https\://arxiv.org/html/2512.21602v1](https://arxiv.org/html/2512.21602v1)  
-> 17. Large Language Model Few-Shot Learning for Predicting ... \- JMIR AI, [https\://ai.jmir.org/2026/1/e89054/PDF](https://ai.jmir.org/2026/1/e89054/PDF)  
-> 18. TabularMath: Evaluating Computational Extrapolation in Tabular, [https\://arxiv.org/pdf/2602.02523](https://arxiv.org/pdf/2602.02523)  
-> 19. ConTextTab: A Semantics-Aware Tabular In-Context Learner \- arXiv, [https\://arxiv.org/html/2506.10707v4](https://arxiv.org/html/2506.10707v4)  
-> 20. OmniCLIC: A Unified Omics Contrastive Learning Framework for, [https\://pubs.acs.org/doi/10.1021/acs.jcim.5c01397](https://pubs.acs.org/doi/10.1021/acs.jcim.5c01397)  
-> 21. (ICLR 2025\) TabM: Advancing Tabular Deep Learning With ... \- GitHub, [https\://github.com/yandex-research/tabm](https://github.com/yandex-research/tabm)  
-> 22. Google Sports Data, [https\://support.google.com/knowledgepanel/answer/9787176](https://support.google.com/knowledgepanel/answer/9787176)  
-> 23. Application of the Rasch measurement model in rehabilitation, [https\://www\.frontiersin.org/journals/rehabilitation-sciences/articles/10.3389/fresc.2023.1208670/full](https://www.frontiersin.org/journals/rehabilitation-sciences/articles/10.3389/fresc.2023.1208670/full)  
-> 24. Full Html \- Educational Methods & Psychometrics (EMP), [https\://emp-open.de/Full\_text?article\_id=255](https://emp-open.de/Full_text?article_id=255)  
-> 25. Transformation of Rasch model logits for enhanced interpretability, [https\://pmc.ncbi.nlm.nih.gov/articles/PMC9783398/](https://pmc.ncbi.nlm.nih.gov/articles/PMC9783398/)  
-> 26. Response Styles in the Partial Credit Model, [https\://epub.ub.uni-muenchen.de/29373/1/TR\_PCMRS.pdf](https://epub.ub.uni-muenchen.de/29373/1/TR_PCMRS.pdf)  
-> 27. Evaluating different scoring methods for the speeded Cloze-elide test, [https\://www\.tqmp.org/RegularArticles/vol18-3/p241/p241.pdf](https://www.tqmp.org/RegularArticles/vol18-3/p241/p241.pdf)  
-> 28. Time Series with PyTorch \- bibis.ir, [https\://download.bibis.ir/Books/Artificial-Intelligence/Time-Series/2026/Time%20Series%20with%20PyTorch%20%20Modern%20Deep%20Learning%20Toolkit%20for%20Real-World%20Forecasting%20Challenges%20(Graeme%20Davidson,%20Lei%20Ma)\_bibis.ir.pdf](https://download.bibis.ir/Books/Artificial-Intelligence/Time-Series/2026/Time%20Series%20with%20PyTorch%20%20Modern%20Deep%20Learning%20Toolkit%20for%20Real-World%20Forecasting%20Challenges%20\(Graeme%20Davidson,%20Lei%20Ma\)_bibis.ir.pdf)  
-> 29. Controlled learning of pointwise nonlinearities in neural-network-like, [https\://infoscience.epfl.ch/bitstreams/22897d8c-279e-476a-918a-a2f5b9483f54/download](https://infoscience.epfl.ch/bitstreams/22897d8c-279e-476a-918a-a2f5b9483f54/download)  
-> 30. Embedding Numerical Features and Meta-Features in Tabular Deep, [https\://www\.itc.ktu.lt/index.php/ITC/article/view/39134/17020](https://www.itc.ktu.lt/index.php/ITC/article/view/39134/17020)  
-> 31. Tabular Numeric Stretch Transformation \- arXiv, [https\://arxiv.org/html/2608.09162v1](https://arxiv.org/html/2608.09162v1)  
-> 32. A. Theoretical Analysis, [https\://proceedings.mlr.press/v119/sarafian20a/sarafian20a-supp.pdf](https://proceedings.mlr.press/v119/sarafian20a/sarafian20a-supp.pdf)  
-> 33. Automatic Mixed Precision examples — PyTorch 2.14 documentation, [https\://docs.pytorch.org/docs/stable/notes/amp\_examples.html](https://docs.pytorch.org/docs/stable/notes/amp_examples.html)
+> 1. Modeling Response Time and Responses in Multidimensional, [https\://www\.frontiersin.org/journals/psychology/articles/10.3389/fpsyg.2019.00051/full](https://www.frontiersin.org/journals/psychology/articles/10.3389/fpsyg.2019.00051/full)  
+> 2. Sample Size Requirements for Estimation of Item Parameters in the, [https\://pmc.ncbi.nlm.nih.gov/articles/PMC4746434/](https://pmc.ncbi.nlm.nih.gov/articles/PMC4746434/)  
+> 3. Item parameter estimations for multidimensional graded response, [https\://www\.frontiersin.org/journals/education/articles/10.3389/feduc.2022.947581/full](https://www.frontiersin.org/journals/education/articles/10.3389/feduc.2022.947581/full)  
+> 4. Disentangled Latent Representations for Tabular Data \- arXiv, [https\://arxiv.org/pdf/2508.06347](https://arxiv.org/pdf/2508.06347)  
+> 5. \[2508.06347\] Structural Equation-VAE: Disentangled Latent ... \- arXiv, [https\://arxiv.org/abs/2508.06347](https://arxiv.org/abs/2508.06347)  
+> 6. sevae \- PyPI, [https\://pypi.org/project/sevae/](https://pypi.org/project/sevae/)  
+> 7. PEARL: Prototype-Enhanced Alignment for Label-Efficient ... \- arXiv, [https\://arxiv.org/pdf/2601.17495](https://arxiv.org/pdf/2601.17495)  
+> 8. Disentangling genotype and environment specific latent features for, [https\://pmc.ncbi.nlm.nih.gov/articles/PMC11686434/](https://pmc.ncbi.nlm.nih.gov/articles/PMC11686434/)  
+> 9. A Closer Look at Disentangling in β-VAE \- arXiv, [https\://arxiv.org/pdf/1912.05127](https://arxiv.org/pdf/1912.05127)  
+> 10. From Autoencoder to Beta-VAE | Lil'Log, [https\://lilianweng.github.io/posts/2018-08-12-vae/](https://lilianweng.github.io/posts/2018-08-12-vae/)  
+> 11. MEMBERSHIP PRIVACY RISKS OF SHARPNESS AWARE, [https\://proceedings.iclr.cc/paper\_files/paper/2026/file/82f77023563b21fbd423b2d9b165c281-Paper-Conference.pdf](https://proceedings.iclr.cc/paper_files/paper/2026/file/82f77023563b21fbd423b2d9b165c281-Paper-Conference.pdf)  
+> 12. Dichotomous (Binary), Categorical-Ordinal, and Count Outcomes, [https\://publish.uwo.ca/\~ptrembla/longitudinal/lm-lecture12.pdf](https://publish.uwo.ca/~ptrembla/longitudinal/lm-lecture12.pdf)  
+> 13. Latent Trait Measurement Models for Other (not Binary) Responses, [https\://www\.lesahoffman.com/PSQF6249/PSQF6249\_Lecture6\_Other\_Responses.pdf](https://www.lesahoffman.com/PSQF6249/PSQF6249_Lecture6_Other_Responses.pdf)  
+> 14. arXiv:2412.05169v1 \[cs.LG\] 6 Dec 2024, [https\://arxiv.org/pdf/2412.05169?](https://arxiv.org/pdf/2412.05169)  
+> 15. arXiv:2406.13137v1 \[cs.LG\] 19 Jun 2024, [https\://arxiv.org/pdf/2406.13137?](https://arxiv.org/pdf/2406.13137)  
+> 16. TabM: Advancing Tabular Deep Learning with Parameter-Efficient, [https\://arxiv.org/html/2410.24210v1](https://arxiv.org/html/2410.24210v1)  
+> 17. Tabular Deep Learning for Hydrogen–Brine Interfacial Tension, [https\://pubs.acs.org/doi/10.1021/acs.energyfuels.6c01887](https://pubs.acs.org/doi/10.1021/acs.energyfuels.6c01887)  
+> 18. Papers Explained Review 04: Tabular Deep Learning \- Medium, [https\://medium.com/dair-ai/papers-explained-review-04-tabular-deep-learning-776db04f965b](https://medium.com/dair-ai/papers-explained-review-04-tabular-deep-learning-776db04f965b)  
+> 19. Measurement-Driven Path-Loss Modeling for Low-Altitude UAV Air, [https\://www\.mdpi.com/2504-446X/10/10/727](https://www.mdpi.com/2504-446X/10/10/727)  
+> 20. Exact Head Updates and Backpropagation-Free Trunk Training, [https\://openreview.net/pdf/e21ce61386767a95e435613a515e06b1fdff303e.pdf](https://openreview.net/pdf/e21ce61386767a95e435613a515e06b1fdff303e.pdf)  
+> 21. Track: Poster Session 6 \- ICLR 2027, [https\://iclr.cc/virtual/2025/session/31976](https://iclr.cc/virtual/2025/session/31976)  
+> 22. Re-M3Dr: Rebalanced MultiModal Mean Deviation Regression \- arXiv, [https\://arxiv.org/pdf/2605.26513](https://arxiv.org/pdf/2605.26513)  
+> 23. Improving Model-Based Reinforcement Learning by Converging to, [https\://proceedings.neurips.cc/paper\_files/paper/2025/file/a6df53f082619d02b9fad64a022e5de3-Paper-Conference.pdf](https://proceedings.neurips.cc/paper_files/paper/2025/file/a6df53f082619d02b9fad64a022e5de3-Paper-Conference.pdf)  
+> 24. Perturbed Forgetting of Model Biases Within SAM Dynamics \- GitHub, [https\://raw.githubusercontent.com/mlresearch/v235/main/assets/vani24a/vani24a.pdf](https://raw.githubusercontent.com/mlresearch/v235/main/assets/vani24a/vani24a.pdf)  
+> 25. DCN V2: Improved Deep & Cross Network and Practical Lessons for, [https\://www\.alphaxiv.org/audio/2008.13535](https://www.alphaxiv.org/audio/2008.13535)  
+> 26. DCN V2: Improved Deep & Cross Network and Practical Lessons for, [https\://arxiv.org/pdf/2008.13535](https://arxiv.org/pdf/2008.13535)  
+> 27. ASAM: Adaptive Sharpness-Aware Minimization for Scale-Invariant, [https\://research.samsung.com/blog/ASAM-Adaptive-Sharpness-Aware-Minimization-for-Scale-Invariant-Learning-of-Deep-Neural-Networks](https://research.samsung.com/blog/ASAM-Adaptive-Sharpness-Aware-Minimization-for-Scale-Invariant-Learning-of-Deep-Neural-Networks)  
+> 28. Multitask Learning Based on Improved Uncertainty Weighted Loss, [https\://www\.mdpi.com/2073-4433/13/6/989](https://www.mdpi.com/2073-4433/13/6/989)  
+> 29. Multi-Task Learning Using Uncertainty to Weigh Losses for Scene, [https\://arxiv.org/html/1705.07115v3](https://arxiv.org/html/1705.07115v3)  
+> 30. Multi-task Learning Using Uncertainty to Weigh Losses for Scene, [https\://www\.researchgate.net/publication/329747447\_Multi-task\_Learning\_Using\_Uncertainty\_to\_Weigh\_Losses\_for\_Scene\_Geometry\_and\_Semantics](https://www.researchgate.net/publication/329747447_Multi-task_Learning_Using_Uncertainty_to_Weigh_Losses_for_Scene_Geometry_and_Semantics)  
+> 31. On Embeddings for Numerical Features in Tabular Deep Learning, [https\://www\.alphaxiv.org/ro/abs/2203.05556](https://www.alphaxiv.org/ro/abs/2203.05556)  
+> 32. Rigorous Experimental Analysis of Tabular Data Generated using, [https\://www\.researchgate.net/publication/380386150\_Rigorous\_Experimental\_Analysis\_of\_Tabular\_Data\_Generated\_using\_TVAE\_and\_CTGAN](https://www.researchgate.net/publication/380386150_Rigorous_Experimental_Analysis_of_Tabular_Data_Generated_using_TVAE_and_CTGAN)  
+> 33. On Embeddings for Numerical Features in Tabular Deep Learning, [https\://openreview.net/pdf?id=pfI7u0eJAIr](https://openreview.net/pdf?id=pfI7u0eJAIr)  
+> 34. GitHub \- yandex-research/rtdl-num-embeddings: (NeurIPS 2022\) On, [https\://github.com/yandex-research/rtdl-num-embeddings](https://github.com/yandex-research/rtdl-num-embeddings)  
+> 35. REVISITING NEAREST NEIGHBOR FOR TABULAR DATA, [https\://openreview.net/pdf?id=JytL2MrlLT](https://openreview.net/pdf?id=JytL2MrlLT)  
+> 36. 1st Place \- GPT5.4, Gemini3.1, ClaudeOpus4.6 \- KGMON Playbook\!, [https\://www\.kaggle.com/competitions/playground-series-s6e3/writeups/1st-place-gpt5-4-gemini3-1-claudeopus4-6-kgm](https://www.kaggle.com/competitions/playground-series-s6e3/writeups/1st-place-gpt5-4-gemini3-1-claudeopus4-6-kgm)  
+> 37. PDHFORMER: PROGRESSIVE DUAL-HEAD TRANS \- OpenReview, [https\://openreview.net/attachment?id=vFcZIbXO4t\&name=pdf](https://openreview.net/attachment?id=vFcZIbXO4t&name=pdf)  
+> 38. Representation Learning for Tabular Data: A Comprehensive Survey, [https\://www\.computer.org/csdl/journal/tp/2026/06/11369258/2dHi0RBl4Vq](https://www.computer.org/csdl/journal/tp/2026/06/11369258/2dHi0RBl4Vq)

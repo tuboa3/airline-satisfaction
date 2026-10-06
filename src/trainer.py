@@ -156,11 +156,9 @@ class CrossValidationEngine:
                 teacher_test = np.mean(valid_test, axis=0)
                 logging.info(f"Loaded {len(valid_test)} GBDT teacher models for test consistency.")
 
-        is_tree_model = (
-            "lightgbm" in model_name_lower
-            or "lgb" in model_name_lower
-            or "xgboost" in model_name_lower
-            or "xgb" in model_name_lower
+        is_tree_model = any(
+            k in model_name_lower
+            for k in ["lightgbm", "lgb", "xgboost", "xgb", "catboost", "cb", "cat"]
         )
 
         for fold, (synth_tr_subidx, synth_va_subidx) in enumerate(skf.split(synth_indices, y_synth)):
@@ -221,7 +219,17 @@ class CrossValidationEngine:
                     "service_failure_class",
                     "age_class_travel",
                 ]
-                cat_cols = [c for c in candidate_cats if c in X_tr.columns]
+                # Also include all 39 Shelton Wang rating-context crosses (_x_)
+                cat_cols = [
+                    c
+                    for c in X_tr.columns
+                    if c in candidate_cats
+                    or (
+                        "_x_" in c
+                        and not c.startswith("te_")
+                        and not c.startswith("log_")
+                    )
+                ]
                 extra_fit_kwargs["cat_features"] = cat_cols
 
             teacher_tr = (
@@ -246,9 +254,11 @@ class CrossValidationEngine:
                 )
 
             if margin_va is not None:
-                val_preds = model.predict_proba(X_va, base_margin=margin_va)
+                val_preds = model.predict_proba(
+                    X_va, base_margin=margin_va, **extra_fit_kwargs
+                )
             else:
-                val_preds = model.predict_proba(X_va)
+                val_preds = model.predict_proba(X_va, **extra_fit_kwargs)
             oof_preds[synth_va_subidx] = val_preds
 
             fold_auc = roc_auc_score(y_va, val_preds)
@@ -257,9 +267,17 @@ class CrossValidationEngine:
 
             # Accumulate test predictions
             if margin_te is not None:
-                test_preds += model.predict_proba(X_test, base_margin=margin_te) / self.train_cfg.n_splits
+                test_preds += (
+                    model.predict_proba(
+                        X_test, base_margin=margin_te, **extra_fit_kwargs
+                    )
+                    / self.train_cfg.n_splits
+                )
             else:
-                test_preds += model.predict_proba(X_test) / self.train_cfg.n_splits
+                test_preds += (
+                    model.predict_proba(X_test, **extra_fit_kwargs)
+                    / self.train_cfg.n_splits
+                )
 
             # Memory garbage collection
             del X_tr, y_tr, sw_tr, X_va, y_va, model

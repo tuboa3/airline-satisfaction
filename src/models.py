@@ -351,17 +351,42 @@ class CatBoostModel(BaseModel):
         self.model = CatBoostClassifier(**self.params)
 
     def fit(self, X_train, y_train, X_val, y_val, sample_weight=None, **kwargs) -> None:
+        from catboost import Pool
+
         cat_features = kwargs.get("cat_features", None)
-        try:
-            self.model.fit(
+        base_margin_tr = kwargs.get("base_margin_tr", None)
+        base_margin_val = kwargs.get("base_margin_val", None)
+
+        if base_margin_tr is not None:
+            train_input = Pool(
                 X_train,
                 y_train,
+                weight=sample_weight,
+                baseline=base_margin_tr,
+                cat_features=cat_features,
+            )
+            val_input = Pool(
+                X_val,
+                y_val,
+                baseline=base_margin_val,
+                cat_features=cat_features,
+            )
+            fit_kwargs = dict(eval_set=val_input)
+        else:
+            train_input = X_train
+            fit_kwargs = dict(
                 sample_weight=sample_weight,
                 eval_set=(X_val, y_val),
                 cat_features=cat_features,
+            )
+
+        try:
+            self.model.fit(
+                train_input,
                 early_stopping_rounds=self.early_stopping_rounds,
                 verbose=self.verbose,
                 use_best_model=True,
+                **fit_kwargs,
             )
         except Exception as e:
             if self.params.get("task_type") == "GPU":
@@ -383,19 +408,23 @@ class CatBoostModel(BaseModel):
                     ]
                 self.model = CatBoostClassifier(**cpu_params)
                 self.model.fit(
-                    X_train,
-                    y_train,
-                    sample_weight=sample_weight,
-                    eval_set=(X_val, y_val),
-                    cat_features=cat_features,
+                    train_input,
                     early_stopping_rounds=self.early_stopping_rounds,
                     verbose=self.verbose,
                     use_best_model=True,
+                    **fit_kwargs,
                 )
             else:
                 raise e
 
     def predict_proba(self, X, **kwargs) -> np.ndarray:
+        base_margin = kwargs.get("base_margin", None)
+        if base_margin is not None:
+            from catboost import Pool
+
+            cat_features = kwargs.get("cat_features", None)
+            pool = Pool(X, baseline=base_margin, cat_features=cat_features)
+            return self.model.predict_proba(pool)[:, 1]
         return self.model.predict_proba(X)[:, 1]
 
 

@@ -122,13 +122,26 @@ class FeaturePipeline:
             index=df.index,
         ).astype(str)
 
-        return {
+        crosses = {
             "route_class_travel": dist_tier + "_" + cls + "_" + travel,
             "route_delay_tier": dist_tier + "_" + delay_tier,
             "route_dissatisfaction": dist_tier + "_" + dissat_count,
             "service_failure_class": dissat_count + "_" + cls + "_" + travel,
             "age_class_travel": age_tier + "_" + cls + "_" + travel,
         }
+
+        # Shelton Wang (11th place): 39 Rating-Context Crosses (+34 bps across all 5 folds)
+        # Each service rating crossed with Class, Type of Travel, Customer Type
+        context_cols = [
+            c for c in ["Class", "Type of Travel", "Customer Type"] if c in df.columns
+        ]
+        for rc in rating_cols:
+            r_str = df[rc].astype(str)
+            for ctx in context_cols:
+                cross_name = f"{rc}_x_{ctx}"
+                crosses[cross_name] = r_str + "|" + df[ctx].astype(str)
+
+        return crosses
 
     def _get_multi_crosses(self, df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
         """Generates high-cardinality multi-way topological crosses."""
@@ -686,6 +699,24 @@ class FeaturePipeline:
                 .astype(np.float32)
             )
 
+            data["comfort_score"] = data["cabin_score"]
+            logistics_cols = [
+                c
+                for c in [
+                    "Departure/Arrival time convenient",
+                    "Gate location",
+                    "Inflight entertainment",
+                ]
+                if c in ratings_no_zero.columns
+            ]
+            if logistics_cols:
+                data["logistics_score"] = (
+                    ratings_no_zero[logistics_cols]
+                    .mean(axis=1)
+                    .fillna(3)
+                    .astype(np.float32)
+                )
+
             data["total_service_mean"] = (
                 ratings_no_zero.mean(axis=1).fillna(3).astype(np.float32)
             )
@@ -731,6 +762,16 @@ class FeaturePipeline:
             data["straight_liner"] = (data["intra_passenger_var"] == 0.0).astype(
                 np.int8
             )
+
+            # 1b. Survey entropy across rating distribution (Friend 2)
+            r_mat = rating_matrix.values
+            ent_arr = np.zeros(len(data), dtype=np.float32)
+            n_items = float(r_mat.shape[1])
+            for k in range(6):
+                pk = (r_mat == k).sum(axis=1) / n_items
+                ent_arr -= np.where(pk > 0, pk * np.log(pk + 1e-9), 0.0)
+            data["survey_entropy"] = ent_arr.astype(np.float32)
+            data["survey_zero_count"] = (rating_matrix == 0).sum(axis=1).astype(np.int8)
 
             # 2. Midpoint satisficing (fraction of 3s given among answered questions)
             data["midpoint_fraction"] = (

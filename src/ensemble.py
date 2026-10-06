@@ -574,6 +574,37 @@ class EnsembleOptimizer:
         best_auc = roc_auc_score(y_true, oof_meta_preds)
         return oof_meta_preds, best_auc, test_meta_preds
 
+    def blend_logistic_stacking(
+        self,
+        model_names: list[str],
+        oof_list: list[np.ndarray],
+        test_list: list[np.ndarray],
+        y_true: np.ndarray,
+        C: float = 1.0,
+    ) -> tuple[np.ndarray, float, np.ndarray]:
+        """
+        Plain Regularized Logistic Regression Stacking on Logits (Sachith7 #1 Stacker).
+        Proved to outperform complex neural and non-linear stackers when base models are strong.
+        """
+        from sklearn.linear_model import LogisticRegression
+
+        eps = self.epsilon
+        X_oof = np.column_stack([logit(np.clip(p, eps, 1.0 - eps)) for p in oof_list])
+        X_test = np.column_stack([logit(np.clip(p, eps, 1.0 - eps)) for p in test_list])
+
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        oof_preds = np.zeros(len(y_true), dtype=np.float32)
+        test_preds = np.zeros(len(X_test), dtype=np.float32)
+
+        for tr_idx, va_idx in skf.split(X_oof, y_true):
+            clf = LogisticRegression(C=C, max_iter=1000, solver="lbfgs", random_state=42)
+            clf.fit(X_oof[tr_idx], y_true[tr_idx])
+            oof_preds[va_idx] = clf.predict_proba(X_oof[va_idx])[:, 1]
+            test_preds += clf.predict_proba(X_test)[:, 1] / 5.0
+
+        auc = roc_auc_score(y_true, oof_preds)
+        return oof_preds, auc, test_preds
+
     def run_all(self, chosen_method: str = "auto") -> tuple[np.ndarray, float, np.ndarray]:
         """
         Executes all ensembling paradigms, compares their out-of-fold performance,
@@ -675,10 +706,20 @@ class EnsembleOptimizer:
         )
         self.logger.info(f"Strategy 7 (Isotonic Calibrated Stacking): OOF ROC-AUC = {auc_iso:.5f}")
 
-        # 11. Selection
+        # 11. Strategy 8: Plain Regularized Logistic Regression Stacking (Sachith7 #1 Stacker)
+        oof_logreg, auc_logreg, test_logreg = self.blend_logistic_stacking(
+            model_names, oof_list, test_list, y_true
+        )
+        self.logger.info(
+            f"Strategy 8 (Regularized Logistic Regression Stacking): OOF ROC-AUC = {auc_logreg:.5f}"
+        )
+
+        # 12. Selection
         candidates = {
             "rank": (oof_rank, auc_rank, test_rank),
             "logit": (oof_slsqp, auc_slsqp, test_slsqp),
+            "logistic": (oof_logreg, auc_logreg, test_logreg),
+            "logreg": (oof_logreg, auc_logreg, test_logreg),
             "wmw": (oof_wmw, auc_wmw, test_wmw),
             "smooth_wmw": (oof_swmw, auc_swmw, test_swmw),
             "ridge": (oof_ridge, auc_ridge, test_ridge),
@@ -699,18 +740,30 @@ class EnsembleOptimizer:
         )
         self.logger.info("=" * 70)
 
-        # Save Final Submission
+        # Hybrid Post-Calibration: Align Test Quantiles to OOF Empirical Distribution (Friend 1)
+        from src.postprocess import HybridPostCalibrator
+
+        aligned_champ_test = HybridPostCalibrator.empirical_quantile_align(
+            champ_oof, champ_test
+        )
+
+        # Save Final Submission (both quantile-aligned champion and raw champion)
         test_ids = self.load_test_ids()
         sub_df = pd.DataFrame(
+            {self.feature_cfg.id_col: test_ids, self.feature_cfg.target_col: aligned_champ_test}
+        )
+        raw_sub_df = pd.DataFrame(
             {self.feature_cfg.id_col: test_ids, self.feature_cfg.target_col: champ_test}
         )
 
         os.makedirs(self.paths.submissions_dir, exist_ok=True)
         sub_path = os.path.join(self.paths.submissions_dir, "submission_ensemble.csv")
+        raw_path = os.path.join(self.paths.submissions_dir, "submission_ensemble_raw.csv")
         sub_df.to_csv(sub_path, index=False)
         sub_df.to_csv("submission.csv", index=False)
+        raw_sub_df.to_csv(raw_path, index=False)
         self.logger.info(
-            f"Exported Champion Submissions to '{sub_path}' and 'submission.csv'"
+            f"Exported Quantile-Aligned Champion to '{sub_path}' and 'submission.csv' (Raw saved to '{raw_path}')"
         )
 
-        return champ_oof, champ_auc, champ_test
+        return champ_oof, champ_auc, aligned_champ_test
