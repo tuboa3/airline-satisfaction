@@ -253,12 +253,17 @@ class CrossValidationEngine:
                     **extra_fit_kwargs,
                 )
 
+            # Build clean kwargs for predict_proba (exclude training-only keys)
+            predict_kwargs = {}
+            if "cat_features" in extra_fit_kwargs:
+                predict_kwargs["cat_features"] = extra_fit_kwargs["cat_features"]
+
             if margin_va is not None:
                 val_preds = model.predict_proba(
-                    X_va, base_margin=margin_va, **extra_fit_kwargs
+                    X_va, base_margin=margin_va, **predict_kwargs
                 )
             else:
-                val_preds = model.predict_proba(X_va, **extra_fit_kwargs)
+                val_preds = model.predict_proba(X_va, **predict_kwargs)
             oof_preds[synth_va_subidx] = val_preds
 
             fold_auc = roc_auc_score(y_va, val_preds)
@@ -269,13 +274,13 @@ class CrossValidationEngine:
             if margin_te is not None:
                 test_preds += (
                     model.predict_proba(
-                        X_test, base_margin=margin_te, **extra_fit_kwargs
+                        X_test, base_margin=margin_te, **predict_kwargs
                     )
                     / self.train_cfg.n_splits
                 )
             else:
                 test_preds += (
-                    model.predict_proba(X_test, **extra_fit_kwargs)
+                    model.predict_proba(X_test, **predict_kwargs)
                     / self.train_cfg.n_splits
                 )
 

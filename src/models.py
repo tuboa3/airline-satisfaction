@@ -358,17 +358,20 @@ class CatBoostModel(BaseModel):
         base_margin_val = kwargs.get("base_margin_val", None)
 
         if base_margin_tr is not None:
+            # CatBoost Pool expects baseline as 2D array (n_samples, 1) for binary classification
+            bm_tr = np.asarray(base_margin_tr).reshape(-1, 1)
+            bm_va = np.asarray(base_margin_val).reshape(-1, 1) if base_margin_val is not None else None
             train_input = Pool(
                 X_train,
                 y_train,
                 weight=sample_weight,
-                baseline=base_margin_tr,
+                baseline=bm_tr,
                 cat_features=cat_features,
             )
             val_input = Pool(
                 X_val,
                 y_val,
-                baseline=base_margin_val,
+                baseline=bm_va,
                 cat_features=cat_features,
             )
             fit_kwargs = dict(eval_set=val_input)
@@ -422,8 +425,10 @@ class CatBoostModel(BaseModel):
         if base_margin is not None:
             from catboost import Pool
 
+            # CatBoost Pool expects baseline as 2D (n_samples, 1) for binary classification
+            bm = np.asarray(base_margin).reshape(-1, 1)
             cat_features = kwargs.get("cat_features", None)
-            pool = Pool(X, baseline=base_margin, cat_features=cat_features)
+            pool = Pool(X, baseline=bm, cat_features=cat_features)
             return self.model.predict_proba(pool)[:, 1]
         return self.model.predict_proba(X)[:, 1]
 
