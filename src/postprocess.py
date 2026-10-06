@@ -7,6 +7,7 @@ Strictly segregated from the cross-validation loop to prevent public/private sha
 
 import os
 
+import numpy as np
 import pandas as pd
 
 from src.config import FeatureConfig, PathConfig
@@ -236,7 +237,11 @@ class HybridPostCalibrator:
         res = minimize(loss_fn, init_params, method="L-BFGS-B", bounds=bounds)
         a_opt, b_opt, c_opt = res.x
 
-        cal_oof = expit(a_opt * log_s_oof - b_opt * log_1ms_oof + c_opt).astype(np.float32)
-        cal_test = expit(a_opt * log_s_test - b_opt * log_1ms_test + c_opt).astype(np.float32)
+        cal_oof = expit(a_opt * log_s_oof - b_opt * log_1ms_oof + c_opt).astype(
+            np.float32
+        )
+        cal_test = expit(a_opt * log_s_test - b_opt * log_1ms_test + c_opt).astype(
+            np.float32
+        )
 
         return cal_oof, cal_test
