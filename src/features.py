@@ -584,7 +584,8 @@ class FeaturePipeline:
             data["dep_delay_over_10"] = (dep_delay > 10).astype(np.int8)
             data["delay_diff"] = (arr_delay - dep_delay).astype(np.float32)
             data["route_delay_hazard"] = (
-                arr_delay / np.maximum(10.0, np.maximum(0.0, data["Flight Distance"]) / 7.5)
+                arr_delay
+                / np.maximum(10.0, np.maximum(0.0, data["Flight Distance"]) / 7.5)
             ).astype(np.float32)
 
             # Airborne Delay Recovery & Difference Dynamics (Golden Features from Research)
@@ -983,6 +984,7 @@ class FeaturePipeline:
                 bounded_dict = self._get_bounded_crosses(data)
                 for b_col, b_series in bounded_dict.items():
                     data[b_col] = b_series.astype(str)
+                data = data.copy()
 
             # Multi-Way Bayesian Target Encoding (Domain 4 + Extensions)
             if self.target_encoding_maps:
