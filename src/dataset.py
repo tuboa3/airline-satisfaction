@@ -247,11 +247,7 @@ class DatasetIngestion:
                 train_synth = train_synth.drop(columns=[self.feature_cfg.id_col])
 
             orig_df_raw = None
-            orig_files = (
-                self.discover_original_files()
-                if self.train_cfg.use_original_data
-                else []
-            )
+            orig_files = self.discover_original_files()
 
             if orig_files:
                 self.logger.info(
@@ -280,6 +276,16 @@ class DatasetIngestion:
                         f"Original Host Dataset loaded: {len(orig_df)} rows. "
                         f"Target Satisfaction Mean: {orig_df[self.feature_cfg.target_col].mean():.4f}"
                     )
+
+                    # If raw original rows are disabled, reserve original data exclusively for Teacher model
+                    if not self.train_cfg.use_original_data:
+                        self.logger.info(
+                            f"Original Host Dataset reserved exclusively for Teacher Model ({len(orig_df)} rows). "
+                            "Raw rows will NOT be concatenated into training folds (purged per Topic #745098 & #745932)."
+                        )
+                        train_synth["sample_weight"] = 1.0
+                        sample_weights = np.ones(len(train_synth), dtype=np.float32)
+                        return train_synth, test_synth, sample_weights, orig_df_raw
 
                     # Compute sample weights
                     if self.train_cfg.use_density_ratio_weighting:

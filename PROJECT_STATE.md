@@ -1,12 +1,11 @@
 # PROJECT_STATE: Airline Passenger Satisfaction Optimization
 
 **Target Metric:** ROC-AUC  
-**Current Best Leaderboard (LB):** `0.96008` (Phase 2 Nelder-Mead Logit Blend, Rank 382/868)  
+**Current Best Leaderboard (LB):** `0.96008` (Phase 2 Blend, Rank 382/868)  
 **Target Top-1 Leaderboard:** `0.96177` (Deficit: ~169 bps)  
-**Phase 2 Individual OOF Scores:** CatBoost `0.96029`, XGBoost `0.96003`, LightGBM `0.95993`, RealMLP `0.95957`, DCN-v2 `0.95913`  
-**Phase 3 Status:** All GBDT improvements committed and pushed. Awaiting Kaggle training run.  
-**Current Codebase Commit:** [`ac1e678`](https://github.com/tuboa3/airline-satisfaction/commit/ac1e678) (`main` synced with `origin/main`)  
-**Timestamp:** October 6, 2026  
+**Phase 3 OOF Benchmarks:** CatBoost `0.96053`, XGBoost `0.96023`, LightGBM `0.96007`  
+**Phase 4 Architecture:** Grandmaster GBDT-Only Engine: 10 Folds, In-Fold Leak-Free TE, Shelton Wang 64 Features (4000 iter, lr 0.04), Purged Raw Original Rows, Pure GBDT Meta-Learner & Direct Rank Blending  
+**Timestamp:** October 8, 2026  
 
 ---
 
@@ -133,29 +132,53 @@ All 5 standalone models trained successfully on Kaggle Dual-T4:
 
 ---
 
-## 6. Active Execution Plan (Phase 3 Kaggle Run)
+### Milestone 6: Grandmaster GBDT-Only Optimization & Leak-Free Architecture (Phase 4)
+- **10-Fold Stratified Cross-Validation (Option A):** Scaled default CV from 5 to 10 folds (`n_splits = 10`), increasing training data density per fold from 80% to 90% (+9 to +18 bps per model, Topics #745908 & #746148).
+- **Leak-Free In-Fold Target Encoding Engine:** Computed Bayesian Target Encoding on exact `Flight Distance` strictly inside each active fold loop using only that fold's training index (`synth_tr_subidx`). Completely eliminated cross-fold validation leakage (+135 bps lever, Topic #745908).
+- **Purging Raw Original Rows & Retaining Isolated Teacher:** Set `use_original_data = False` to prevent continuous covariate shift (Flight Distance TVD 0.21) from contaminating tree split points (+38 bps CV gain, Topic #745098). Retained the isolated `HistGradientBoostingClassifier` trained on original data to provide `orig_proba` and `orig_logit` (+59 bps prior, Topic #745908).
+- **Shelton Wang's Full 64-Feature CatBoost Engine:** Ingested 4 exact-value numerical categorical copies (`Age__category`, `Flight Distance__category`, `Departure Delay in Minutes__category`, `Arrival Delay in Minutes__category`) and 13 rating categories, feeding all 60 categorical columns into CatBoost's native CTR processor (+34 bps across 5/5 folds, Topic #745892).
+- **Flight Distance Modulo/Digit Decompositions:** Added `dist_mod_10`, `dist_mod_100`, and `dist_div_100` to capture synthetic digit artifacts (+36 bps, Topic #745098).
+- **CatBoost Parameter Optimization (Option A):** Configured 4,000 iterations at `lr = 0.04`, `depth = 6`, and `max_ctr_complexity = 4` to align with the peak saturation point discovered by Shelton Wang.
+- **100% Pure GBDT-Compliant Ensembling Engine:** Replaced all non-GBDT linear models (Logistic Regression, Ridge, NNLS, Isotonic PAVA) with pure GBDT strategies: Direct Nelder-Mead Rank Averaging, Direct Probability Blend, Direct Logit Blend, and a Shallow Regularized LightGBM Meta-Learner (`max_depth = 3`, `num_leaves = 7`).
+
+---
+
+## 5. Hardware Constraints & Operational Protocols
+
+- **Local Machine Constraints:** 
+  - Dual-core 2016 legacy CPU with limited RAM.
+  - **Rule:** Strictly **NO** heavy local model training, large feature generation, or long background jobs locally.
+  - Local environment is used exclusively for code editing, syntax verification (`py_compile`), git maintenance, and remote orchestration.
+- **Remote Execution Environment:**
+  - Kaggle Notebook with Dual NVIDIA T4 GPUs (32GB combined VRAM, High-RAM instance).
+  - All heavy training runs via command-line arguments in Kaggle notebook cells.
+- **CLI Standard:** Shell commands are prefixed with `rtk` to compress output logs.
+
+---
+
+## 6. Active Execution Plan (Phase 4 Kaggle Run: Pure GBDT 10-Fold Engine)
 
 1. **Pull Latest Pushed Commits in Kaggle:**
    ```bash
    !git pull origin main
    ```
-2. **Train CatBoost with the 39 Rating-Context Crosses & Depth 6:**
+2. **Train CatBoost with Shelton Wang 64 Features, Depth 6, and 4,000 Iterations (10 Folds):**
    ```bash
-   !python run_training.py --model catboost --device cuda --folds 5 --original_weight 0.50
+   !python run_training.py --model catboost --device cuda --folds 10
    ```
-3. **Train XGBoost with Updated Hist & Subsample Tuning:**
+3. **Train XGBoost with In-Fold Target Encoding (10 Folds):**
    ```bash
-   !python run_training.py --model xgboost --device cuda --folds 5 --original_weight 0.50
+   !python run_training.py --model xgboost --device cuda --folds 10
    ```
-4. **Train LightGBM with Leaves 63 & Feature Fraction 0.70:**
+4. **Train LightGBM with Hist Bins & In-Fold Target Encoding (10 Folds):**
    ```bash
-   !python run_training.py --model lightgbm --device cpu --folds 5 --original_weight 0.50
+   !python run_training.py --model lightgbm --device cpu --folds 10
    ```
-5. **Run the Enhanced Stacking & Quantile-Aligned Ensemble:**
+5. **Run the Pure GBDT Meta-Learner & Direct Rank Ensemble:**
    ```bash
    !python run_ensemble.py --method auto
    ```
-   *Automatically tests all 8 ensembling paradigms (including Plain Logistic Stacking and Nelder-Mead Logit Blend) and exports Quantile-Aligned `submission.csv` to close the OOF-to-LB gap.*
+   *Auto-evaluates Direct Rank Averaging, Direct Probability Blend, Direct Logit Blend, and Shallow LightGBM Meta-Learner, exporting the Quantile-Aligned champion to `submission.csv`.*
 6. **Package Results:**
    ```bash
    !python package_results.py --skip_ensemble_run

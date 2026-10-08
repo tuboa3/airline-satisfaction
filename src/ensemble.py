@@ -605,6 +605,106 @@ class EnsembleOptimizer:
         auc = roc_auc_score(y_true, oof_preds)
         return oof_preds, auc, test_preds
 
+    def blend_probability(
+        self,
+        model_names: list[str],
+        oof_list: list[np.ndarray],
+        test_list: list[np.ndarray],
+        y_true: np.ndarray,
+    ) -> tuple[np.ndarray, float, np.ndarray, dict[str, float]]:
+        """Direct Nelder-Mead Probability Blend (Convex Simplex Combination of GBDT predictions)."""
+        oof_mat = np.column_stack(oof_list)
+        test_mat = np.column_stack(test_list)
+        n = len(model_names)
+
+        n_eval = min(len(y_true), 75000)
+        rng = np.random.RandomState(42)
+        eval_idx = rng.choice(len(y_true), size=n_eval, replace=False)
+        oof_sub = oof_mat[eval_idx]
+        y_sub = y_true[eval_idx]
+
+        def obj(w):
+            w_pos = np.maximum(0.0, w)
+            s = np.sum(w_pos)
+            w_norm = (np.ones(n) / n) if s == 0 else (w_pos / s)
+            blend_sub = np.dot(oof_sub, w_norm)
+            return -roc_auc_score(y_sub, blend_sub)
+
+        init_w = np.ones(n) / n
+        opt = minimize(obj, init_w, method="Nelder-Mead", options={"maxiter": 600, "xatol": 1e-5})
+        best_w = np.maximum(0.0, opt.x)
+        best_w /= np.sum(best_w)
+        w_dict = {m: float(best_w[i]) for i, m in enumerate(model_names)}
+
+        final_oof = np.dot(oof_mat, best_w)
+        final_test = np.dot(test_mat, best_w)
+        auc = roc_auc_score(y_true, final_oof)
+        return final_oof, auc, final_test, w_dict
+
+    def blend_gbdt_meta_learner(
+        self,
+        model_names: list[str],
+        oof_list: list[np.ndarray],
+        test_list: list[np.ndarray],
+        y_true: np.ndarray,
+        n_splits: int = 5,
+    ) -> tuple[np.ndarray, float, np.ndarray]:
+        """
+        Pure GBDT-Only Meta-Learner (LightGBM).
+        Shallow regularized tree meta-learner trained with out-of-fold CV.
+        """
+        from lightgbm import LGBMClassifier
+
+        eps = self.epsilon
+        meta_oof_features = []
+        meta_test_features = []
+
+        for p_oof, p_test in zip(oof_list, test_list):
+            p_oof_c = np.clip(p_oof, eps, 1.0 - eps)
+            p_test_c = np.clip(p_test, eps, 1.0 - eps)
+            r_oof = self.rank_transform(p_oof)
+            r_test = self.rank_transform(p_test)
+            z_oof = logit(p_oof_c)
+            z_test = logit(p_test_c)
+            meta_oof_features.extend([p_oof, r_oof, z_oof])
+            meta_test_features.extend([p_test, r_test, z_test])
+
+        X_oof_meta = np.column_stack(meta_oof_features)
+        X_test_meta = np.column_stack(meta_test_features)
+
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        oof_meta_preds = np.zeros(len(y_true), dtype=np.float32)
+        test_meta_preds = np.zeros(len(X_test_meta), dtype=np.float32)
+
+        meta_params = {
+            "objective": "binary",
+            "metric": "auc",
+            "learning_rate": 0.03,
+            "max_depth": 3,
+            "num_leaves": 7,
+            "min_child_samples": 100,
+            "colsample_bytree": 0.8,
+            "subsample": 0.8,
+            "reg_alpha": 1.0,
+            "reg_lambda": 5.0,
+            "n_estimators": 500,
+            "random_state": 42,
+            "n_jobs": -1,
+            "verbose": -1,
+        }
+
+        for tr_idx, va_idx in skf.split(X_oof_meta, y_true):
+            X_tr, y_tr = X_oof_meta[tr_idx], y_true[tr_idx]
+            X_va, y_va = X_oof_meta[va_idx], y_true[va_idx]
+
+            clf = LGBMClassifier(**meta_params)
+            clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], callbacks=[])
+            oof_meta_preds[va_idx] = clf.predict_proba(X_va)[:, 1]
+            test_meta_preds += clf.predict_proba(X_test_meta)[:, 1] / float(n_splits)
+
+        auc = roc_auc_score(y_true, oof_meta_preds)
+        return oof_meta_preds, auc, test_meta_preds
+
     def run_all(self, chosen_method: str = "auto") -> tuple[np.ndarray, float, np.ndarray]:
         """
         Executes all ensembling paradigms, compares their out-of-fold performance,
@@ -645,11 +745,13 @@ class EnsembleOptimizer:
                 self.logger.info(f"  {col:<18}: {corr_str}")
             self.logger.info("-" * 70)
 
-        # 3. Strategy 1: Rank Averaging
+        # 3. Strategy 1: Rank Averaging (Pure GBDT direct rank blend)
         oof_rank, auc_rank, test_rank, w_rank = self.blend_rank(
             model_names, oof_list, test_list, y_true
         )
         self.logger.info(f"Strategy 1 (Rank-Averaged Blend)        : OOF ROC-AUC = {auc_rank:.5f}")
+        for m, w in w_rank.items():
+            self.logger.info(f"    - Rank Weight for {m:<15}: {w:.4f}")
 
         # 4. Calibration & Logit Conversion
         cal_oof_logits, cal_test_logits = self.calibrate_and_logit(models_dict, y_true)
@@ -660,71 +762,34 @@ class EnsembleOptimizer:
         )
         self.logger.info(f"Strategy 2 (Nelder-Mead Logit Blend)    : OOF ROC-AUC = {auc_slsqp:.5f}")
         for m, w in w_slsqp.items():
-            self.logger.info(f"    - Weight for {m:<18}: {w:.4f}")
+            self.logger.info(f"    - Logit Weight for {m:<14}: {w:.4f}")
 
-        # 6. Strategy 3: Direct Empirical WMW Optimization (Dirichlet Barrier)
-        oof_wmw, auc_wmw, test_wmw, w_wmw = self.blend_empirical_wmw(
+        # 6. Strategy 3: Direct Probability Simplex Blend (Direct GBDT Probability Average)
+        oof_prob, auc_prob, test_prob, w_prob = self.blend_probability(
             model_names, oof_list, test_list, y_true
         )
-        self.logger.info(f"Strategy 3 (Direct Empirical WMW Blend) : OOF ROC-AUC = {auc_wmw:.5f}")
-        for m, w in w_wmw.items():
-            self.logger.info(f"    - Empirical WMW Weight for {m:<11}: {w:.4f}")
+        self.logger.info(f"Strategy 3 (Direct Probability Blend)   : OOF ROC-AUC = {auc_prob:.5f}")
+        for m, w in w_prob.items():
+            self.logger.info(f"    - Prob Weight for {m:<15}: {w:.4f}")
 
-        # 7. Strategy 4: Smooth Sigmoid WMW Surrogate Stacking
+        # 7. Strategy 4: Pure GBDT Meta-Learner Stacking (Shallow Regularized LightGBM)
         if len(model_names) > 1:
-            try:
-                oof_swmw, auc_swmw, test_swmw = self.blend_smooth_wmw(
-                    model_names, cal_oof_logits, cal_test_logits, y_true
-                )
-                self.logger.info(f"Strategy 4 (Smooth Sigmoid WMW Stacking): OOF ROC-AUC = {auc_swmw:.5f}")
-            except Exception as e:
-                self.logger.warning(f"Smooth Sigmoid WMW Stacking failed ({e}). Falling back to empirical WMW.")
-                oof_swmw, auc_swmw, test_swmw = oof_wmw, auc_wmw, test_wmw
-        else:
-            oof_swmw, auc_swmw, test_swmw = oof_wmw, auc_wmw, test_wmw
-
-        # 8. Strategy 5: Ridge Meta-Learner with Interactions
-        if len(model_names) > 1:
-            oof_ridge, auc_ridge, test_ridge = self.blend_ridge_interactions(
-                model_names, cal_oof_logits, cal_test_logits, y_true
+            oof_gbdt, auc_gbdt, test_gbdt = self.blend_gbdt_meta_learner(
+                model_names, oof_list, test_list, y_true
             )
-            self.logger.info(f"Strategy 5 (Ridge Interaction Stacking) : OOF ROC-AUC = {auc_ridge:.5f}")
+            self.logger.info(f"Strategy 4 (Shallow GBDT Meta-Learner) : OOF ROC-AUC = {auc_gbdt:.5f}")
         else:
-            oof_ridge, auc_ridge, test_ridge = oof_slsqp, auc_slsqp, test_slsqp
+            oof_gbdt, auc_gbdt, test_gbdt = oof_rank, auc_rank, test_rank
 
-        # 9. Strategy 6: Non-Negative Least Squares (NNLS)
-        oof_nnls, auc_nnls, test_nnls, w_nnls = self.blend_nnls(
-            model_names, oof_list, test_list, y_true
-        )
-        self.logger.info(f"Strategy 6 (Non-Negative Least Squares) : OOF ROC-AUC = {auc_nnls:.5f}")
-        for m, w in w_nnls.items():
-            self.logger.info(f"    - NNLS Weight for {m:<13}: {w:.4f}")
-
-        # 10. Strategy 7: Isotonic Stacking (NNLS + Isotonic PAVA)
-        oof_iso, auc_iso, test_iso = self.blend_isotonic_stacking(
-            model_names, oof_list, test_list, y_true
-        )
-        self.logger.info(f"Strategy 7 (Isotonic Calibrated Stacking): OOF ROC-AUC = {auc_iso:.5f}")
-
-        # 11. Strategy 8: Plain Regularized Logistic Regression Stacking (Sachith7 #1 Stacker)
-        oof_logreg, auc_logreg, test_logreg = self.blend_logistic_stacking(
-            model_names, oof_list, test_list, y_true
-        )
-        self.logger.info(
-            f"Strategy 8 (Regularized Logistic Regression Stacking): OOF ROC-AUC = {auc_logreg:.5f}"
-        )
-
-        # 12. Selection
+        # 8. Selection (Pure GBDT-Only Candidates)
         candidates = {
             "rank": (oof_rank, auc_rank, test_rank),
             "logit": (oof_slsqp, auc_slsqp, test_slsqp),
-            "logistic": (oof_logreg, auc_logreg, test_logreg),
-            "logreg": (oof_logreg, auc_logreg, test_logreg),
-            "wmw": (oof_wmw, auc_wmw, test_wmw),
-            "smooth_wmw": (oof_swmw, auc_swmw, test_swmw),
-            "ridge": (oof_ridge, auc_ridge, test_ridge),
-            "nnls": (oof_nnls, auc_nnls, test_nnls),
-            "isotonic": (oof_iso, auc_iso, test_iso),
+            "prob": (oof_prob, auc_prob, test_prob),
+            "probability": (oof_prob, auc_prob, test_prob),
+            "gbdt_meta": (oof_gbdt, auc_gbdt, test_gbdt),
+            "gbdt_stack": (oof_gbdt, auc_gbdt, test_gbdt),
+            "gbdt": (oof_gbdt, auc_gbdt, test_gbdt),
         }
 
         if chosen_method in candidates:

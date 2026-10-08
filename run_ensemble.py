@@ -23,8 +23,8 @@ def parse_args():
         "--method",
         type=str,
         default="auto",
-        choices=["auto", "logit", "logistic", "logreg", "wmw", "smooth_wmw", "ridge", "rank", "nnls", "isotonic"],
-        help="Ensemble strategy: 'auto' (selects highest OOF ROC-AUC), 'logistic' (regularized plain logistic stacker), 'logit' (bounded Nelder-Mead logit), 'wmw' (empirical WMW U-statistic), 'ridge' (meta-learner), 'rank' (rank-averaging)"
+        choices=["auto", "rank", "direct_rank", "logit", "prob", "probability", "gbdt_meta", "gbdt_stack", "gbdt"],
+        help="Ensemble strategy: 'auto' (selects highest GBDT OOF ROC-AUC), 'rank' (rank-averaging blend), 'prob' (direct probability blend), 'logit' (bounded Nelder-Mead logit blend), 'gbdt_meta' / 'gbdt_stack' (shallow LightGBM meta-learner)"
     )
     parser.add_argument(
         "--data_dir",

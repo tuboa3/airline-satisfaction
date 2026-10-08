@@ -202,7 +202,32 @@ class CrossValidationEngine:
                     extra_fit_kwargs["base_margin_tr"] = margin_tr
                     extra_fit_kwargs["base_margin_val"] = margin_va
 
-            # Native Categorical CTR for CatBoost (Bounded Multi-Way Interactions)
+            # Leak-Free In-Fold Target Encoding (Sachith7 Topic #745908, +135 bps)
+            # Strictly computed on the training indices of the active fold:
+            if "Flight Distance" in X_tr.columns:
+                X_tr = X_tr.copy()
+                X_va = X_va.copy()
+                X_te_fold = X_test.copy()
+                dist_tr = X_tr["Flight Distance"]
+                dist_va = X_va["Flight Distance"]
+                dist_te = X_test["Flight Distance"]
+
+                prior_y = float(np.mean(y_tr))
+                smooth_prior_dist = 20.0
+                c_dist = dist_tr.value_counts()
+                sum_dist = pd.Series(y_tr, index=X_tr.index).groupby(dist_tr).sum()
+                te_dist_map = (
+                    (sum_dist + smooth_prior_dist * prior_y)
+                    / (c_dist + smooth_prior_dist)
+                ).to_dict()
+
+                X_tr["te_Flight Distance"] = dist_tr.map(te_dist_map).fillna(prior_y).astype(np.float32)
+                X_va["te_Flight Distance"] = dist_va.map(te_dist_map).fillna(prior_y).astype(np.float32)
+                X_te_fold["te_Flight Distance"] = dist_te.map(te_dist_map).fillna(prior_y).astype(np.float32)
+            else:
+                X_te_fold = X_test
+
+            # Native Categorical CTR for CatBoost (Shelton Wang Topic #745892)
             if "cat" in model_name_lower or "cb" in model_name_lower:
                 candidate_cats = [
                     "Gender",
@@ -219,13 +244,13 @@ class CrossValidationEngine:
                     "service_failure_class",
                     "age_class_travel",
                 ]
-                # Also include all 39 Shelton Wang rating-context crosses (_x_)
+                # Also include all 39 Shelton Wang rating-context crosses, rating categories, and 4 numerical categories
                 cat_cols = [
                     c
                     for c in X_tr.columns
                     if c in candidate_cats
                     or (
-                        "_x_" in c
+                        ("_x_" in c or "__X__" in c or "__category" in c or "__cat" in c)
                         and not c.startswith("te_")
                         and not c.startswith("log_")
                     )
@@ -248,7 +273,7 @@ class CrossValidationEngine:
                     y_va,
                     sample_weight=sw_tr,
                     teacher_train=teacher_tr,
-                    X_test=X_test,
+                    X_test=X_te_fold,
                     teacher_test=teacher_test,
                     **extra_fit_kwargs,
                 )
@@ -274,13 +299,13 @@ class CrossValidationEngine:
             if margin_te is not None:
                 test_preds += (
                     model.predict_proba(
-                        X_test, base_margin=margin_te, **predict_kwargs
+                        X_te_fold, base_margin=margin_te, **predict_kwargs
                     )
                     / self.train_cfg.n_splits
                 )
             else:
                 test_preds += (
-                    model.predict_proba(X_test, **predict_kwargs)
+                    model.predict_proba(X_te_fold, **predict_kwargs)
                     / self.train_cfg.n_splits
                 )
 

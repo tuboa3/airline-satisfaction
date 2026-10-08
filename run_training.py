@@ -42,8 +42,8 @@ def parse_args():
         "--folds", "--n_splits",
         dest="folds",
         type=int,
-        default=5,
-        help="Number of cross-validation folds (default: 5)"
+        default=10,
+        help="Number of cross-validation folds (default: 10 per Option A)"
     )
     parser.add_argument(
         "--epochs",

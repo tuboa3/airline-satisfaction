@@ -172,21 +172,23 @@ class FeatureConfig:
 class TrainConfig:
     """Training, cross-validation, and optimization settings."""
 
-    n_splits: int = 5
+    n_splits: int = 10
     random_state: int = 42
     shuffle: bool = True
     early_stopping_rounds: int = 100
     verbose_eval: int = 200
 
     # Domain 1: Original Host Dataset Ingestion & Weight Attenuation
-    use_original_data: bool = True
+    # Raw original rows are purged from training folds (karttikjangid05 Topic #745098 & starkhushi Topic #745932).
+    # Original data is used strictly as an external HistGradientBoosting Teacher model (Sachith7 Topic #745908).
+    use_original_data: bool = False
     original_sample_weight: float = 0.50
     use_density_ratio_weighting: bool = False
     density_ratio_clip_min: float = 0.05
     density_ratio_clip_max: float = 3.0
 
-    # GLM Margin Residual Boosting (Stage 1)
-    use_glm_margin: bool = True
+    # GLM Margin Residual Boosting (Disabled for pure GBDT-only mandate)
+    use_glm_margin: bool = False
     glm_params: dict[str, Any] = field(
         default_factory=lambda: {
             "penalty": "l2",
@@ -204,27 +206,27 @@ class TrainConfig:
             "objective": "binary",
             "metric": "auc",
             "boosting_type": "gbdt",
-            "learning_rate": 0.035,
+            "learning_rate": 0.03,
             "num_leaves": 63,
             "max_depth": -1,
             "feature_fraction": 0.70,
             "bagging_fraction": 0.80,
             "bagging_freq": 1,
             "min_child_samples": 30,
-            "n_estimators": 3500,
+            "n_estimators": 4000,
             "random_state": 42,
             "n_jobs": -1,
             "verbose": -1,
         }
     )
 
-    # Default CatBoost Hyperparameters with CTR Configurations (Shelton Wang 11th Place)
+    # Default CatBoost Hyperparameters with CTR Configurations (Shelton Wang Option A: 4000 iter, lr 0.04)
     cb_params: dict[str, Any] = field(
         default_factory=lambda: {
             "loss_function": "Logloss",
             "eval_metric": "AUC",
-            "iterations": 3500,
-            "learning_rate": 0.05,
+            "iterations": 4000,
+            "learning_rate": 0.04,
             "depth": 6,
             "l2_leaf_reg": 3.0,
             "boosting_type": "Plain",

@@ -130,7 +130,7 @@ class FeaturePipeline:
             "age_class_travel": age_tier + "_" + cls + "_" + travel,
         }
 
-        # Shelton Wang (11th place): 39 Rating-Context Crosses (+34 bps across all 5 folds)
+        # Shelton Wang (11th place, Topic #745892): 39 Rating-Context Crosses (+34 bps across all 5 folds)
         # Each service rating crossed with Class, Type of Travel, Customer Type
         context_cols = [
             c for c in ["Class", "Type of Travel", "Customer Type"] if c in df.columns
@@ -140,6 +140,26 @@ class FeaturePipeline:
             for ctx in context_cols:
                 cross_name = f"{rc}_x_{ctx}"
                 crosses[cross_name] = r_str + "|" + df[ctx].astype(str)
+                crosses[f"{rc}__X__{ctx}"] = r_str + "|" + df[ctx].astype(str)
+
+        # Shelton Wang (Topic #745892): All 13 service ratings as categories
+        for rc in rating_cols:
+            if rc in df.columns:
+                crosses[f"{rc}__cat"] = df[rc].astype(str)
+
+        # Shelton Wang (Topic #745892): 4 numerical features copied as exact-value categorical columns
+        numeric_to_copy = [
+            "Age",
+            "Flight Distance",
+            "Departure Delay in Minutes",
+            "Arrival Delay in Minutes",
+        ]
+        for col in numeric_to_copy:
+            if col in df.columns:
+                copy_name = f"{col}__category"
+                crosses[copy_name] = (
+                    df[col].astype("string").fillna("__MISSING__").astype(str)
+                )
 
         return crosses
 
@@ -604,6 +624,11 @@ class FeaturePipeline:
             data["delay_intensity"] = data["total_delay"] / np.maximum(
                 1.0, np.maximum(0.0, data["Flight Distance"]) / 100.0
             )
+
+            # Flight Distance digit decomposition & modulo features (karttikjangid05 Topic #745098, +36 bps)
+            data["dist_mod_10"] = (data["Flight Distance"] % 10).astype(np.int8)
+            data["dist_mod_100"] = (data["Flight Distance"] % 100).astype(np.int16)
+            data["dist_div_100"] = (data["Flight Distance"] // 100).astype(np.int16)
 
             # The 15-Minute Flatline Law
             data["delay_tier"] = np.select(
