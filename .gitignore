@@ -11,8 +11,12 @@ venv/
 env/
 
 # Data files (keep repo lightweight for GitHub & Kaggle pull)
-data/
+data/*
+!data/raw/
+data/raw/*
+!data/raw/airline_passenger_satisfaction.csv
 *.csv
+!data/raw/airline_passenger_satisfaction.csv
 *.zip
 *.parquet
 *.feather
