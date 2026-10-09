@@ -33,7 +33,9 @@ class DatasetIngestion:
         self.train_cfg = train_cfg
         self.logger = get_logger("DatasetIngestion")
 
-    def _standardize_columns(self, df: pd.DataFrame, is_original: bool = False) -> pd.DataFrame:
+    def _standardize_columns(
+        self, df: pd.DataFrame, is_original: bool = False
+    ) -> pd.DataFrame:
         """Standardizes column names and types across datasets."""
         data = df.copy()
 
@@ -42,6 +44,38 @@ class DatasetIngestion:
         drop_existing = [c for c in cols_to_drop if c in data.columns]
         if drop_existing:
             data = data.drop(columns=drop_existing)
+
+        # Standardize column names (handles original dataset variations and title-case variants)
+        col_rename = {
+            "departure and arrival time convenience": "Departure/Arrival time convenient",
+            "departure/arrival time convenience": "Departure/Arrival time convenient",
+            "ease of online booking": "Ease of Online booking",
+            "check-in service": "Checkin service",
+            "in-flight service": "Inflight service",
+            "in-flight wifi service": "Inflight wifi service",
+            "in-flight entertainment": "Inflight entertainment",
+            "departure delay": "Departure Delay in Minutes",
+            "arrival delay": "Arrival Delay in Minutes",
+            "satisfaction": "satisfaction",
+            "gate location": "Gate location",
+            "food and drink": "Food and drink",
+            "online boarding": "Online boarding",
+            "seat comfort": "Seat comfort",
+            "on-board service": "On-board service",
+            "on board service": "On-board service",
+            "leg room service": "Leg room service",
+            "baggage handling": "Baggage handling",
+            "flight distance": "Flight Distance",
+            "customer type": "Customer Type",
+            "type of travel": "Type of Travel",
+        }
+        new_names = {}
+        for c in data.columns:
+            cl = c.strip().lower()
+            if cl in col_rename:
+                new_names[c] = col_rename[cl]
+        if new_names:
+            data = data.rename(columns=new_names)
 
         # Standardize target column if present
         target_candidates = ["satisfaction", "Satisfaction", "target", "Target"]
@@ -58,16 +92,22 @@ class DatasetIngestion:
             "Customer Type": {
                 "loyal customer": "Loyal Customer",
                 "disloyal customer": "disloyal Customer",
-                "disloyal Customer": "disloyal Customer",
+                "returning": "Loyal Customer",
+                "first-time": "disloyal Customer",
+                "first time": "disloyal Customer",
             },
             "Type of Travel": {
                 "business travel": "Business travel",
                 "personal travel": "Personal Travel",
+                "business": "Business travel",
+                "personal": "Personal Travel",
             },
             "Class": {
                 "business": "Business",
                 "eco": "Eco",
                 "eco plus": "Eco Plus",
+                "economy": "Eco",
+                "economy plus": "Eco Plus",
             },
         }
 
@@ -114,24 +154,47 @@ class DatasetIngestion:
                 candidates.append(self.paths.original_path)
 
         # Also dynamically search /kaggle/input and standard local directories
-        search_dirs = ["/kaggle/input", "data/original", "data/raw/original", "data/external"]
+        search_dirs = [
+            "/kaggle/input",
+            "data/original",
+            "data/raw/original",
+            "data/external",
+        ]
         for sdir in search_dirs:
             if os.path.exists(sdir):
                 all_csvs = glob.glob(os.path.join(sdir, "**", "*.csv"), recursive=True)
                 for f in all_csvs:
                     f_lower = f.lower()
-                    if "playground-series-s6e10" in f_lower or "competitions" in f_lower or "sample_submission" in f_lower:
+                    if (
+                        "playground-series-s6e10" in f_lower
+                        or "competitions" in f_lower
+                        or "sample_submission" in f_lower
+                    ):
                         continue
-                    if "airline" in f_lower or "satisfaction" in f_lower or "passenger" in f_lower:
+                    if (
+                        "airline" in f_lower
+                        or "satisfaction" in f_lower
+                        or "passenger" in f_lower
+                    ):
                         candidates.append(f)
 
         # Remove synthetic train/test if accidentally matched
         filtered = []
-        train_abs = os.path.abspath(self.paths.train_path) if self.paths.train_path else ""
+        train_abs = (
+            os.path.abspath(self.paths.train_path) if self.paths.train_path else ""
+        )
         test_abs = os.path.abspath(self.paths.test_path) if self.paths.test_path else ""
-        sub_abs = os.path.abspath(self.paths.sample_sub_path) if self.paths.sample_sub_path else ""
+        sub_abs = (
+            os.path.abspath(self.paths.sample_sub_path)
+            if self.paths.sample_sub_path
+            else ""
+        )
 
-        orig_target_abs = os.path.abspath(self.paths.original_path) if self.paths.original_path else ""
+        orig_target_abs = (
+            os.path.abspath(self.paths.original_path)
+            if self.paths.original_path
+            else ""
+        )
 
         for c in candidates:
             c_abs = os.path.abspath(c)
@@ -140,7 +203,9 @@ class DatasetIngestion:
             if c_base := os.path.basename(c).lower() in ["sample_submission.csv"]:
                 continue
             # If explicitly provided by original_path, retain unconditionally
-            if orig_target_abs and (c_abs == orig_target_abs or c_abs.startswith(orig_target_abs)):
+            if orig_target_abs and (
+                c_abs == orig_target_abs or c_abs.startswith(orig_target_abs)
+            ):
                 filtered.append(c)
                 continue
             c_dir = os.path.dirname(c).lower()

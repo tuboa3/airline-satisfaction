@@ -18,7 +18,6 @@ from scipy.optimize import minimize, nnls
 from scipy.special import expit, logit
 from scipy.stats import rankdata
 from sklearn.isotonic import IsotonicRegression
-from sklearn.linear_model import Ridge, RidgeCV
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
@@ -578,89 +577,6 @@ class EnsembleOptimizer:
         best_auc = roc_auc_score(y_true, final_oof)
         return final_oof, best_auc, final_test
 
-    def blend_ridge_interactions(
-        self,
-        model_names: list[str],
-        cal_oof_logits: dict[str, np.ndarray],
-        cal_test_logits: dict[str, np.ndarray],
-        y_true: np.ndarray,
-    ) -> tuple[np.ndarray, float, np.ndarray]:
-        """
-        Second-Stage Regularized Meta-Learner (Ridge) with Interaction Terms.
-        Uses _build_meta_features to generate base logits, pairwise products, and disagreement magnitudes.
-        """
-        X_meta_oof, X_meta_test = self._build_meta_features(
-            model_names, cal_oof_logits, cal_test_logits
-        )
-
-        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-        oof_meta_preds = np.zeros(len(y_true), dtype=np.float32)
-        test_meta_preds = np.zeros(len(X_meta_test), dtype=np.float32)
-
-        alphas = [0.01, 0.1, 1.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0]
-
-        best_alpha = 10.0
-        best_cv_auc = -1.0
-        for alpha in alphas:
-            fold_aucs = []
-            for tr_idx, va_idx in skf.split(X_meta_oof, y_true):
-                clf = Ridge(alpha=alpha, random_state=42)
-                clf.fit(X_meta_oof[tr_idx], y_true[tr_idx])
-                preds = clf.predict(X_meta_oof[va_idx])
-                fold_aucs.append(roc_auc_score(y_true[va_idx], preds))
-            mean_auc = float(np.mean(fold_aucs))
-            if mean_auc > best_cv_auc:
-                best_cv_auc = mean_auc
-                best_alpha = alpha
-
-        self.logger.info(
-            f"Ridge Meta-Learner selected optimal alpha={best_alpha} (Mean CV ROC-AUC: {best_cv_auc:.5f})"
-        )
-
-        for tr_idx, va_idx in skf.split(X_meta_oof, y_true):
-            X_tr, y_tr = X_meta_oof[tr_idx], y_true[tr_idx]
-            X_va = X_meta_oof[va_idx]
-
-            clf = Ridge(alpha=best_alpha, random_state=42)
-            clf.fit(X_tr, y_tr)
-
-            oof_meta_preds[va_idx] = clf.predict(X_va)
-            test_meta_preds += clf.predict(X_meta_test) / 5.0
-
-        best_auc = roc_auc_score(y_true, oof_meta_preds)
-        return oof_meta_preds, best_auc, test_meta_preds
-
-    def blend_logistic_stacking(
-        self,
-        model_names: list[str],
-        oof_list: list[np.ndarray],
-        test_list: list[np.ndarray],
-        y_true: np.ndarray,
-        C: float = 1.0,
-    ) -> tuple[np.ndarray, float, np.ndarray]:
-        """
-        Plain Regularized Logistic Regression Stacking on Logits (Sachith7 #1 Stacker).
-        Proved to outperform complex neural and non-linear stackers when base models are strong.
-        """
-        from sklearn.linear_model import LogisticRegression
-
-        eps = self.epsilon
-        X_oof = np.column_stack([logit(np.clip(p, eps, 1.0 - eps)) for p in oof_list])
-        X_test = np.column_stack([logit(np.clip(p, eps, 1.0 - eps)) for p in test_list])
-
-        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-        oof_preds = np.zeros(len(y_true), dtype=np.float32)
-        test_preds = np.zeros(len(X_test), dtype=np.float32)
-
-        for tr_idx, va_idx in skf.split(X_oof, y_true):
-            clf = LogisticRegression(C=C, max_iter=1000, solver="lbfgs", random_state=42)
-            clf.fit(X_oof[tr_idx], y_true[tr_idx])
-            oof_preds[va_idx] = clf.predict_proba(X_oof[va_idx])[:, 1]
-            test_preds += clf.predict_proba(X_test)[:, 1] / 5.0
-
-        auc = roc_auc_score(y_true, oof_preds)
-        return oof_preds, auc, test_preds
-
     def blend_probability(
         self,
         model_names: list[str],
@@ -884,6 +800,25 @@ class EnsembleOptimizer:
         sub_path = os.path.join(self.paths.submissions_dir, "submission_ensemble.csv")
         sub_df.to_csv(sub_path, index=False)
         sub_df.to_csv("submission.csv", index=False)
+
+        # Domain 1: Safe Post-Processing Exact-Match Target Leakage Overrides
+        try:
+            from src.dataset import DatasetIngestion
+            from src.postprocess import ExactMatchPostprocessor
+
+            ingestion = DatasetIngestion(self.paths, self.feature_cfg)
+            _, test_synth, _, orig_df = ingestion.load_and_prepare()
+            if orig_df is not None:
+                postprocessor = ExactMatchPostprocessor(self.paths, self.feature_cfg)
+                matches = postprocessor.find_exact_matches(test_synth, orig_df)
+                if len(matches) > 0:
+                    postprocessor.apply_overrides(sub_path, matches)
+                    postprocessor.apply_overrides("submission.csv", matches)
+                    self.logger.info(
+                        f"Applied {len(matches)} exact ground-truth overrides to ensemble submissions."
+                    )
+        except Exception as e:
+            self.logger.warning(f"Could not apply exact-match overrides in ensemble: {e}")
 
         # Integrity verification: re-read file from disk
         verify_df = pd.read_csv("submission.csv")

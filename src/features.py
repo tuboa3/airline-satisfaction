@@ -810,6 +810,17 @@ class FeaturePipeline:
                 default=0,
             ).astype(np.int8)
 
+            # Reverse-Engineered Delay Anomalies (CTGAN Zero-Dirac Mass & Correlation Artifacts)
+            dep_is_0 = (dep_delay == 0)
+            arr_is_0 = (arr_delay == 0)
+            data["is_both_delays_zero"] = (dep_is_0 & arr_is_0).astype(np.int8)
+            data["is_dep_zero_arr_nonzero"] = (dep_is_0 & ~arr_is_0).astype(np.int8)
+            data["is_dep_nonzero_arr_zero"] = (~dep_is_0 & arr_is_0).astype(np.int8)
+            data["delay_discrepancy"] = np.abs(arr_delay - dep_delay).astype(np.float32)
+            data["delay_speedup_ratio"] = (
+                (dep_delay - arr_delay) / np.maximum(1.0, dep_delay)
+            ).astype(np.float32)
+
             # -------------------------------------------------------------
             # 2. ZERO-INFLATION & "NOT APPLICABLE" INDICATORS
             # -------------------------------------------------------------
@@ -822,6 +833,37 @@ class FeaturePipeline:
             data["total_na_ratings"] = (
                 (data[self.config.rating_cols] == 0).sum(axis=1).astype(np.int8)
             )
+
+            # The "Zero-Rating Miracle" indicator (all 3 digital services N/A: sat rate > 85%)
+            data["is_all_digital_na"] = (
+                (data["Inflight wifi service"] == 0)
+                & (data["Online boarding"] == 0)
+                & (data["Ease of Online booking"] == 0)
+            ).astype(np.int8)
+            data["any_digital_na"] = (
+                (data["Inflight wifi service"] == 0)
+                | (data["Online boarding"] == 0)
+                | (data["Ease of Online booking"] == 0)
+            ).astype(np.int8)
+
+            # N/A-Adjusted Continuous Ratings (restoring monotonic satisfaction ordering for GBDTs)
+            # In survey design, 0 is "Not Applicable" with high satisfaction (wifi@0=88.7%, boarding@0=62.0%, booking@0=70.8%)
+            # Imputing to their empirical equivalent quantile prevents monotonic split distortions
+            data["na_adj_wifi"] = np.where(
+                data["Inflight wifi service"] == 0,
+                4.5,
+                data["Inflight wifi service"].astype(np.float32),
+            ).astype(np.float32)
+            data["na_adj_boarding"] = np.where(
+                data["Online boarding"] == 0,
+                3.2,
+                data["Online boarding"].astype(np.float32),
+            ).astype(np.float32)
+            data["na_adj_booking"] = np.where(
+                data["Ease of Online booking"] == 0,
+                3.8,
+                data["Ease of Online booking"].astype(np.float32),
+            ).astype(np.float32)
 
             # -------------------------------------------------------------
             # 3. NON-LINEAR INFLECTION THRESHOLDS & TRUMP CARDS
@@ -1019,6 +1061,20 @@ class FeaturePipeline:
                 )
             ).astype(np.int8)
 
+            # Simpson's Paradox Confounder Disentanglement: Departure/Arrival time convenient
+            # In raw data, time_conv=1 has 50.6% satisfaction (86.2% Business Travelers),
+            # while time_conv=4 has 40.2% satisfaction (56.6% Business Travelers).
+            time_conv = data["Departure/Arrival time convenient"].astype(np.float32)
+            data["time_conv_x_business_travel"] = (time_conv * is_business_travel).astype(
+                np.float32
+            )
+            data["time_conv_x_business_class"] = (time_conv * is_business_class).astype(
+                np.float32
+            )
+            data["time_conv_x_eco"] = (time_conv * (1 - is_business_class)).astype(
+                np.float32
+            )
+
             # -------------------------------------------------------------
             # 7. 3-WAY MACRO-MANIFOLDS (GOLDEN SEGMENT VS DEAD ZONE)
             # -------------------------------------------------------------
@@ -1172,6 +1228,26 @@ class FeaturePipeline:
                     .fillna(0.0)
                     .astype(np.float32)
                 )
+
+            # Real-World FAA / US Trunk Air Corridor Quantization (Reverse-Engineered Discrete Modes)
+            # Dominant discrete airport pairs: 2475 (JFK-LAX), 337 (LAX-SFO), 594 (ORD-ATL), 862 (DFW-ORD),
+            # 404 (ORD-MSP), 447 (DFW-MSY), 236 (ORD-DTW), 192, 308, 399
+            if "Flight Distance" in data.columns:
+                trunk_modes = np.array(
+                    [192, 236, 308, 337, 399, 404, 447, 594, 862, 2475],
+                    dtype=np.float32,
+                )
+                fd_arr = data["Flight Distance"].values.astype(np.float32)
+                diffs = np.abs(fd_arr[:, None] - trunk_modes[None, :])
+                nearest_idx = np.argmin(diffs, axis=1)
+                min_dist_to_mode = np.min(diffs, axis=1)
+                nearest_modes = trunk_modes[nearest_idx]
+
+                data["is_trunk_route"] = (min_dist_to_mode <= 2.0).astype(np.int8)
+                data["trunk_mode_residual"] = (fd_arr - nearest_modes).astype(
+                    np.float32
+                )
+                data["abs_trunk_mode_residual"] = min_dist_to_mode.astype(np.float32)
 
             # Bounded Crosses String Representation
             if self.config.enable_bounded_crosses:
@@ -1431,6 +1507,25 @@ class FeaturePipeline:
         name = model_name.lower()
         cols = df.columns.tolist()
 
+        rev_eng_features = {
+            "is_both_delays_zero",
+            "is_dep_zero_arr_nonzero",
+            "is_dep_nonzero_arr_zero",
+            "delay_discrepancy",
+            "delay_speedup_ratio",
+            "is_all_digital_na",
+            "any_digital_na",
+            "na_adj_wifi",
+            "na_adj_boarding",
+            "na_adj_booking",
+            "time_conv_x_business_travel",
+            "time_conv_x_business_class",
+            "time_conv_x_eco",
+            "is_trunk_route",
+            "trunk_mode_residual",
+            "abs_trunk_mode_residual",
+        }
+
         if any(k in name for k in ["extra_trees", "xt", "lightgbm_xt", "lgb_xt"]):
             # VIEW 4: LightGBM Extra-Trees Randomized Threshold View (Candidate D)
             # Focuses on smooth survey metrics, group scores, modulo patterns, and external priors
@@ -1447,6 +1542,7 @@ class FeaturePipeline:
                     or c.startswith("res_exp_")
                     or c.startswith("cnt_")
                     or c.startswith("org_mean_")
+                    or (c in rev_eng_features)
                     or (
                         c
                         in [
@@ -1507,6 +1603,7 @@ class FeaturePipeline:
                     or ("_x_" in c)
                     or ("_is_0" in c)
                     or c.startswith("exp_")
+                    or (c in rev_eng_features)
                     or (c in self.config.categorical_cols)
                     or (c in self.config.rating_cols)
                     or (c in self.config.numerical_cols)
@@ -1548,6 +1645,7 @@ class FeaturePipeline:
                     or c.startswith("org_mean_")
                     or c.startswith("exp_")
                     or c.startswith("res_exp_")
+                    or (c in rev_eng_features)
                     or (
                         c
                         in [
@@ -1589,6 +1687,7 @@ class FeaturePipeline:
 
                 if (
                     c.startswith("exp_")
+                    or (c in rev_eng_features)
                     or (
                         c
                         in [

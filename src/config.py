@@ -58,6 +58,8 @@ class PathConfig:
         # Discover original dataset if available
         if not self.original_path:
             orig_candidates = [
+                os.path.join(self.raw_dir, "airline_passenger_satisfaction.csv"),
+                "data/raw/airline_passenger_satisfaction.csv",
                 "/kaggle/input/airline-passenger-satisfaction",
                 "/kaggle/input/airline-passenger-satisfaction-dataset",
                 "/kaggle/input/customer-satisfaction",
@@ -67,16 +69,45 @@ class PathConfig:
                 "data/external",
             ]
             import glob
+
+            # Also check raw_dir for auxiliary satisfaction CSVs
+            if os.path.exists(self.raw_dir):
+                raw_csvs = glob.glob(os.path.join(self.raw_dir, "*.csv"))
+                for rc in raw_csvs:
+                    rc_base = os.path.basename(rc).lower()
+                    if rc_base not in [
+                        "train.csv",
+                        "test.csv",
+                        "sample_submission.csv",
+                    ]:
+                        if any(
+                            k in rc_base
+                            for k in [
+                                "airline",
+                                "passenger",
+                                "satisfaction",
+                                "customer",
+                            ]
+                        ):
+                            orig_candidates.insert(0, rc)
+
             if os.path.exists("/kaggle/input"):
                 orig_matches = (
-                    glob.glob("/kaggle/input/**/airline-passenger-satisfaction*/**", recursive=True)
-                    + glob.glob("/kaggle/input/**/customer-satisfaction*/**", recursive=True)
+                    glob.glob(
+                        "/kaggle/input/**/airline-passenger-satisfaction*/**",
+                        recursive=True,
+                    )
+                    + glob.glob(
+                        "/kaggle/input/**/customer-satisfaction*/**", recursive=True
+                    )
+                    + glob.glob("/kaggle/input/**/*airline*.csv", recursive=True)
                 )
                 for om in orig_matches:
-                    if os.path.isdir(om):
+                    om_base = os.path.basename(om).lower()
+                    if om_base in ["train.csv", "test.csv", "sample_submission.csv"]:
+                        continue
+                    if os.path.isdir(om) or om.endswith(".csv"):
                         orig_candidates.insert(0, om)
-                    elif om.endswith(".csv"):
-                        orig_candidates.insert(0, os.path.dirname(om))
 
             for oc in orig_candidates:
                 if os.path.exists(oc):
