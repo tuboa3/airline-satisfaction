@@ -200,20 +200,21 @@ class TrainConfig:
         }
     )
 
-    # Default LightGBM Hyperparameters
+    # Default LightGBM Hyperparameters (Koumei Maki & Goodpjw Ladder: num_leaves 127, feature_frac 0.50, min_child 50)
     lgb_params: dict[str, Any] = field(
         default_factory=lambda: {
             "objective": "binary",
             "metric": "auc",
             "boosting_type": "gbdt",
-            "learning_rate": 0.03,
-            "num_leaves": 63,
+            "learning_rate": 0.02,
+            "num_leaves": 127,
             "max_depth": -1,
-            "feature_fraction": 0.70,
+            "feature_fraction": 0.50,
             "bagging_fraction": 0.80,
             "bagging_freq": 1,
-            "min_child_samples": 30,
-            "n_estimators": 4000,
+            "min_child_samples": 50,
+            "lambda_l2": 5.0,
+            "n_estimators": 5000,
             "random_state": 42,
             "n_jobs": -1,
             "verbose": -1,
@@ -228,33 +229,34 @@ class TrainConfig:
             "iterations": 4000,
             "learning_rate": 0.04,
             "depth": 6,
-            "l2_leaf_reg": 3.0,
+            "l2_leaf_reg": 5.0,
             "boosting_type": "Plain",
             "bagging_temperature": 0.2,
             "random_strength": 1.0,
             "combinations_ctr": ["BinarizedTargetMeanValue", "Counter"],
             "max_ctr_complexity": 4,
             "random_seed": 42,
-            "early_stopping_rounds": 100,
+            "early_stopping_rounds": 150,
             "verbose": 250,
         }
     )
 
-    # Default XGBoost Hyperparameters
+    # Default XGBoost Hyperparameters (Busyaprime & Koumei Maki: max_depth 8, colsample 0.50, lr 0.015)
     xgb_params: dict[str, Any] = field(
         default_factory=lambda: {
             "objective": "binary:logistic",
             "eval_metric": "auc",
-            "learning_rate": 0.035,
-            "max_depth": 6,
-            "colsample_bytree": 0.70,
+            "learning_rate": 0.015,
+            "max_depth": 8,
+            "colsample_bytree": 0.50,
             "subsample": 0.80,
             "min_child_weight": 5,
-            "reg_alpha": 0.5,
+            "reg_alpha": 0.10,
             "reg_lambda": 2.0,
-            "n_estimators": 3500,
+            "n_estimators": 4500,
             "random_state": 42,
             "tree_method": "hist",
+            "early_stopping_rounds": 150,
         }
     )
 

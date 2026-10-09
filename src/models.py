@@ -477,9 +477,18 @@ class XGBoostModel(BaseModel):
         base_margin_val = kwargs.get("base_margin_val", None)
 
         dtrain = xgb.DMatrix(
-            X_train, label=y_train, weight=sample_weight, base_margin=base_margin_tr
+            X_train,
+            label=y_train,
+            weight=sample_weight,
+            base_margin=base_margin_tr,
+            enable_categorical=True,
         )
-        dval = xgb.DMatrix(X_val, label=y_val, base_margin=base_margin_val)
+        dval = xgb.DMatrix(
+            X_val,
+            label=y_val,
+            base_margin=base_margin_val,
+            enable_categorical=True,
+        )
 
         evals = [(dtrain, "train"), (dval, "valid")]
         self.model = xgb.train(
@@ -495,7 +504,7 @@ class XGBoostModel(BaseModel):
         import xgboost as xgb
 
         base_margin = kwargs.get("base_margin", None)
-        dtest = xgb.DMatrix(X, base_margin=base_margin)
+        dtest = xgb.DMatrix(X, base_margin=base_margin, enable_categorical=True)
         return self.model.predict(dtest)
 
 

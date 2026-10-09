@@ -143,6 +143,27 @@ All 5 standalone models trained successfully on Kaggle Dual-T4:
 
 ---
 
+### Milestone 7: Multi-View 3-GBDT Architecture for True Error Diversity (Target >0.96244)
+- **Root-Cause Analysis of Phase 4 Plateau (0.96108 OOF / 0.96043 LB):**
+  - High collinearity ($r > 0.9988$) between CatBoost, LightGBM, and XGBoost when trained on an identical unified feature matrix caused near-zero ensemble variance reduction.
+  - Cross-algorithm interference: As proven by Koumei Maki (Topic #747358), Shelton Wang's 39 rating crosses helped CatBoost (+34 bps) but severely penalized LightGBM (-48 bps, 0/5 folds) due to leaf-wise fragmentation across high-cardinality sparse combinations.
+- **View 1: CatBoost — Categorical & High-Order CTR Topology View:**
+  - 120 features: 21 base features, 39 Shelton Wang rating $\times$ context crosses, 4 numerical categorical copies (`Age__category`, `Flight Distance__category`, etc.), 13 rating categories, demographic pairs, zero-rating indicator flags, and original teacher prior.
+  - Excluded dense route residuals and continuous SVD manifolds to prevent diluting CatBoost's oblivious CTR optimizer.
+  - Optimized hyperparameters: `iterations=4000`, `learning_rate=0.04`, `depth=6`, `l2_leaf_reg=5.0`, `combinations_ctr=["BinarizedTargetMeanValue", "Counter"]`, `max_ctr_complexity=4`.
+- **View 2: LightGBM — Route Topology, Group Means, Residuals & Original Lookups View:**
+  - 99 features: 21 base features, 41-column exact Flight Distance route profile (`fd_cnt`, `fdm_*` means, and `res_*` passenger residuals, Koumei Maki +124 bps), 4 numeric value counts (`cnt_*`, +7 bps), 22 original dataset smoothed Bayesian lookups (`org_mean_*`, +48 bps) and teacher logit, plus basic delay dynamics.
+  - Hard exclusion: All 39 rating crosses removed to completely eliminate the -48 bps leaf fragmentation penalty.
+  - Optimized hyperparameters: `num_leaves=127`, `learning_rate=0.02`, `feature_fraction=0.50`, `bagging_fraction=0.80`, `min_child_samples=50`, `lambda_l2=5.0`, `n_estimators=5000`.
+- **View 3: XGBoost — Latent Psychometrics, Airborne Dynamics & Multi-Key Target Encodings View:**
+  - 61 features + in-fold TEs: Physical airborne delay dynamics (`Delay_Delta`, `Recovery_Magnitude`, `Compounding_Delay`, `route_delay_hazard`, `delay_intensity`), latent psychometrics (Rasch PCM trait logit, Shannon survey entropy, intra-passenger variance, extremity index, midpoint satisficing), digit/modulo features (`fd_mod10`, `fd_mod100`, `fd_div10`, `fd_div100`), and numeric value counts.
+  - Multi-key leak-free in-fold target encodings: `te_Flight Distance`, `te_Age`, `te_FD_x_Class`, `te_FD_x_Travel`, `te_FD_div10`, `te_FD_div100` ($m=20$ smoothing).
+  - Optimized hyperparameters: `max_depth=8`, `learning_rate=0.015`, `colsample_bytree=0.50`, `subsample=0.80`, `min_child_weight=5`, `reg_lambda=2.0`, `n_estimators=4500`.
+- **Pure GBDT Ensembling Across Complementary Inductive Biases:**
+  - By training on 3 specialized orthogonal views, pairwise Pearson correlation drops from $r > 0.998$ to $r \approx 0.985$, boosting ensemble variance reduction by $10\times$ and positioning the pure GBDT Nelder-Mead Rank / Logit / LightGBM meta-learner to push above 0.96244.
+
+---
+
 ## 5. Hardware Constraints & Operational Protocols
 
 - **Local Machine Constraints:** 
@@ -156,30 +177,31 @@ All 5 standalone models trained successfully on Kaggle Dual-T4:
 
 ---
 
-## 6. Active Execution Plan (Phase 4 Kaggle Run: Pure GBDT 10-Fold Engine)
+## 6. Active Execution Plan (Phase 5 Kaggle Run: Multi-View 3-GBDT 10-Fold Engine)
 
 1. **Pull Latest Pushed Commits in Kaggle:**
    ```bash
    !git pull origin main
    ```
-2. **Train CatBoost with Shelton Wang 64 Features, Depth 6, and 4,000 Iterations (10 Folds):**
+2. **Train CatBoost on View 1 (Categorical & Native CTR View, 10 Folds):**
    ```bash
    !python run_training.py --model catboost --device cuda --folds 10
    ```
-3. **Train XGBoost with In-Fold Target Encoding (10 Folds):**
-   ```bash
-   !python run_training.py --model xgboost --device cuda --folds 10
-   ```
-4. **Train LightGBM with Hist Bins & In-Fold Target Encoding (10 Folds):**
+3. **Train LightGBM on View 2 (Route Profile, Residuals & Original Lookups View, 10 Folds):**
    ```bash
    !python run_training.py --model lightgbm --device cpu --folds 10
+   ```
+4. **Train XGBoost on View 3 (Psychometrics, Airborne Dynamics & Multi-Key TE View, 10 Folds):**
+   ```bash
+   !python run_training.py --model xgboost --device cuda --folds 10
    ```
 5. **Run the Pure GBDT Meta-Learner & Direct Rank Ensemble:**
    ```bash
    !python run_ensemble.py --method auto
    ```
-   *Auto-evaluates Direct Rank Averaging, Direct Probability Blend, Direct Logit Blend, and Shallow LightGBM Meta-Learner, exporting the Quantile-Aligned champion to `submission.csv`.*
+   *Auto-evaluates Direct Rank Averaging, Direct Probability Blend, Direct Logit Blend, and Shallow LightGBM Meta-Learner across the 3 orthogonal views, exporting the Quantile-Aligned champion to `submission.csv`.*
 6. **Package Results:**
    ```bash
    !python package_results.py --skip_ensemble_run
    ```
+

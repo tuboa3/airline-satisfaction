@@ -81,8 +81,16 @@ class CrossValidationEngine:
         )
         X_test = self.pipeline.transform(test_synth, is_train=False)
 
+        # Route to Architecture-Specific Feature View (Breaking Pearson r > 0.998 Collinearity)
+        X_train_all = self.pipeline.get_feature_view(
+            X_train_all, self.model_name
+        )
+        X_test = self.pipeline.get_feature_view(X_test, self.model_name)
+
         feature_names = X_train_all.columns.tolist()
-        logging.info(f"Engineered Feature Count: {len(feature_names)}")
+        logging.info(
+            f"Engineered Feature Count for View [{self.model_name.upper()}]: {len(feature_names)}"
+        )
 
         # Isolate synthetic indices for leak-proof CV evaluation (0: synthetic, 1: original)
         synth_mask = (unified_train["is_original"] == 0).values
@@ -202,30 +210,56 @@ class CrossValidationEngine:
                     extra_fit_kwargs["base_margin_tr"] = margin_tr
                     extra_fit_kwargs["base_margin_val"] = margin_va
 
-            # Leak-Free In-Fold Target Encoding (Sachith7 Topic #745908, +135 bps)
+            # Leak-Free Multi-Key In-Fold Target Encoding (Koumei Maki + Busyaprime + Goodpjw)
             # Strictly computed on the training indices of the active fold:
-            if "Flight Distance" in X_tr.columns:
+            if not ("cat" in model_name_lower or "cb" in model_name_lower):
                 X_tr = X_tr.copy()
                 X_va = X_va.copy()
                 X_te_fold = X_test.copy()
-                dist_tr = X_tr["Flight Distance"]
-                dist_va = X_va["Flight Distance"]
-                dist_te = X_test["Flight Distance"]
 
                 prior_y = float(np.mean(y_tr))
-                smooth_prior_dist = 20.0
-                c_dist = dist_tr.value_counts()
-                sum_dist = pd.Series(y_tr, index=X_tr.index).groupby(dist_tr).sum()
-                te_dist_map = (
-                    (sum_dist + smooth_prior_dist * prior_y)
-                    / (c_dist + smooth_prior_dist)
-                ).to_dict()
+                smooth_m = 20.0
 
-                X_tr["te_Flight Distance"] = dist_tr.map(te_dist_map).fillna(prior_y).astype(np.float32)
-                X_va["te_Flight Distance"] = dist_va.map(te_dist_map).fillna(prior_y).astype(np.float32)
-                X_te_fold["te_Flight Distance"] = dist_te.map(te_dist_map).fillna(prior_y).astype(np.float32)
+                te_key_defs = []
+                if "Flight Distance" in X_tr.columns:
+                    te_key_defs.append(
+                        ("te_Flight Distance", X_tr["Flight Distance"], X_va["Flight Distance"], X_test["Flight Distance"])
+                    )
+                    te_key_defs.append(
+                        ("te_FD_div10", (X_tr["Flight Distance"] // 10).astype(str), (X_va["Flight Distance"] // 10).astype(str), (X_test["Flight Distance"] // 10).astype(str))
+                    )
+                    te_key_defs.append(
+                        ("te_FD_div100", (X_tr["Flight Distance"] // 100).astype(str), (X_va["Flight Distance"] // 100).astype(str), (X_test["Flight Distance"] // 100).astype(str))
+                    )
+                if "Age" in X_tr.columns:
+                    te_key_defs.append(
+                        ("te_Age", X_tr["Age"], X_va["Age"], X_test["Age"])
+                    )
+                if "Flight Distance" in X_tr.columns and "Class" in X_tr.columns:
+                    te_key_defs.append(
+                        ("te_FD_x_Class", X_tr["Flight Distance"].astype(str) + "_" + X_tr["Class"].astype(str),
+                         X_va["Flight Distance"].astype(str) + "_" + X_va["Class"].astype(str),
+                         X_test["Flight Distance"].astype(str) + "_" + X_test["Class"].astype(str))
+                    )
+                if "Flight Distance" in X_tr.columns and "Type of Travel" in X_tr.columns:
+                    te_key_defs.append(
+                        ("te_FD_x_Travel", X_tr["Flight Distance"].astype(str) + "_" + X_tr["Type of Travel"].astype(str),
+                         X_va["Flight Distance"].astype(str) + "_" + X_va["Type of Travel"].astype(str),
+                         X_test["Flight Distance"].astype(str) + "_" + X_test["Type of Travel"].astype(str))
+                    )
+
+                for te_name, tr_s, va_s, te_s in te_key_defs:
+                    c_counts = tr_s.value_counts()
+                    c_sums = pd.Series(y_tr, index=X_tr.index).groupby(tr_s).sum()
+                    te_map = ((c_sums + smooth_m * prior_y) / (c_counts + smooth_m)).to_dict()
+
+                    X_tr[te_name] = tr_s.map(te_map).fillna(prior_y).astype(np.float32)
+                    X_va[te_name] = va_s.map(te_map).fillna(prior_y).astype(np.float32)
+                    X_te_fold[te_name] = te_s.map(te_map).fillna(prior_y).astype(np.float32)
             else:
-                X_te_fold = X_test
+                X_tr = X_tr.copy()
+                X_va = X_va.copy()
+                X_te_fold = X_test.copy()
 
             # Native Categorical CTR for CatBoost (Shelton Wang Topic #745892)
             if "cat" in model_name_lower or "cb" in model_name_lower:
@@ -244,7 +278,6 @@ class CrossValidationEngine:
                     "service_failure_class",
                     "age_class_travel",
                 ]
-                # Also include all 39 Shelton Wang rating-context crosses, rating categories, and 4 numerical categories
                 cat_cols = [
                     c
                     for c in X_tr.columns
@@ -253,8 +286,14 @@ class CrossValidationEngine:
                         ("_x_" in c or "__X__" in c or "__category" in c or "__cat" in c)
                         and not c.startswith("te_")
                         and not c.startswith("log_")
+                        and not c.startswith("org_")
                     )
+                    or (c in self.feature_cfg.rating_cols)
                 ]
+                for col in cat_cols:
+                    X_tr[col] = X_tr[col].astype(str)
+                    X_va[col] = X_va[col].astype(str)
+                    X_te_fold[col] = X_te_fold[col].astype(str)
                 extra_fit_kwargs["cat_features"] = cat_cols
 
             teacher_tr = (

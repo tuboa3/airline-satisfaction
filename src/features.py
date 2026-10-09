@@ -69,6 +69,13 @@ class FeaturePipeline:
             "age_class_travel",
         ]
 
+        # Route Profile & Group Conditional Residuals (Koumei Maki +124 bps)
+        self.route_profile_means: dict[str, dict[Any, float]] = {}
+        self.route_fd_cnt: dict[Any, int] = {}
+        self.num_value_counts: dict[str, dict[Any, int]] = {}
+        self.orig_lookup_maps: dict[str, dict[Any, float]] = {}
+        self.orig_prior_value: float = 0.5
+
         self.fitted: bool = False
 
     def _get_bounded_crosses(self, df: pd.DataFrame) -> dict[str, pd.Series]:
@@ -567,6 +574,83 @@ class FeaturePipeline:
                 except Exception as e:
                     logging.warning(f"Could not fit Original Dataset Prior Model: {e}")
                     self.orig_prior_model = None
+
+            # 8. Route Profile Group Means & Residual Forensics (Koumei Maki +124 bps)
+            # Transductive over train + test; Flight Distance contains zero label leakage.
+            if "Flight Distance" in full_df.columns:
+                base_cols_all = [
+                    c
+                    for c in (
+                        self.config.categorical_cols
+                        + self.config.numerical_cols
+                        + self.config.rating_cols
+                    )
+                    if c in full_df.columns
+                ]
+                self.route_fd_cnt = (
+                    full_df["Flight Distance"]
+                    .value_counts(dropna=False)
+                    .to_dict()
+                )
+
+                route_df = full_df[base_cols_all].copy()
+                for c in self.config.categorical_cols:
+                    if c in route_df.columns:
+                        route_df[c] = pd.factorize(route_df[c])[0]
+                if (
+                    "Arrival Delay in Minutes" in route_df.columns
+                    and "Departure Delay in Minutes" in route_df.columns
+                ):
+                    route_df["Arrival Delay in Minutes"] = route_df[
+                        "Arrival Delay in Minutes"
+                    ].fillna(route_df["Departure Delay in Minutes"])
+
+                grp_fd = route_df.groupby(full_df["Flight Distance"])
+                for c in base_cols_all:
+                    if c != "Flight Distance":
+                        self.route_profile_means[c] = grp_fd[c].mean().to_dict()
+
+            # 9. Numeric Value Counts (Koumei Maki +7 bps)
+            for c in self.config.numerical_cols:
+                if c in full_df.columns:
+                    self.num_value_counts[c] = (
+                        full_df[c].value_counts(dropna=False).to_dict()
+                    )
+
+            # 10. Smoothed Original-Data Column Lookups (Koumei Maki +48 bps)
+            if (
+                orig_df is not None
+                and len(orig_df) > 0
+                and self.config.target_col in orig_df.columns
+            ):
+                try:
+                    y_orig_num = resolve_binary_target(
+                        orig_df[self.config.target_col]
+                    )
+                    prior_orig = float(y_orig_num.mean())
+                    self.orig_prior_value = prior_orig
+                    m_smooth = 10.0
+                    for c in (
+                        self.config.categorical_cols
+                        + self.config.numerical_cols
+                        + self.config.rating_cols
+                    ):
+                        if c in orig_df.columns:
+                            s_orig = (
+                                pd.DataFrame(
+                                    {"v": orig_df[c].values, "y": y_orig_num}
+                                )
+                                .groupby("v", dropna=False)["y"]
+                                .agg(["sum", "count"])
+                            )
+                            self.orig_lookup_maps[c] = (
+                                (s_orig["sum"] + m_smooth * prior_orig)
+                                / (s_orig["count"] + m_smooth)
+                            ).to_dict()
+                except Exception as e:
+                    logging.warning(
+                        f"Could not compute original dataset column lookups: {e}"
+                    )
 
             self.fitted = True
             return self
@@ -1073,6 +1157,96 @@ class FeaturePipeline:
                 data["orig_logit"] = np.float32(0.0)
 
             # -------------------------------------------------------------
+            # 10.9 ROUTE PROFILES, GROUP MEANS & RESIDUALS (Koumei Maki +124 bps)
+            # -------------------------------------------------------------
+            if self.route_profile_means and "Flight Distance" in data.columns:
+                fd_series = data["Flight Distance"]
+                data["fd_cnt"] = (
+                    fd_series.map(self.route_fd_cnt).fillna(1.0).astype(np.float32)
+                )
+                route_adds = {}
+                for c, mean_map in self.route_profile_means.items():
+                    if c in data.columns:
+                        val_c = data[c]
+                        if c in self.config.categorical_cols:
+                            val_c = pd.factorize(val_c)[0].astype(np.float32)
+                        else:
+                            val_c = (
+                                pd.to_numeric(val_c, errors="coerce")
+                                .fillna(0.0)
+                                .astype(np.float32)
+                            )
+                        mean_c = (
+                            fd_series.map(mean_map)
+                            .fillna(float(val_c.mean()))
+                            .astype(np.float32)
+                        )
+                        route_adds[f"fdm_{c}"] = mean_c
+                        route_adds[f"res_{c}"] = (val_c - mean_c).astype(np.float32)
+                if route_adds:
+                    data = pd.concat(
+                        [data, pd.DataFrame(route_adds, index=data.index)], axis=1
+                    )
+
+            # -------------------------------------------------------------
+            # 10.10 NUMERIC VALUE COUNTS (Koumei Maki +7 bps)
+            # -------------------------------------------------------------
+            cnt_adds = {}
+            for c, cnt_map in self.num_value_counts.items():
+                if c in data.columns:
+                    cnt_adds[f"cnt_{c}"] = (
+                        data[c].map(cnt_map).fillna(0).astype(np.float32)
+                    )
+            if cnt_adds:
+                data = pd.concat(
+                    [data, pd.DataFrame(cnt_adds, index=data.index)], axis=1
+                )
+
+            # -------------------------------------------------------------
+            # 10.11 ORIGINAL DATASET SMOOTHED LOOKUPS (Koumei Maki +48 bps)
+            # -------------------------------------------------------------
+            org_adds = {}
+            for c, lookup in self.orig_lookup_maps.items():
+                if c in data.columns:
+                    org_adds[f"org_mean_{c}"] = (
+                        data[c]
+                        .map(lookup)
+                        .fillna(self.orig_prior_value)
+                        .astype(np.float32)
+                    )
+            if org_adds:
+                data = pd.concat(
+                    [data, pd.DataFrame(org_adds, index=data.index)], axis=1
+                )
+
+            # -------------------------------------------------------------
+            # 10.12 DIGIT & MODULO DECOMPOSITION (Busyaprime & Goodpjw)
+            # -------------------------------------------------------------
+            modulo_adds = {}
+            if "Flight Distance" in data.columns:
+                fd_v = (
+                    pd.to_numeric(data["Flight Distance"], errors="coerce")
+                    .fillna(0)
+                    .astype(np.int64)
+                )
+                modulo_adds["fd_mod10"] = (fd_v % 10).astype(np.float32)
+                modulo_adds["fd_mod100"] = (fd_v % 100).astype(np.float32)
+                modulo_adds["fd_div10"] = (fd_v // 10).astype(np.float32)
+                modulo_adds["fd_div100"] = (fd_v // 100).astype(np.float32)
+            if "Age" in data.columns:
+                age_v = (
+                    pd.to_numeric(data["Age"], errors="coerce")
+                    .fillna(0)
+                    .astype(np.int64)
+                )
+                modulo_adds["age_mod10"] = (age_v % 10).astype(np.float32)
+                modulo_adds["age_div10"] = (age_v // 10).astype(np.float32)
+            if modulo_adds:
+                data = pd.concat(
+                    [data, pd.DataFrame(modulo_adds, index=data.index)], axis=1
+                )
+
+            # -------------------------------------------------------------
             # 11. CATEGORICAL ENCODING
             # -------------------------------------------------------------
             cat_columns = list(self.label_encoders.keys())
@@ -1111,3 +1285,173 @@ class FeaturePipeline:
         """Fits transductive statistics and transforms training data."""
         self.fit(train_df, test_df, orig_df=orig_df)
         return self.transform(train_df, is_train=True)
+
+    def get_feature_view(
+        self, df: pd.DataFrame, model_name: str
+    ) -> pd.DataFrame:
+        """
+        Routes engineered dataframe to the mathematically optimal feature view
+        tailored to the specific GBDT architecture's inductive bias:
+        - View 1 (CatBoost): Oblivious symmetric trees with native CTR. Focuses on categorical
+          crosses, discrete ratings, numerical categories, demographic pairs, and prior logit.
+          Excludes dense route residuals and continuous SVD projections.
+        - View 2 (LightGBM): Leaf-wise (best-first) growth. Exploits exact route group means
+          (fdm_*), residuals (res_*), route counts (fd_cnt), original-data lookups, and value counts.
+          Excludes the 39 rating crosses (which hurt LightGBM by -48 bps due to leaf fragmentation).
+        - View 3 (XGBoost): Depth-wise Hessian-weighted growth. Exploits airborne delay recovery dynamics,
+          Rasch PCM trait logits, Shannon survey entropy, response style forensics, and digit modulo features.
+        """
+        name = model_name.lower()
+        cols = df.columns.tolist()
+
+        if any(k in name for k in ["catboost", "cb", "cat"]):
+            # VIEW 1: CatBoost Categorical & CTR Topology View
+            selected = []
+            for c in cols:
+                # Exclude dense continuous route residuals, SVD manifolds, and centroid ratios
+                if c.startswith("res_") or c.startswith("fdm_") or c.startswith("svd_"):
+                    continue
+                if "centroid" in c or "dist_to_" in c or "global_dist_" in c:
+                    continue
+                if c in ["anomaly_density_score", "intra_passenger_var"]:
+                    continue
+
+                # Keep base features, rating crosses, categories, and prior logits
+                if (
+                    ("__X__" in c)
+                    or ("__category" in c)
+                    or ("_x_" in c)
+                    or ("_is_0" in c)
+                    or (c in self.config.categorical_cols)
+                    or (c in self.config.rating_cols)
+                    or (c in self.config.numerical_cols)
+                    or (c in ["orig_logit", "orig_proba", "total_na_ratings"])
+                    or (
+                        c
+                        in [
+                            "route_class_travel",
+                            "route_delay_tier",
+                            "route_dissatisfaction",
+                            "service_failure_class",
+                            "age_class_travel",
+                        ]
+                    )
+                ):
+                    selected.append(c)
+
+            if len(selected) < 15:
+                return df.copy()
+            return df[selected].copy()
+
+        elif any(k in name for k in ["lightgbm", "lgb"]):
+            # VIEW 2: LightGBM Route Topology, Residuals & Original Lookups View
+            selected = []
+            for c in cols:
+                # Hard exclusion: Shelton Wang 39 rating crosses (Topic #747358: hurts LightGBM by -48 bps)
+                if "__X__" in c:
+                    continue
+                if c.startswith("svd_"):
+                    continue
+                if "centroid" in c or "dist_to_" in c or "global_dist_" in c:
+                    continue
+
+                # Include route profiles, residuals, original lookups, counts, base features, basic delay dynamics
+                if (
+                    c.startswith("fdm_")
+                    or c.startswith("res_")
+                    or c.startswith("cnt_")
+                    or c.startswith("org_mean_")
+                    or (
+                        c
+                        in [
+                            "fd_cnt",
+                            "orig_logit",
+                            "orig_proba",
+                            "total_delay",
+                            "has_delay",
+                            "has_severe_delay",
+                            "Delay_Delta",
+                            "Recovery_Magnitude",
+                            "Compounding_Delay",
+                            "route_mean_arr_delay",
+                            "route_std_arr_delay",
+                            "freq_flight_distance",
+                            "log_count_flight_distance",
+                        ]
+                    )
+                    or (c in self.config.categorical_cols)
+                    or (c in self.config.rating_cols)
+                    or (c in self.config.numerical_cols)
+                ):
+                    selected.append(c)
+
+            if len(selected) < 15:
+                return df.copy()
+            return df[selected].copy()
+
+        elif any(k in name for k in ["xgboost", "xgb"]):
+            # VIEW 3: XGBoost Latent Psychometrics, Airborne Dynamics & Multi-Key View
+            selected = []
+            for c in cols:
+                if "__X__" in c or c.startswith("res_"):
+                    continue
+                if c.startswith("svd_"):
+                    continue
+                if "centroid" in c or "dist_to_" in c or "global_dist_" in c:
+                    continue
+
+                if (
+                    (
+                        c
+                        in [
+                            "Delay_Delta",
+                            "arr_minus_dep",
+                            "Recovery_Magnitude",
+                            "Compounding_Delay",
+                            "total_delay",
+                            "has_delay",
+                            "has_severe_delay",
+                            "route_delay_hazard",
+                            "delay_intensity",
+                            "delay_diff",
+                            "Arrival_Delay_is_nan",
+                            "rasch_delight_score",
+                            "rasch_pcm_trait",
+                            "intra_passenger_var",
+                            "straight_liner",
+                            "survey_entropy",
+                            "midpoint_fraction",
+                            "extremity_ratio",
+                            "min_service_rating",
+                            "has_service_failure",
+                            "is_all_pass_service",
+                            "digital_score",
+                            "cabin_score",
+                            "staff_score",
+                            "comfort_score",
+                            "total_service_mean",
+                            "service_rating_std",
+                            "total_na_ratings",
+                            "fd_mod10",
+                            "fd_mod100",
+                            "fd_div10",
+                            "fd_div100",
+                            "age_mod10",
+                            "age_div10",
+                            "orig_logit",
+                            "orig_proba",
+                        ]
+                    )
+                    or c.startswith("cnt_")
+                    or (c in self.config.categorical_cols)
+                    or (c in self.config.rating_cols)
+                    or (c in self.config.numerical_cols)
+                ):
+                    selected.append(c)
+
+            if len(selected) < 15:
+                return df.copy()
+            return df[selected].copy()
+
+        else:
+            return df.copy()
