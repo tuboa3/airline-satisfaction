@@ -360,36 +360,44 @@ class CatBoostModel(BaseModel):
         if base_margin_tr is not None:
             # CatBoost Pool expects baseline as 2D array (n_samples, 1) for binary classification
             bm_tr = np.asarray(base_margin_tr).reshape(-1, 1)
-            bm_va = np.asarray(base_margin_val).reshape(-1, 1) if base_margin_val is not None else None
-            train_input = Pool(
+            bm_va = (
+                np.asarray(base_margin_val).reshape(-1, 1)
+                if base_margin_val is not None
+                else None
+            )
+            train_pool = Pool(
                 X_train,
                 y_train,
                 weight=sample_weight,
                 baseline=bm_tr,
                 cat_features=cat_features,
             )
-            val_input = Pool(
+            val_pool = Pool(
                 X_val,
                 y_val,
                 baseline=bm_va,
                 cat_features=cat_features,
             )
-            fit_kwargs = dict(eval_set=val_input)
         else:
-            train_input = X_train
-            fit_kwargs = dict(
-                sample_weight=sample_weight,
-                eval_set=(X_val, y_val),
+            train_pool = Pool(
+                X_train,
+                y_train,
+                weight=sample_weight,
+                cat_features=cat_features,
+            )
+            val_pool = Pool(
+                X_val,
+                y_val,
                 cat_features=cat_features,
             )
 
         try:
             self.model.fit(
-                train_input,
+                train_pool,
+                eval_set=val_pool,
                 early_stopping_rounds=self.early_stopping_rounds,
                 verbose=self.verbose,
                 use_best_model=True,
-                **fit_kwargs,
             )
         except Exception as e:
             if self.params.get("task_type") == "GPU":
@@ -411,11 +419,11 @@ class CatBoostModel(BaseModel):
                     ]
                 self.model = CatBoostClassifier(**cpu_params)
                 self.model.fit(
-                    train_input,
+                    train_pool,
+                    eval_set=val_pool,
                     early_stopping_rounds=self.early_stopping_rounds,
                     verbose=self.verbose,
                     use_best_model=True,
-                    **fit_kwargs,
                 )
             else:
                 raise e

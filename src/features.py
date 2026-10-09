@@ -4,6 +4,7 @@ Plus Domain A (Density & Frequency Forensics) and Domain C (Transductive Encodin
 """
 
 import logging
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -11,6 +12,9 @@ from sklearn.cluster import MiniBatchKMeans
 from sklearn.decomposition import TruncatedSVD
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import LabelEncoder
+
+# Suppress pandas fragmentation warnings when engineering 100+ columns
+warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 
 from src.config import FeatureConfig
 from src.utils import reduce_mem_usage, resolve_binary_target, timer
@@ -1032,6 +1036,7 @@ class FeaturePipeline:
             # -------------------------------------------------------------
             # 6. SIMPSON'S INVERSION & DEMOGRAPHIC INTERACTIONS
             # -------------------------------------------------------------
+            data = data.copy()
             is_business_class = (data["Class"] == "Business").astype(np.int8)
             is_business_travel = (data["Type of Travel"] == "Business travel").astype(
                 np.int8
@@ -1188,6 +1193,7 @@ class FeaturePipeline:
             # -------------------------------------------------------------
             # 10.5 ROUTE PROFILES & BOUNDED CROSSES (Rugved Bane & Friend 1)
             # -------------------------------------------------------------
+            data = data.copy()
             # Route Profiles: Flight Distance target encoding & aggregations
             if self.config.enable_route_profiles and "Flight Distance" in data.columns:
                 if (
@@ -1288,6 +1294,7 @@ class FeaturePipeline:
             # -------------------------------------------------------------
             # 10.8 ORIGINAL DATASET PRIOR FEATURES (Rugved Bane #2 and #3)
             # -------------------------------------------------------------
+            data = data.copy()
             if self.orig_prior_model is not None and self.orig_prior_cols:
                 try:
                     X_prior_eval = data[self.orig_prior_cols].copy()
@@ -1455,6 +1462,7 @@ class FeaturePipeline:
             # -------------------------------------------------------------
             # 11. CATEGORICAL ENCODING
             # -------------------------------------------------------------
+            data = data.copy()
             cat_columns = list(self.label_encoders.keys())
             for col in cat_columns:
                 if col in data.columns:
