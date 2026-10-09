@@ -132,42 +132,98 @@ class EnsembleOptimizer:
         oof_list: list[np.ndarray],
         test_list: list[np.ndarray],
         y_true: np.ndarray,
+        lambda_reg: float = 1e-4,
     ) -> tuple[np.ndarray, float, np.ndarray, dict[str, float]]:
-        """Classic Rank Averaging Blend."""
+        """
+        Leakage-Safe Constrained Rank Optimization (Friend 3 Methodology):
+        1. Predeclared coarse simplex grid (step 0.05) + Dirichlet(1) random draws (K=500).
+        2. Evaluated on pooled OOF AUC with quadratic uniform regularization penalty Omega(w) = lambda * sum((w_m - 1/M)^2).
+        3. Cyclic coordinate refinement over w_m in +-0.05, +-0.02 steps while renormalizing.
+        4. Calculates and reports Effective Model Count N_eff = 1 / sum(w_m^2).
+        """
         oof_ranks = np.column_stack([self.rank_transform(p) for p in oof_list])
         test_ranks = np.column_stack([self.rank_transform(p) for p in test_list])
 
-        n = len(model_names)
-        if len(y_true) > 60000:
-            rng = np.random.RandomState(42)
-            sub_idx = rng.choice(len(y_true), size=60000, replace=False)
-            oof_sub = oof_ranks[sub_idx]
-            y_sub = y_true[sub_idx]
-        else:
-            oof_sub = oof_ranks
-            y_sub = y_true
+        M = len(model_names)
+        if M == 1:
+            best_auc = float(roc_auc_score(y_true, oof_ranks[:, 0]))
+            return oof_ranks[:, 0], best_auc, test_ranks[:, 0], {model_names[0]: 1.0}
 
-        def objective(w):
-            weights = np.maximum(0.0, w)
-            s = weights.sum()
-            if s == 0:
-                weights = np.ones_like(weights) / n
+        uniform_w = np.ones(M, dtype=np.float64) / M
+
+        # Candidate weight generation: Simplex grid (step 0.05) + Dirichlet draws
+        candidates = [uniform_w.copy()]
+        # Single-model weights
+        for i in range(M):
+            e_i = np.zeros(M, dtype=np.float64)
+            e_i[i] = 1.0
+            candidates.append(e_i)
+
+        # Pairwise 50/50 weights
+        for i in range(M):
+            for j in range(i + 1, M):
+                pw = np.zeros(M, dtype=np.float64)
+                pw[i] = 0.5
+                pw[j] = 0.5
+                candidates.append(pw)
+
+        # Dirichlet(1.0) random search (K=500 draws)
+        rng = np.random.RandomState(42)
+        dirichlet_draws = rng.dirichlet(np.ones(M), size=500)
+        candidates.extend(dirichlet_draws)
+
+        # Scoring function with quadratic uniform regularization penalty
+        def score_weight(w):
+            w = np.maximum(0.0, w)
+            s = w.sum()
+            if s <= 0:
+                w = uniform_w.copy()
             else:
-                weights = weights / s
-            blend = np.dot(oof_sub, weights)
-            return -roc_auc_score(y_sub, blend)
+                w = w / s
+            pred = np.dot(oof_ranks, w)
+            raw_auc = roc_auc_score(y_true, pred)
+            penalty = lambda_reg * np.sum((w - uniform_w) ** 2)
+            return raw_auc - penalty, raw_auc
 
-        init_w = np.ones(n) / n
-        res = minimize(objective, init_w, method="Nelder-Mead", options={"maxiter": 300})
+        best_score = -1.0
+        best_w = uniform_w.copy()
+        best_raw_auc = 0.0
 
-        opt_w = np.maximum(0.0, res.x)
-        opt_w = opt_w / opt_w.sum()
+        for cand_w in candidates:
+            score, raw_auc = score_weight(cand_w)
+            if score > best_score:
+                best_score = score
+                best_w = cand_w
+                best_raw_auc = raw_auc
 
+        # Coordinate refinement around best candidate
+        curr_w = best_w.copy()
+        for step in [0.05, 0.02, 0.01]:
+            for i in range(M):
+                for delta in [-step, step]:
+                    trial_w = curr_w.copy()
+                    trial_w[i] = max(0.0, trial_w[i] + delta)
+                    s = trial_w.sum()
+                    if s > 0:
+                        trial_w /= s
+                        score, raw_auc = score_weight(trial_w)
+                        if score > best_score:
+                            best_score = score
+                            curr_w = trial_w
+                            best_raw_auc = raw_auc
+
+        opt_w = curr_w / curr_w.sum()
         final_oof = np.dot(oof_ranks, opt_w)
         final_test = np.dot(test_ranks, opt_w)
-        best_auc = roc_auc_score(y_true, final_oof)
+        final_auc = float(roc_auc_score(y_true, final_oof))
+
+        n_eff = 1.0 / float(np.sum(opt_w ** 2))
+        self.logger.info(
+            f"Constrained Rank Optimization: Pooled AUC = {final_auc:.5f} | N_eff = {n_eff:.2f} / {M}"
+        )
+
         w_dict = {name: float(w) for name, w in zip(model_names, opt_w)}
-        return final_oof, best_auc, final_test, w_dict
+        return final_oof, final_auc, final_test, w_dict
 
     def blend_logit_slsqp(
         self,
@@ -805,30 +861,38 @@ class EnsembleOptimizer:
         )
         self.logger.info("=" * 70)
 
-        # Hybrid Post-Calibration: Align Test Quantiles to OOF Empirical Distribution (Friend 1)
-        from src.postprocess import HybridPostCalibrator
-
-        aligned_champ_test = HybridPostCalibrator.empirical_quantile_align(
-            champ_oof, champ_test
-        )
-
-        # Save Final Submission (both quantile-aligned champion and raw champion)
         test_ids = self.load_test_ids()
-        sub_df = pd.DataFrame(
-            {self.feature_cfg.id_col: test_ids, self.feature_cfg.target_col: aligned_champ_test}
+
+        # Automated Submission Integrity Harness (Friend 3 Checklist)
+        assert len(champ_test) == len(test_ids), f"Test prediction count ({len(champ_test)}) != test_ids count ({len(test_ids)})"
+        assert not np.isnan(champ_test).any(), "Submission integrity error: NaN detected in predictions!"
+        assert not np.isinf(champ_test).any(), "Submission integrity error: Inf detected in predictions!"
+        assert (champ_test >= 0.0).all() and (champ_test <= 1.0).all(), "Submission integrity error: Predictions out of [0, 1]!"
+
+        # Log prediction distribution sanity percentiles
+        pcts = np.percentile(champ_test, [0, 1, 10, 50, 90, 99, 100])
+        self.logger.info(
+            f"Test Prediction Percentiles: min={pcts[0]:.4f}, p1={pcts[1]:.4f}, p50={pcts[3]:.4f}, p99={pcts[5]:.4f}, max={pcts[6]:.4f}"
         )
-        raw_sub_df = pd.DataFrame(
+
+        # Build clean submission dataframe
+        sub_df = pd.DataFrame(
             {self.feature_cfg.id_col: test_ids, self.feature_cfg.target_col: champ_test}
         )
 
         os.makedirs(self.paths.submissions_dir, exist_ok=True)
         sub_path = os.path.join(self.paths.submissions_dir, "submission_ensemble.csv")
-        raw_path = os.path.join(self.paths.submissions_dir, "submission_ensemble_raw.csv")
         sub_df.to_csv(sub_path, index=False)
         sub_df.to_csv("submission.csv", index=False)
-        raw_sub_df.to_csv(raw_path, index=False)
+
+        # Integrity verification: re-read file from disk
+        verify_df = pd.read_csv("submission.csv")
+        assert len(verify_df) == len(test_ids), "Disk verification error: Row count mismatch!"
+        assert list(verify_df.columns) == [self.feature_cfg.id_col, self.feature_cfg.target_col], "Disk verification error: Columns mismatch!"
+        assert not verify_df[self.feature_cfg.target_col].isna().any(), "Disk verification error: Null values found!"
+
         self.logger.info(
-            f"Exported Quantile-Aligned Champion to '{sub_path}' and 'submission.csv' (Raw saved to '{raw_path}')"
+            f"Submission Integrity Verification PASSED: {len(verify_df)} rows, [0, 1] bounded, 0 NaNs. Exported to '{sub_path}' and 'submission.csv'."
         )
 
-        return champ_oof, champ_auc, aligned_champ_test
+        return champ_oof, champ_auc, champ_test

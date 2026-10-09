@@ -22,6 +22,7 @@ def parse_args():
         default="lightgbm",
         choices=[
             "lightgbm", "lgbm",
+            "lightgbm_xt", "lgb_xt", "extra_trees",
             "catboost", "cb", "cat",
             "xgboost", "xgb",
             "realmlp", "tabm", "hybrid",
@@ -93,14 +94,16 @@ def parse_args():
         help="Use adversarial density ratio weighting for original data"
     )
     parser.add_argument(
-        "--no_original",
+        "--use_original_data",
         action="store_true",
-        help="Disable original dataset ingestion and train purely on synthetic data"
+        default=False,
+        help="Concatenate raw original rows into training folds (default: False, purged due to covariate shift)"
     )
     parser.add_argument(
-        "--no_glm_margin",
+        "--use_glm_margin",
         action="store_true",
-        help="Disable Stage 1 GLM margin generation for tree models"
+        default=False,
+        help="Enable Stage 1 GLM margin generation for tree models (default: False)"
     )
     return parser.parse_args()
 
@@ -114,10 +117,10 @@ def main():
     train_cfg = TrainConfig(
         n_splits=args.folds,
         random_state=args.seed,
-        use_original_data=(not args.no_original),
+        use_original_data=args.use_original_data,
         original_sample_weight=args.original_weight,
         use_density_ratio_weighting=args.density_ratio,
-        use_glm_margin=(not args.no_glm_margin),
+        use_glm_margin=args.use_glm_margin,
     )
 
     if args.epochs is not None:

@@ -60,13 +60,18 @@ class PathConfig:
             orig_candidates = [
                 "/kaggle/input/airline-passenger-satisfaction",
                 "/kaggle/input/airline-passenger-satisfaction-dataset",
+                "/kaggle/input/customer-satisfaction",
+                "/kaggle/input/customer-satisfaction-dataset",
                 "data/original",
                 "data/raw/original",
                 "data/external",
             ]
             import glob
             if os.path.exists("/kaggle/input"):
-                orig_matches = glob.glob("/kaggle/input/**/airline-passenger-satisfaction*/**", recursive=True)
+                orig_matches = (
+                    glob.glob("/kaggle/input/**/airline-passenger-satisfaction*/**", recursive=True)
+                    + glob.glob("/kaggle/input/**/customer-satisfaction*/**", recursive=True)
+                )
                 for om in orig_matches:
                     if os.path.isdir(om):
                         orig_candidates.insert(0, om)
@@ -166,6 +171,8 @@ class FeatureConfig:
     enable_orig_prior: bool = True
     enable_route_profiles: bool = True
     enable_bounded_crosses: bool = True
+    enable_expected_ratings: bool = True
+    enable_dist_decomposition: bool = True
 
 
 @dataclass
@@ -180,7 +187,7 @@ class TrainConfig:
 
     # Domain 1: Original Host Dataset Ingestion & Weight Attenuation
     # Raw original rows are purged from training folds (karttikjangid05 Topic #745098 & starkhushi Topic #745932).
-    # Original data is used strictly as an external HistGradientBoosting Teacher model (Sachith7 Topic #745908).
+    # Original data is used strictly as external Bayes lookups (org_mean_*), Auxiliary Rating Priors (E[r_i|X]), and Teacher model.
     use_original_data: bool = False
     original_sample_weight: float = 0.50
     use_density_ratio_weighting: bool = False
@@ -200,7 +207,7 @@ class TrainConfig:
         }
     )
 
-    # Default LightGBM Hyperparameters (Koumei Maki & Goodpjw Ladder: num_leaves 127, feature_frac 0.50, min_child 50)
+    # Arm 2: LightGBM Hyperparameters (Leaf-Wise Asymmetric Growth, 99 features)
     lgb_params: dict[str, Any] = field(
         default_factory=lambda: {
             "objective": "binary",
@@ -210,9 +217,11 @@ class TrainConfig:
             "num_leaves": 127,
             "max_depth": -1,
             "feature_fraction": 0.50,
+            "feature_fraction_bynode": 0.70,
             "bagging_fraction": 0.80,
             "bagging_freq": 1,
             "min_child_samples": 50,
+            "path_smooth": 5.0,
             "lambda_l2": 5.0,
             "n_estimators": 5000,
             "random_state": 42,
@@ -221,19 +230,41 @@ class TrainConfig:
         }
     )
 
-    # Default CatBoost Hyperparameters with CTR Configurations (Shelton Wang Option A: 4000 iter, lr 0.04)
+    # Arm 4: LightGBM Extra-Trees Hyperparameters (Randomized Threshold Splits for True Diversity)
+    lgb_xt_params: dict[str, Any] = field(
+        default_factory=lambda: {
+            "objective": "binary",
+            "metric": "auc",
+            "boosting_type": "gbdt",
+            "extra_trees": True,
+            "learning_rate": 0.025,
+            "num_leaves": 255,
+            "max_depth": -1,
+            "feature_fraction": 0.60,
+            "bagging_fraction": 0.80,
+            "bagging_freq": 1,
+            "min_child_samples": 30,
+            "lambda_l2": 2.0,
+            "n_estimators": 4500,
+            "random_state": 42,
+            "n_jobs": -1,
+            "verbose": -1,
+        }
+    )
+
+    # Arm 1: CatBoost Hyperparameters (Symmetric-Tree Architecture, 120 features)
     cb_params: dict[str, Any] = field(
         default_factory=lambda: {
             "loss_function": "Logloss",
             "eval_metric": "AUC",
             "iterations": 4000,
             "learning_rate": 0.04,
-            "depth": 6,
+            "depth": 8,
             "l2_leaf_reg": 5.0,
-            "boosting_type": "Plain",
-            "bagging_temperature": 0.2,
-            "random_strength": 1.0,
-            "combinations_ctr": ["BinarizedTargetMeanValue", "Counter"],
+            "grow_policy": "SymmetricTree",
+            "bagging_temperature": 2.0,
+            "random_strength": 10.0,
+            "combinations_ctr": ["FloatTargetMeanValue", "FeatureFreq"],
             "max_ctr_complexity": 4,
             "random_seed": 42,
             "early_stopping_rounds": 150,
@@ -241,15 +272,16 @@ class TrainConfig:
         }
     )
 
-    # Default XGBoost Hyperparameters (Busyaprime & Koumei Maki: max_depth 8, colsample 0.50, lr 0.015)
+    # Arm 3: XGBoost Hyperparameters (Depth-Wise Hessian Growth, 65 features + In-Fold TEs)
     xgb_params: dict[str, Any] = field(
         default_factory=lambda: {
             "objective": "binary:logistic",
             "eval_metric": "auc",
             "learning_rate": 0.015,
-            "max_depth": 8,
-            "colsample_bytree": 0.50,
-            "subsample": 0.80,
+            "max_depth": 9,
+            "colsample_bytree": 0.80,
+            "colsample_bynode": 0.40,
+            "subsample": 0.85,
             "min_child_weight": 5,
             "reg_alpha": 0.10,
             "reg_lambda": 2.0,

@@ -158,9 +158,24 @@ All 5 standalone models trained successfully on Kaggle Dual-T4:
 - **View 3: XGBoost — Latent Psychometrics, Airborne Dynamics & Multi-Key Target Encodings View:**
   - 61 features + in-fold TEs: Physical airborne delay dynamics (`Delay_Delta`, `Recovery_Magnitude`, `Compounding_Delay`, `route_delay_hazard`, `delay_intensity`), latent psychometrics (Rasch PCM trait logit, Shannon survey entropy, intra-passenger variance, extremity index, midpoint satisficing), digit/modulo features (`fd_mod10`, `fd_mod100`, `fd_div10`, `fd_div100`), and numeric value counts.
   - Multi-key leak-free in-fold target encodings: `te_Flight Distance`, `te_Age`, `te_FD_x_Class`, `te_FD_x_Travel`, `te_FD_div10`, `te_FD_div100` ($m=20$ smoothing).
-  - Optimized hyperparameters: `max_depth=8`, `learning_rate=0.015`, `colsample_bytree=0.50`, `subsample=0.80`, `min_child_weight=5`, `reg_lambda=2.0`, `n_estimators=4500`.
-- **Pure GBDT Ensembling Across Complementary Inductive Biases:**
-  - By training on 3 specialized orthogonal views, pairwise Pearson correlation drops from $r > 0.998$ to $r \approx 0.985$, boosting ensemble variance reduction by $10\times$ and positioning the pure GBDT Nelder-Mead Rank / Logit / LightGBM meta-learner to push above 0.96244.
+  - Optimized hyperparameters: `max_depth=9`, `learning_rate=0.015`, `colsample_bynode=0.40`, `subsample=0.85`, `min_child_weight=5`, `reg_lambda=2.0`, `n_estimators=4500`.
+
+### Milestone 5: The Grandmaster 4-Arm GBDT Engine & Top-1 Penetration Strategy
+- **Root-Cause Investigation of the 0.95975 LB Drop (Diagnosed & Resolved):**
+  1. *Transductive Categorical Code Inversion:* `src/features.py` had 5 ad-hoc `pd.factorize()` calls inside `transform()` and route profiles, encoding test categories in appearance order. In train: `Personal Travel=0, Business=1`; in test: `Business=0, Personal=1`. Inverted the single most predictive feature on the test set! Fixed with frozen, deterministic category bijections across `fit()` and `transform()`.
+  2. *Covariate Shift Contamination:* `run_training.py` previously concatenated 129,880 raw original rows into every fold, inducing a 0.21 TVD shift on Flight Distance and degrading CV by -38 bps. Purged raw original rows from folds; reserved `orig_df` strictly for external priors.
+  3. *Collinearity Lock & Linear Model Violation:* `use_glm_margin` ran a linear spline GLM, violating the GBDT-only mandate and collinearity-locking models ($r = 0.9989$). Completely disabled.
+- **Auxiliary Task Expected Rating Priors ($\hat{E}[r_i \mid X_{-i}]$):**
+  - Trained 13 multiclass GBDT models exclusively on `orig_df` predicting passenger survey ratings $r_i \in \{0..5\}$ given flight and passenger context.
+  - Calculated continuous expected ratings $\hat{\mu}_i(x) = \sum k \cdot P(r_i=k)$ and expectation residuals $r_i - \hat{\mu}_i(x)$ with zero target leakage (+14 to +25 bps).
+- **Fold-Safe Continuous Flight Distance Decomposition:**
+  - Decomposed Flight Distance into smooth continuous trend (`dist_trend`, rolling mean within $\pm 50$ miles) and Empirical Bayes shrunk route residual (`dist_route_residual`, $m=20$).
+- **Arm 4: LightGBM Extra-Trees (`extra_trees=True`):**
+  - Added Extremely Randomized Trees (`extra_trees=True`, `num_leaves=255`, `min_child_samples=30`, `feature_fraction=0.60`) to create orthogonal decision boundaries and drop Spearman rank correlation below 0.96.
+- **Constrained Simplex Dirichlet Rank Optimizer & Submission Integrity:**
+  - Replaced unconstrained Nelder-Mead with predeclared simplex grid (0.05 step) + Dirichlet(1) random draws + quadratic uniform regularization penalty $\Omega(w) = \lambda \sum (w_m - 1/M)^2$ + cyclic coordinate refinement.
+  - Added automated 6-point submission integrity harness (assert row count == 299,844, test ID alignment, zero NaNs, bounds in [0, 1], and disk re-read check).
+  - Saved raw unquantized champion predictions directly to `submission.csv` to avoid float32 tie quantization artifacts.
 
 ---
 
@@ -177,30 +192,34 @@ All 5 standalone models trained successfully on Kaggle Dual-T4:
 
 ---
 
-## 6. Active Execution Plan (Phase 5 Kaggle Run: Multi-View 3-GBDT 10-Fold Engine)
+## 6. Active Execution Plan (Phase 5 Kaggle Run: 4-Arm GBDT 10-Fold Engine)
 
 1. **Pull Latest Pushed Commits in Kaggle:**
    ```bash
    !git pull origin main
    ```
-2. **Train CatBoost on View 1 (Categorical & Native CTR View, 10 Folds):**
+2. **Train Arm 1: CatBoost (Symmetric-Tree Architecture, 10 Folds):**
    ```bash
    !python run_training.py --model catboost --device cuda --folds 10
    ```
-3. **Train LightGBM on View 2 (Route Profile, Residuals & Original Lookups View, 10 Folds):**
+3. **Train Arm 2: LightGBM (Leaf-Wise Asymmetric Growth, 10 Folds):**
    ```bash
    !python run_training.py --model lightgbm --device cpu --folds 10
    ```
-4. **Train XGBoost on View 3 (Psychometrics, Airborne Dynamics & Multi-Key TE View, 10 Folds):**
+4. **Train Arm 3: XGBoost (Depth-Wise Hessian Growth & Kinematics, 10 Folds):**
    ```bash
    !python run_training.py --model xgboost --device cuda --folds 10
    ```
-5. **Run the Pure GBDT Meta-Learner & Direct Rank Ensemble:**
+5. **Train Arm 4: LightGBM Extra-Trees (Randomized Threshold Splits, 10 Folds):**
+   ```bash
+   !python run_training.py --model lightgbm_xt --device cpu --folds 10
+   ```
+6. **Run Constrained Simplex Dirichlet Rank Optimizer & Integrity Harness:**
    ```bash
    !python run_ensemble.py --method auto
    ```
-   *Auto-evaluates Direct Rank Averaging, Direct Probability Blend, Direct Logit Blend, and Shallow LightGBM Meta-Learner across the 3 orthogonal views, exporting the Quantile-Aligned champion to `submission.csv`.*
-6. **Package Results:**
+   *Auto-evaluates Constrained Rank Averaging (with $N_{eff}$ diagnostics), Direct Probability Blend, Bounded Logit Blend, and Shallow LightGBM Meta-Learner across the 4 orthogonal views, exporting the raw unquantized champion directly to `submission.csv`.*
+7. **Package Results for Download & Analysis:**
    ```bash
    !python package_results.py --skip_ensemble_run
    ```

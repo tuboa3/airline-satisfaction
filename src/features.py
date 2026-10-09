@@ -76,6 +76,10 @@ class FeaturePipeline:
         self.orig_lookup_maps: dict[str, dict[Any, float]] = {}
         self.orig_prior_value: float = 0.5
 
+        # Auxiliary Expected Rating Priors (Friend 1 Methodology)
+        self.expected_rating_models: dict[str, Any] = {}
+        self.expected_rating_features: list[str] = []
+
         self.fitted: bool = False
 
     def _get_bounded_crosses(self, df: pd.DataFrame) -> dict[str, pd.Series]:
@@ -548,7 +552,10 @@ class FeaturePipeline:
                     X_orig_prior = orig_df[prior_cols].copy()
                     for cc in self.config.categorical_cols:
                         if cc in X_orig_prior.columns:
-                            X_orig_prior[cc] = pd.factorize(X_orig_prior[cc])[0]
+                            m_dict = self.label_encoder_dicts.get(cc, {})
+                            X_orig_prior[cc] = (
+                                X_orig_prior[cc].astype(str).map(m_dict).fillna(-1).astype(np.int32)
+                            )
                     if (
                         "Arrival Delay in Minutes" in X_orig_prior.columns
                         and "Departure Delay in Minutes" in X_orig_prior.columns
@@ -596,7 +603,10 @@ class FeaturePipeline:
                 route_df = full_df[base_cols_all].copy()
                 for c in self.config.categorical_cols:
                     if c in route_df.columns:
-                        route_df[c] = pd.factorize(route_df[c])[0]
+                        m_dict = self.label_encoder_dicts.get(c, {})
+                        route_df[c] = (
+                            route_df[c].astype(str).map(m_dict).fillna(-1).astype(np.float32)
+                        )
                 if (
                     "Arrival Delay in Minutes" in route_df.columns
                     and "Departure Delay in Minutes" in route_df.columns
@@ -651,6 +661,81 @@ class FeaturePipeline:
                     logging.warning(
                         f"Could not compute original dataset column lookups: {e}"
                     )
+
+            # 11. Auxiliary Task Expected Rating Priors (Friend 1 Methodology)
+            # Fits multiclass GBDT models on orig_df predicting rating r_i in {0..5} given demographic & flight features.
+            # Predicts passenger expectations E[r_i | X_{-i}] and expectations residuals with zero target leakage.
+            if (
+                getattr(self.config, "enable_expected_ratings", True)
+                and orig_df is not None
+                and len(orig_df) > 0
+            ):
+                try:
+                    from lightgbm import LGBMClassifier
+
+                    rating_pred_cols = [
+                        c
+                        for c in [
+                            "Gender",
+                            "Customer Type",
+                            "Type of Travel",
+                            "Class",
+                            "Age",
+                            "Flight Distance",
+                            "Departure Delay in Minutes",
+                            "Arrival Delay in Minutes",
+                        ]
+                        if c in orig_df.columns
+                    ]
+
+                    X_orig_ratings = orig_df[rating_pred_cols].copy()
+                    for cat_c in self.config.categorical_cols:
+                        if cat_c in X_orig_ratings.columns:
+                            m_dict = self.label_encoder_dicts.get(cat_c, {})
+                            X_orig_ratings[cat_c] = (
+                                X_orig_ratings[cat_c]
+                                .astype(str)
+                                .map(m_dict)
+                                .fillna(-1)
+                                .astype(np.int32)
+                            )
+                    if (
+                        "Arrival Delay in Minutes" in X_orig_ratings.columns
+                        and "Departure Delay in Minutes" in X_orig_ratings.columns
+                    ):
+                        X_orig_ratings["Arrival Delay in Minutes"] = X_orig_ratings[
+                            "Arrival Delay in Minutes"
+                        ].fillna(X_orig_ratings["Departure Delay in Minutes"])
+                    X_orig_ratings = X_orig_ratings.fillna(0)
+
+                    self.expected_rating_features = rating_pred_cols
+                    for r_col in self.config.rating_cols:
+                        if r_col in orig_df.columns:
+                            y_r = (
+                                pd.to_numeric(orig_df[r_col], errors="coerce")
+                                .fillna(0)
+                                .astype(int)
+                            )
+                            if len(np.unique(y_r)) > 1:
+                                clf_r = LGBMClassifier(
+                                    n_estimators=35,
+                                    num_leaves=15,
+                                    learning_rate=0.08,
+                                    min_child_samples=30,
+                                    random_state=42,
+                                    n_jobs=-1,
+                                    verbose=-1,
+                                )
+                                clf_r.fit(X_orig_ratings, y_r)
+                                self.expected_rating_models[r_col] = clf_r
+                    logging.info(
+                        f"Fitted {len(self.expected_rating_models)} Auxiliary Expected Rating Priors on {len(orig_df)} rows."
+                    )
+                except Exception as e:
+                    logging.warning(
+                        f"Could not fit Auxiliary Expected Rating Models: {e}"
+                    )
+                    self.expected_rating_models = {}
 
             self.fitted = True
             return self
@@ -1132,15 +1217,10 @@ class FeaturePipeline:
                     X_prior_eval = data[self.orig_prior_cols].copy()
                     for cat_c in self.config.categorical_cols:
                         if cat_c in X_prior_eval.columns:
-                            mapping = self.label_encoder_dicts.get(cat_c, None)
-                            if mapping is not None:
-                                X_prior_eval[cat_c] = (
-                                    X_prior_eval[cat_c].map(mapping).fillna(-1)
-                                )
-                            else:
-                                X_prior_eval[cat_c] = pd.factorize(X_prior_eval[cat_c])[
-                                    0
-                                ]
+                            mapping = self.label_encoder_dicts.get(cat_c, {})
+                            X_prior_eval[cat_c] = (
+                                X_prior_eval[cat_c].astype(str).map(mapping).fillna(-1)
+                            )
                     p_prior = self.orig_prior_model.predict_proba(X_prior_eval)[
                         :, 1
                     ].astype(np.float32)
@@ -1169,7 +1249,8 @@ class FeaturePipeline:
                     if c in data.columns:
                         val_c = data[c]
                         if c in self.config.categorical_cols:
-                            val_c = pd.factorize(val_c)[0].astype(np.float32)
+                            mapping = self.label_encoder_dicts.get(c, {})
+                            val_c = val_c.astype(str).map(mapping).fillna(-1).astype(np.float32)
                         else:
                             val_c = (
                                 pd.to_numeric(val_c, errors="coerce")
@@ -1247,22 +1328,68 @@ class FeaturePipeline:
                 )
 
             # -------------------------------------------------------------
+            # 10.13 AUXILIARY EXPECTED RATINGS & RESIDUALS (Friend 1 Methodology)
+            # -------------------------------------------------------------
+            if self.expected_rating_models and self.expected_rating_features:
+                try:
+                    X_eval_ratings = data[self.expected_rating_features].copy()
+                    for cat_c in self.config.categorical_cols:
+                        if cat_c in X_eval_ratings.columns:
+                            m_dict = self.label_encoder_dicts.get(cat_c, {})
+                            X_eval_ratings[cat_c] = (
+                                X_eval_ratings[cat_c]
+                                .astype(str)
+                                .map(m_dict)
+                                .fillna(-1)
+                                .astype(np.int32)
+                            )
+                    if (
+                        "Arrival Delay in Minutes" in X_eval_ratings.columns
+                        and "Departure Delay in Minutes" in X_eval_ratings.columns
+                    ):
+                        X_eval_ratings["Arrival Delay in Minutes"] = X_eval_ratings[
+                            "Arrival Delay in Minutes"
+                        ].fillna(X_eval_ratings["Departure Delay in Minutes"])
+                    X_eval_ratings = X_eval_ratings.fillna(0)
+
+                    exp_adds = {}
+                    for r_col, clf_r in self.expected_rating_models.items():
+                        probs = clf_r.predict_proba(X_eval_ratings)
+                        classes = np.array(clf_r.classes_, dtype=np.float32)
+                        exp_val = np.sum(probs * classes, axis=1).astype(np.float32)
+                        exp_adds[f"exp_{r_col}"] = exp_val
+                        if r_col in data.columns:
+                            act_val = (
+                                pd.to_numeric(data[r_col], errors="coerce")
+                                .fillna(0.0)
+                                .values.astype(np.float32)
+                            )
+                            exp_adds[f"res_exp_{r_col}"] = (act_val - exp_val).astype(
+                                np.float32
+                            )
+                    if exp_adds:
+                        data = pd.concat(
+                            [data, pd.DataFrame(exp_adds, index=data.index)], axis=1
+                        )
+                except Exception as e:
+                    logging.warning(
+                        f"Failed to generate Auxiliary Expected Ratings in transform: {e}"
+                    )
+
+            # -------------------------------------------------------------
             # 11. CATEGORICAL ENCODING
             # -------------------------------------------------------------
             cat_columns = list(self.label_encoders.keys())
             for col in cat_columns:
                 if col in data.columns:
-                    mapping = self.label_encoder_dicts.get(col)
-                    if mapping is not None:
-                        data[col] = (
-                            data[col]
-                            .astype(str)
-                            .map(mapping)
-                            .fillna(-1)
-                            .astype(np.int16)
-                        )
-                    else:
-                        data[col] = pd.factorize(data[col])[0].astype(np.int16)
+                    mapping = self.label_encoder_dicts.get(col, {})
+                    data[col] = (
+                        data[col]
+                        .astype(str)
+                        .map(mapping)
+                        .fillna(-1)
+                        .astype(np.int16)
+                    )
 
             # Drop identifier if present
             if self.config.id_col in data.columns:
@@ -1304,7 +1431,64 @@ class FeaturePipeline:
         name = model_name.lower()
         cols = df.columns.tolist()
 
-        if any(k in name for k in ["catboost", "cb", "cat"]):
+        if any(k in name for k in ["extra_trees", "xt", "lightgbm_xt", "lgb_xt"]):
+            # VIEW 4: LightGBM Extra-Trees Randomized Threshold View (Candidate D)
+            # Focuses on smooth survey metrics, group scores, modulo patterns, and external priors
+            # Highly orthogonal to exact-greedy leaf-wise partitions.
+            selected = []
+            for c in cols:
+                if "__X__" in c or c.startswith("res_") or c.startswith("fdm_") or c.startswith("svd_"):
+                    continue
+                if "centroid" in c or "dist_to_" in c or "global_dist_" in c:
+                    continue
+
+                if (
+                    c.startswith("exp_")
+                    or c.startswith("res_exp_")
+                    or c.startswith("cnt_")
+                    or c.startswith("org_mean_")
+                    or (
+                        c
+                        in [
+                            "fd_cnt",
+                            "orig_logit",
+                            "orig_proba",
+                            "total_delay",
+                            "has_delay",
+                            "has_severe_delay",
+                            "Delay_Delta",
+                            "Recovery_Magnitude",
+                            "Compounding_Delay",
+                            "route_delay_hazard",
+                            "rasch_delight_score",
+                            "rasch_pcm_trait",
+                            "survey_entropy",
+                            "digital_score",
+                            "cabin_score",
+                            "staff_score",
+                            "comfort_score",
+                            "total_service_mean",
+                            "service_rating_std",
+                            "total_na_ratings",
+                            "fd_mod10",
+                            "fd_mod100",
+                            "fd_div10",
+                            "fd_div100",
+                            "age_mod10",
+                            "age_div10",
+                        ]
+                    )
+                    or (c in self.config.categorical_cols)
+                    or (c in self.config.rating_cols)
+                    or (c in self.config.numerical_cols)
+                ):
+                    selected.append(c)
+
+            if len(selected) < 15:
+                return df.copy()
+            return df[selected].copy()
+
+        elif any(k in name for k in ["catboost", "cb", "cat"]):
             # VIEW 1: CatBoost Categorical & CTR Topology View
             selected = []
             for c in cols:
@@ -1316,12 +1500,13 @@ class FeaturePipeline:
                 if c in ["anomaly_density_score", "intra_passenger_var"]:
                     continue
 
-                # Keep base features, rating crosses, categories, and prior logits
+                # Keep base features, rating crosses, categories, expected ratings, and prior logits
                 if (
                     ("__X__" in c)
                     or ("__category" in c)
                     or ("_x_" in c)
                     or ("_is_0" in c)
+                    or c.startswith("exp_")
                     or (c in self.config.categorical_cols)
                     or (c in self.config.rating_cols)
                     or (c in self.config.numerical_cols)
@@ -1361,6 +1546,8 @@ class FeaturePipeline:
                     or c.startswith("res_")
                     or c.startswith("cnt_")
                     or c.startswith("org_mean_")
+                    or c.startswith("exp_")
+                    or c.startswith("res_exp_")
                     or (
                         c
                         in [
@@ -1401,7 +1588,8 @@ class FeaturePipeline:
                     continue
 
                 if (
-                    (
+                    c.startswith("exp_")
+                    or (
                         c
                         in [
                             "Delay_Delta",

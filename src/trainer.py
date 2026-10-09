@@ -122,6 +122,8 @@ class CrossValidationEngine:
             params = self.train_cfg.cb_params.copy()
         elif "xgb" in model_name_lower or "xgboost" in model_name_lower:
             params = self.train_cfg.xgb_params.copy()
+        elif any(k in model_name_lower for k in ["extra_trees", "xt", "lightgbm_xt", "lgb_xt"]):
+            params = self.train_cfg.lgb_xt_params.copy()
         elif (
             "realmlp" in model_name_lower
             or "tabm" in model_name_lower
@@ -164,11 +166,6 @@ class CrossValidationEngine:
                 teacher_test = np.mean(valid_test, axis=0)
                 logging.info(f"Loaded {len(valid_test)} GBDT teacher models for test consistency.")
 
-        is_tree_model = any(
-            k in model_name_lower
-            for k in ["lightgbm", "lgb", "xgboost", "xgb", "catboost", "cb", "cat"]
-        )
-
         for fold, (synth_tr_subidx, synth_va_subidx) in enumerate(skf.split(synth_indices, y_synth)):
             logging.info("-" * 50)
             logging.info(f"FOLD {fold + 1} / {self.train_cfg.n_splits}")
@@ -180,43 +177,58 @@ class CrossValidationEngine:
             else:
                 train_global_idx = synth_indices[synth_tr_subidx]
 
-            X_tr = X_train_all.iloc[train_global_idx]
+            X_tr = X_train_all.iloc[train_global_idx].copy()
             y_tr = y_all[train_global_idx]
             sw_tr = sample_weights[train_global_idx]
 
-            X_va = X_train_all.iloc[val_global_idx]
+            X_va = X_train_all.iloc[val_global_idx].copy()
             y_va = y_all[val_global_idx]
+            X_te_fold = X_test.copy()
 
             extra_fit_kwargs = {}
             margin_va = None
             margin_te = None
 
-            # Stage 1: GLM Margin Residual Boosting
-            if self.train_cfg.use_glm_margin and is_tree_model:
-                with timer(f"Fold {fold + 1} GLM Margin Generation"):
-                    glm_gen = GLMMarginGenerator(
-                        continuous_cols=self.feature_cfg.numerical_cols,
-                        categorical_cols=self.feature_cfg.categorical_cols,
-                        n_knots=self.train_cfg.glm_params.get("n_knots", 5),
-                        degree=self.train_cfg.glm_params.get("degree", 3),
-                        C=self.train_cfg.glm_params.get("C", 0.1),
-                        random_state=self.train_cfg.random_state,
-                    )
-                    glm_gen.fit(X_tr, y_tr, sample_weight=sw_tr)
-                    margin_tr = glm_gen.predict_margin(X_tr)
-                    margin_va = glm_gen.predict_margin(X_va)
-                    margin_te = glm_gen.predict_margin(X_test)
+            # Fold-Safe Continuous Flight Distance Decomposition (Friend 1 Methodology)
+            if "Flight Distance" in X_tr.columns and getattr(self.feature_cfg, "enable_dist_decomposition", True):
+                prior_y = float(np.mean(y_tr))
+                fd_stats = (
+                    pd.DataFrame({"fd": X_tr["Flight Distance"].values, "y": y_tr})
+                    .groupby("fd")["y"]
+                    .agg(["mean", "count"])
+                )
+                unique_dists = np.sort(fd_stats.index.values)
 
-                    extra_fit_kwargs["base_margin_tr"] = margin_tr
-                    extra_fit_kwargs["base_margin_val"] = margin_va
+                # Continuous rolling trend across +-50 miles
+                trend_dict = {}
+                for d in unique_dists:
+                    mask = (unique_dists >= d - 50.0) & (unique_dists <= d + 50.0)
+                    near_dists = unique_dists[mask]
+                    near_counts = fd_stats.loc[near_dists, "count"].values
+                    near_means = fd_stats.loc[near_dists, "mean"].values
+                    tot = near_counts.sum()
+                    trend_dict[d] = float((near_means * near_counts).sum() / tot) if tot > 0 else prior_y
+
+                # Map rolling trend
+                X_tr["dist_trend"] = X_tr["Flight Distance"].map(trend_dict).fillna(prior_y).astype(np.float32)
+                X_va["dist_trend"] = X_va["Flight Distance"].map(trend_dict).fillna(prior_y).astype(np.float32)
+                X_te_fold["dist_trend"] = X_te_fold["Flight Distance"].map(trend_dict).fillna(prior_y).astype(np.float32)
+
+                # Empirical Bayes shrunk route residual (m=20)
+                m_shrink = 20.0
+                res_dict = {}
+                for d in unique_dists:
+                    n_d = fd_stats.loc[d, "count"]
+                    raw_res = fd_stats.loc[d, "mean"] - trend_dict[d]
+                    res_dict[d] = float((n_d / (n_d + m_shrink)) * raw_res)
+
+                X_tr["dist_route_residual"] = X_tr["Flight Distance"].map(res_dict).fillna(0.0).astype(np.float32)
+                X_va["dist_route_residual"] = X_va["Flight Distance"].map(res_dict).fillna(0.0).astype(np.float32)
+                X_te_fold["dist_route_residual"] = X_te_fold["Flight Distance"].map(res_dict).fillna(0.0).astype(np.float32)
 
             # Leak-Free Multi-Key In-Fold Target Encoding (Koumei Maki + Busyaprime + Goodpjw)
             # Strictly computed on the training indices of the active fold:
             if not ("cat" in model_name_lower or "cb" in model_name_lower):
-                X_tr = X_tr.copy()
-                X_va = X_va.copy()
-                X_te_fold = X_test.copy()
-
                 prior_y = float(np.mean(y_tr))
                 smooth_m = 20.0
 
@@ -256,10 +268,6 @@ class CrossValidationEngine:
                     X_tr[te_name] = tr_s.map(te_map).fillna(prior_y).astype(np.float32)
                     X_va[te_name] = va_s.map(te_map).fillna(prior_y).astype(np.float32)
                     X_te_fold[te_name] = te_s.map(te_map).fillna(prior_y).astype(np.float32)
-            else:
-                X_tr = X_tr.copy()
-                X_va = X_va.copy()
-                X_te_fold = X_test.copy()
 
             # Native Categorical CTR for CatBoost (Shelton Wang Topic #745892)
             if "cat" in model_name_lower or "cb" in model_name_lower:
