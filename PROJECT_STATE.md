@@ -177,6 +177,30 @@ All 5 standalone models trained successfully on Kaggle Dual-T4:
   - Added automated 6-point submission integrity harness (assert row count == 299,844, test ID alignment, zero NaNs, bounds in [0, 1], and disk re-read check).
   - Saved raw unquantized champion predictions directly to `submission.csv` to avoid float32 tie quantization artifacts.
 
+### Milestone 6: 4-Friend Consensus, Bernoulli Label Noise Regularization & Pure GBDT Meta-Stacking
+- **Root-Cause Discovery of Public LB Shift (0.96076 -> 0.96072):**
+  - In Kaggle Run 1, LightGBM + LightGBM XT + XGBoost trained together and blended to `0.96076`.
+  - In Kaggle Run 2, the session restarted (wiping `outputs/`). Only CatBoost was trained, so `run_ensemble.py` found only `oof_preds_catboost.npy` and evaluated a single-model weight (1.0). Standalone CatBoost OOF was `0.960718`, which rounded to `0.96072` on LB!
+  - When all four models run concurrently in the same session, the true 4-way rank/logit blend achieves **`0.96128` OOF**.
+- **Reverse Engineering Insights (Gemini 3.1 Pro High & 4 Friends):**
+  - CTGAN generated target labels via probabilistic Bernoulli sampling $Y \sim \text{Bernoulli}(P(Y \mid X))$, generating ~3.8% boundary label noise. Hard logloss over-splits on these points.
+  - `Baggage handling` has values strictly in `[1, 5]` and never has a `0` mode, unlike the other 12 survey columns.
+  - Train and test marginal distributions are identical down to 4 decimal places (adversarial validation AUC $\approx 0.500$). Leak-free OOF CV is an exact oracle of test performance.
+- **Model-Specific Noise Regularization:**
+  - *LightGBM:* `path_smooth=10.0`, `num_leaves=75`, `max_depth=10`, `min_child_samples=100`, `lambda_l1=1.0`, `lambda_l2=5.0`, `cat_smooth=25.0`, `feature_fraction=0.65`.
+  - *LightGBM Extra-Trees:* `extra_trees=True`, `num_leaves=255`, `path_smooth=5.0`, `bagging_fraction=0.75`, `min_child_samples=20`.
+  - *CatBoost:* `depth=6`, `l2_leaf_reg=12.0`, `bagging_temperature=1.5`, `random_strength=10.0`, `iterations=6000`, `learning_rate=0.02`.
+  - *XGBoost:* `max_depth=9`, `colsample_bynode=0.40`, `subsample=0.80`, `min_child_weight=20`, `gamma=1.5`, `reg_lambda=3.0`.
+- **Expanded Modulo & Harmonic Representations:**
+  - Added periodic features `fd_mod50`, `fd_mod250`, `fd_mod500`, `sin_fd_500`, and `cos_fd_500`.
+- **Expanded Auxiliary Rating Priors & Coherence Metrics:**
+  - Confidence ($\max_k P_k$) and conditional entropy ($H = -\sum P \log P$) per rating column.
+  - Negative log-likelihood surprise score ($L_i = -\log P(r_{\text{obs}})$) and passenger-level summary scores (`mean_rating_surprise`, `max_rating_surprise`).
+- **Pure GBDT Shallow Meta-Learner (`META_LGBM`):**
+  - `max_depth=2`, `num_leaves=4`, `min_child_samples=500`, `feature_fraction=0.60`, `learning_rate=0.01`, `n_estimators=1000`.
+  - Comprehensive level-1 meta-features: base probabilities, ranks, logits, ensemble mean/std/min/max, and pairwise model disagreement terms.
+  - Multi-start softmax Nelder-Mead simplex blending.
+
 ---
 
 ## 5. Hardware Constraints & Operational Protocols

@@ -37,3 +37,7 @@ scratch/
 .DS_Store
 .idea/
 .vscode/
+
+# User uploaded notebooks and artifacts
+notebooks/
+.patchloom/

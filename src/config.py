@@ -238,22 +238,25 @@ class TrainConfig:
         }
     )
 
-    # Arm 2: LightGBM Hyperparameters (Leaf-Wise Asymmetric Growth, 99 features)
+    # Arm 2: LightGBM Hyperparameters (Leaf-Wise Asymmetric Growth, Noise-Regularized)
     lgb_params: dict[str, Any] = field(
         default_factory=lambda: {
             "objective": "binary",
             "metric": "auc",
             "boosting_type": "gbdt",
             "learning_rate": 0.02,
-            "num_leaves": 127,
-            "max_depth": -1,
-            "feature_fraction": 0.50,
+            "num_leaves": 75,
+            "max_depth": 10,
+            "feature_fraction": 0.65,
             "feature_fraction_bynode": 0.70,
             "bagging_fraction": 0.80,
             "bagging_freq": 1,
-            "min_child_samples": 50,
-            "path_smooth": 5.0,
+            "min_child_samples": 100,
+            "min_child_weight": 0.1,
+            "path_smooth": 10.0,
+            "lambda_l1": 1.0,
             "lambda_l2": 5.0,
+            "cat_smooth": 25.0,
             "n_estimators": 5000,
             "random_state": 42,
             "n_jobs": -1,
@@ -261,7 +264,7 @@ class TrainConfig:
         }
     )
 
-    # Arm 4: LightGBM Extra-Trees Hyperparameters (Randomized Threshold Splits for True Diversity)
+    # Arm 4: LightGBM Extra-Trees Hyperparameters (Randomized Threshold Splits for Extreme Diversity)
     lgb_xt_params: dict[str, Any] = field(
         default_factory=lambda: {
             "objective": "binary",
@@ -271,39 +274,42 @@ class TrainConfig:
             "learning_rate": 0.025,
             "num_leaves": 255,
             "max_depth": -1,
-            "feature_fraction": 0.60,
-            "bagging_fraction": 0.80,
+            "feature_fraction": 0.50,
+            "bagging_fraction": 0.75,
             "bagging_freq": 1,
-            "min_child_samples": 30,
+            "min_child_samples": 20,
+            "path_smooth": 5.0,
             "lambda_l2": 2.0,
-            "n_estimators": 4500,
+            "n_estimators": 5000,
             "random_state": 42,
             "n_jobs": -1,
             "verbose": -1,
         }
     )
 
-    # Arm 1: CatBoost Hyperparameters (Symmetric-Tree Architecture, 120 features)
+    # Arm 1: CatBoost Hyperparameters (Symmetric-Tree Architecture, Robust Against 3.8% Bernoulli Noise)
     cb_params: dict[str, Any] = field(
         default_factory=lambda: {
             "loss_function": "Logloss",
             "eval_metric": "AUC",
-            "iterations": 4000,
-            "learning_rate": 0.04,
-            "depth": 8,
-            "l2_leaf_reg": 5.0,
+            "iterations": 6000,
+            "learning_rate": 0.02,
+            "depth": 6,
+            "l2_leaf_reg": 12.0,
             "grow_policy": "SymmetricTree",
-            "bagging_temperature": 2.0,
+            "bootstrap_type": "Bayesian",
+            "bagging_temperature": 1.5,
             "random_strength": 10.0,
+            "simple_ctr": ["FloatTargetMeanValue"],
             "combinations_ctr": ["FloatTargetMeanValue", "FeatureFreq"],
             "max_ctr_complexity": 4,
             "random_seed": 42,
-            "early_stopping_rounds": 150,
+            "early_stopping_rounds": 200,
             "verbose": 250,
         }
     )
 
-    # Arm 3: XGBoost Hyperparameters (Depth-Wise Hessian Growth, 65 features + In-Fold TEs)
+    # Arm 3: XGBoost Hyperparameters (Depth-Wise Hessian Growth, Noise-Bounded Regularization)
     xgb_params: dict[str, Any] = field(
         default_factory=lambda: {
             "objective": "binary:logistic",
@@ -312,14 +318,35 @@ class TrainConfig:
             "max_depth": 9,
             "colsample_bytree": 0.80,
             "colsample_bynode": 0.40,
-            "subsample": 0.85,
-            "min_child_weight": 5,
+            "subsample": 0.80,
+            "min_child_weight": 20,
+            "gamma": 1.5,
             "reg_alpha": 0.10,
-            "reg_lambda": 2.0,
-            "n_estimators": 4500,
+            "reg_lambda": 3.0,
+            "n_estimators": 5000,
             "random_state": 42,
             "tree_method": "hist",
-            "early_stopping_rounds": 150,
+            "early_stopping_rounds": 200,
+        }
+    )
+
+    # Pure GBDT Shallow Meta-Learner (Friend 3 Stacking Engine)
+    meta_lgb_params: dict[str, Any] = field(
+        default_factory=lambda: {
+            "objective": "binary",
+            "metric": "auc",
+            "learning_rate": 0.01,
+            "max_depth": 2,
+            "num_leaves": 4,
+            "min_child_samples": 500,
+            "feature_fraction": 0.60,
+            "lambda_l1": 1.0,
+            "lambda_l2": 5.0,
+            "bagging_fraction": 0.80,
+            "bagging_freq": 1,
+            "n_estimators": 1000,
+            "random_state": 42,
+            "verbosity": -1,
         }
     )
 

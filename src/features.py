@@ -1394,9 +1394,15 @@ class FeaturePipeline:
                     .astype(np.int64)
                 )
                 modulo_adds["fd_mod10"] = (fd_v % 10).astype(np.float32)
+                modulo_adds["fd_mod50"] = (fd_v % 50).astype(np.float32)
                 modulo_adds["fd_mod100"] = (fd_v % 100).astype(np.float32)
+                modulo_adds["fd_mod250"] = (fd_v % 250).astype(np.float32)
+                modulo_adds["fd_mod500"] = (fd_v % 500).astype(np.float32)
                 modulo_adds["fd_div10"] = (fd_v // 10).astype(np.float32)
                 modulo_adds["fd_div100"] = (fd_v // 100).astype(np.float32)
+                # Harmonic smooth cyclical representations (Friend 4 Track C)
+                modulo_adds["sin_fd_500"] = np.sin(2.0 * np.pi * fd_v / 500.0).astype(np.float32)
+                modulo_adds["cos_fd_500"] = np.cos(2.0 * np.pi * fd_v / 500.0).astype(np.float32)
             if "Age" in data.columns:
                 age_v = (
                     pd.to_numeric(data["Age"], errors="coerce")
@@ -1436,11 +1442,19 @@ class FeaturePipeline:
                     X_eval_ratings = X_eval_ratings.fillna(0)
 
                     exp_adds = {}
+                    all_surprises = []
                     for r_col, clf_r in self.expected_rating_models.items():
                         probs = clf_r.predict_proba(X_eval_ratings)
                         classes = np.array(clf_r.classes_, dtype=np.float32)
                         exp_val = np.sum(probs * classes, axis=1).astype(np.float32)
                         exp_adds[f"exp_{r_col}"] = exp_val
+                        
+                        # Confidence (maximum predicted probability) & Conditional Entropy
+                        conf_val = np.max(probs, axis=1).astype(np.float32)
+                        exp_adds[f"conf_exp_{r_col}"] = conf_val
+                        ent_val = -np.sum(probs * np.log(probs + 1e-9), axis=1).astype(np.float32)
+                        exp_adds[f"ent_exp_{r_col}"] = ent_val
+
                         if r_col in data.columns:
                             act_val = (
                                 pd.to_numeric(data[r_col], errors="coerce")
@@ -1450,6 +1464,19 @@ class FeaturePipeline:
                             exp_adds[f"res_exp_{r_col}"] = (act_val - exp_val).astype(
                                 np.float32
                             )
+                            # Surprise score: -log P(observed rating | context)
+                            class_indices = {int(c): idx for idx, c in enumerate(clf_r.classes_)}
+                            act_ints = np.round(act_val).astype(int)
+                            idx_arr = np.array([class_indices.get(v, 0) for v in act_ints])
+                            obs_probs = probs[np.arange(len(probs)), idx_arr]
+                            surp_val = -np.log(np.maximum(1e-5, obs_probs)).astype(np.float32)
+                            exp_adds[f"surp_exp_{r_col}"] = surp_val
+                            all_surprises.append(surp_val)
+
+                    if all_surprises:
+                        exp_adds["mean_rating_surprise"] = np.mean(all_surprises, axis=0).astype(np.float32)
+                        exp_adds["max_rating_surprise"] = np.max(all_surprises, axis=0).astype(np.float32)
+
                     if exp_adds:
                         data = pd.concat(
                             [data, pd.DataFrame(exp_adds, index=data.index)], axis=1
@@ -1536,8 +1563,6 @@ class FeaturePipeline:
 
         if any(k in name for k in ["extra_trees", "xt", "lightgbm_xt", "lgb_xt"]):
             # VIEW 4: LightGBM Extra-Trees Randomized Threshold View (Candidate D)
-            # Focuses on smooth survey metrics, group scores, modulo patterns, and external priors
-            # Highly orthogonal to exact-greedy leaf-wise partitions.
             selected = []
             for c in cols:
                 if "__X__" in c or c.startswith("res_") or c.startswith("fdm_") or c.startswith("svd_"):
@@ -1548,8 +1573,13 @@ class FeaturePipeline:
                 if (
                     c.startswith("exp_")
                     or c.startswith("res_exp_")
+                    or c.startswith("conf_exp_")
+                    or c.startswith("ent_exp_")
                     or c.startswith("cnt_")
                     or c.startswith("org_mean_")
+                    or c.startswith("fd_mod")
+                    or c.startswith("sin_fd_")
+                    or c.startswith("cos_fd_")
                     or (c in rev_eng_features)
                     or (
                         c
@@ -1574,10 +1604,6 @@ class FeaturePipeline:
                             "total_service_mean",
                             "service_rating_std",
                             "total_na_ratings",
-                            "fd_mod10",
-                            "fd_mod100",
-                            "fd_div10",
-                            "fd_div100",
                             "age_mod10",
                             "age_div10",
                         ]
@@ -1596,21 +1622,25 @@ class FeaturePipeline:
             # VIEW 1: CatBoost Categorical & CTR Topology View
             selected = []
             for c in cols:
-                # Exclude dense continuous route residuals, SVD manifolds, and centroid ratios
-                if c.startswith("res_") or c.startswith("fdm_") or c.startswith("svd_"):
+                # Exclude dense continuous route residuals, SVD manifolds, modulos, and centroid ratios
+                if c.startswith("res_") or c.startswith("fdm_") or c.startswith("svd_") or c.startswith("fd_mod"):
+                    continue
+                if c.startswith("sin_fd_") or c.startswith("cos_fd_"):
                     continue
                 if "centroid" in c or "dist_to_" in c or "global_dist_" in c:
                     continue
                 if c in ["anomaly_density_score", "intra_passenger_var"]:
                     continue
 
-                # Keep base features, rating crosses, categories, expected ratings, and prior logits
+                # Keep base features, rating crosses, categories, prior logits, and passenger coherence/surprise
                 if (
                     ("__X__" in c)
                     or ("__category" in c)
                     or ("_x_" in c)
                     or ("_is_0" in c)
                     or c.startswith("exp_")
+                    or c.startswith("surp_exp_")
+                    or c in ["mean_rating_surprise", "max_rating_surprise"]
                     or (c in rev_eng_features)
                     or (c in self.config.categorical_cols)
                     or (c in self.config.rating_cols)
@@ -1637,7 +1667,7 @@ class FeaturePipeline:
             # VIEW 2: LightGBM Route Topology, Residuals & Original Lookups View
             selected = []
             for c in cols:
-                # Hard exclusion: Shelton Wang 39 rating crosses (Topic #747358: hurts LightGBM by -48 bps)
+                # Hard exclusion: Shelton Wang 39 rating crosses (hurts LightGBM by -48 bps)
                 if "__X__" in c:
                     continue
                 if c.startswith("svd_"):
@@ -1645,7 +1675,7 @@ class FeaturePipeline:
                 if "centroid" in c or "dist_to_" in c or "global_dist_" in c:
                     continue
 
-                # Include route profiles, residuals, original lookups, counts, base features, basic delay dynamics
+                # Include route profiles, residuals, original lookups, counts, base features, modulos, harmonics
                 if (
                     c.startswith("fdm_")
                     or c.startswith("res_")
@@ -1653,6 +1683,13 @@ class FeaturePipeline:
                     or c.startswith("org_mean_")
                     or c.startswith("exp_")
                     or c.startswith("res_exp_")
+                    or c.startswith("conf_exp_")
+                    or c.startswith("ent_exp_")
+                    or c.startswith("surp_exp_")
+                    or c.startswith("fd_mod")
+                    or c.startswith("sin_fd_")
+                    or c.startswith("cos_fd_")
+                    or c in ["mean_rating_surprise", "max_rating_surprise"]
                     or (c in rev_eng_features)
                     or (
                         c
@@ -1695,6 +1732,12 @@ class FeaturePipeline:
 
                 if (
                     c.startswith("exp_")
+                    or c.startswith("res_exp_")
+                    or c.startswith("conf_exp_")
+                    or c.startswith("ent_exp_")
+                    or c.startswith("fd_mod")
+                    or c.startswith("sin_fd_")
+                    or c.startswith("cos_fd_")
                     or (c in rev_eng_features)
                     or (
                         c
@@ -1727,10 +1770,6 @@ class FeaturePipeline:
                             "total_service_mean",
                             "service_rating_std",
                             "total_na_ratings",
-                            "fd_mod10",
-                            "fd_mod100",
-                            "fd_div10",
-                            "fd_div100",
                             "age_mod10",
                             "age_div10",
                             "orig_logit",

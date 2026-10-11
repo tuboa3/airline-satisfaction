@@ -21,7 +21,7 @@ from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
-from src.config import FeatureConfig, PathConfig
+from src.config import FeatureConfig, PathConfig, TrainConfig
 from src.utils import get_logger, resolve_binary_target, timer
 
 
@@ -38,10 +38,12 @@ class EnsembleOptimizer:
         self,
         paths: PathConfig = PathConfig(),
         feature_cfg: FeatureConfig = FeatureConfig(),
+        train_cfg: TrainConfig = TrainConfig(),
         epsilon: float = 1e-6,
     ):
         self.paths = paths
         self.feature_cfg = feature_cfg
+        self.train_cfg = train_cfg
         self.epsilon = epsilon
         self.logger = get_logger("EnsembleOptimizer")
 
@@ -250,34 +252,41 @@ class EnsembleOptimizer:
             X_sub = X_oof_logits
             y_sub = y_true
 
-        def objective(w):
-            weights = np.maximum(0.0, w)
-            s = weights.sum()
-            if s == 0:
-                weights = np.ones_like(weights) / n
-            else:
-                weights = weights / s
+        def softmax(theta):
+            e = np.exp(theta - np.max(theta))
+            return e / np.sum(e)
+
+        def objective(theta):
+            weights = softmax(theta)
             z_blend = np.dot(X_sub, weights)
             p_blend = expit(z_blend)
             auc = roc_auc_score(y_sub, p_blend)
             dirichlet_penalty = -(dirichlet_alpha - 1.0) * np.sum(np.log(weights + 1e-12))
             return -auc + 1e-4 * dirichlet_penalty
 
-        init_w = np.ones(n) / n
-        bounds = [(0.0, 1.0) for _ in range(n)]
-        res = minimize(
-            objective,
-            init_w,
-            method="Nelder-Mead",
-            bounds=bounds,
-            options={"maxiter": 300},
-        )
+        starts = [np.zeros(n)]
+        for i in range(n):
+            s = np.zeros(n)
+            s[i] = 3.0
+            starts.append(s)
+        rng_restarts = np.random.RandomState(42)
+        for _ in range(5):
+            starts.append(rng_restarts.randn(n))
 
-        opt_w = np.maximum(0.0, res.x)
-        if opt_w.sum() > 0:
-            opt_w = opt_w / np.sum(opt_w)
-        else:
-            opt_w = np.ones(n) / n
+        best_res = None
+        best_val = float("inf")
+        for init_theta in starts:
+            res = minimize(
+                objective,
+                init_theta,
+                method="Nelder-Mead",
+                options={"maxiter": 300, "xatol": 1e-5},
+            )
+            if res.fun < best_val:
+                best_val = res.fun
+                best_res = res
+
+        opt_w = softmax(best_res.x)
 
         z_oof_final = np.dot(X_oof_logits, opt_w)
         z_test_final = np.dot(X_test_logits, opt_w)
@@ -595,17 +604,33 @@ class EnsembleOptimizer:
         oof_sub = oof_mat[eval_idx]
         y_sub = y_true[eval_idx]
 
-        def obj(w):
-            w_pos = np.maximum(0.0, w)
-            s = np.sum(w_pos)
-            w_norm = (np.ones(n) / n) if s == 0 else (w_pos / s)
+        def softmax(theta):
+            e = np.exp(theta - np.max(theta))
+            return e / np.sum(e)
+
+        def obj(theta):
+            w_norm = softmax(theta)
             blend_sub = np.dot(oof_sub, w_norm)
             return -roc_auc_score(y_sub, blend_sub)
 
-        init_w = np.ones(n) / n
-        opt = minimize(obj, init_w, method="Nelder-Mead", options={"maxiter": 600, "xatol": 1e-5})
-        best_w = np.maximum(0.0, opt.x)
-        best_w /= np.sum(best_w)
+        starts = [np.zeros(n)]
+        for i in range(n):
+            s = np.zeros(n)
+            s[i] = 3.0
+            starts.append(s)
+        rng_restarts = np.random.RandomState(42)
+        for _ in range(5):
+            starts.append(rng_restarts.randn(n))
+
+        best_opt = None
+        best_val = float("inf")
+        for init_theta in starts:
+            opt = minimize(obj, init_theta, method="Nelder-Mead", options={"maxiter": 300, "xatol": 1e-5})
+            if opt.fun < best_val:
+                best_val = opt.fun
+                best_opt = opt
+
+        best_w = softmax(best_opt.x)
         w_dict = {m: float(best_w[i]) for i, m in enumerate(model_names)}
 
         final_oof = np.dot(oof_mat, best_w)
@@ -628,42 +653,48 @@ class EnsembleOptimizer:
         from lightgbm import LGBMClassifier
 
         eps = self.epsilon
+        P_oof = np.column_stack(oof_list)
+        P_test = np.column_stack(test_list)
+        M = len(model_names)
+
         meta_oof_features = []
         meta_test_features = []
 
-        for p_oof, p_test in zip(oof_list, test_list):
-            p_oof_c = np.clip(p_oof, eps, 1.0 - eps)
-            p_test_c = np.clip(p_test, eps, 1.0 - eps)
-            r_oof = self.rank_transform(p_oof)
-            r_test = self.rank_transform(p_test)
+        # 1. Base model probabilities, ranks, and logits
+        for i in range(M):
+            p_oof_c = np.clip(P_oof[:, i], eps, 1.0 - eps)
+            p_test_c = np.clip(P_test[:, i], eps, 1.0 - eps)
+            r_oof = self.rank_transform(P_oof[:, i])
+            r_test = self.rank_transform(P_test[:, i])
             z_oof = logit(p_oof_c)
             z_test = logit(p_test_c)
-            meta_oof_features.extend([p_oof, r_oof, z_oof])
-            meta_test_features.extend([p_test, r_test, z_test])
+            meta_oof_features.extend([P_oof[:, i], r_oof, z_oof])
+            meta_test_features.extend([P_test[:, i], r_test, z_test])
 
-        X_oof_meta = np.column_stack(meta_oof_features)
-        X_test_meta = np.column_stack(meta_test_features)
+        # 2. Ensemble summary statistics (mean, std, min, max across models)
+        meta_oof_features.append(np.mean(P_oof, axis=1))
+        meta_test_features.append(np.mean(P_test, axis=1))
+        meta_oof_features.append(np.std(P_oof, axis=1))
+        meta_test_features.append(np.std(P_test, axis=1))
+        meta_oof_features.append(np.min(P_oof, axis=1))
+        meta_test_features.append(np.min(P_test, axis=1))
+        meta_oof_features.append(np.max(P_oof, axis=1))
+        meta_test_features.append(np.max(P_test, axis=1))
+
+        # 3. Disagreement terms (pairwise differences)
+        for i in range(M):
+            for j in range(i + 1, M):
+                meta_oof_features.append(P_oof[:, i] - P_oof[:, j])
+                meta_test_features.append(P_test[:, i] - P_test[:, j])
+
+        X_oof_meta = np.column_stack(meta_oof_features).astype(np.float32)
+        X_test_meta = np.column_stack(meta_test_features).astype(np.float32)
 
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
         oof_meta_preds = np.zeros(len(y_true), dtype=np.float32)
         test_meta_preds = np.zeros(len(X_test_meta), dtype=np.float32)
 
-        meta_params = {
-            "objective": "binary",
-            "metric": "auc",
-            "learning_rate": 0.03,
-            "max_depth": 3,
-            "num_leaves": 7,
-            "min_child_samples": 100,
-            "colsample_bytree": 0.8,
-            "subsample": 0.8,
-            "reg_alpha": 1.0,
-            "reg_lambda": 5.0,
-            "n_estimators": 500,
-            "random_state": 42,
-            "n_jobs": -1,
-            "verbose": -1,
-        }
+        meta_params = self.train_cfg.meta_lgb_params.copy()
 
         for tr_idx, va_idx in skf.split(X_oof_meta, y_true):
             X_tr, y_tr = X_oof_meta[tr_idx], y_true[tr_idx]

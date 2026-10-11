@@ -1,284 +1,347 @@
-# **Research Report: GBDT Architectural Diversity, Leakage-Safe Ensembling, and Categorical Split Optimization for Kaggle S6E10**
+# **Advanced GBDT Optimization and Noise-Robust Representation Engineering for Airline Passenger Satisfaction**
 
-## **Executive Diagnosis**
+## **1\. Executive Verdict**
 
-The central research problem defining the Kaggle Playground Series S6E10 competition involves standalone out-of-fold (OOF) Gradient Boosted Decision Tree (GBDT) models that achieve highly respectable standalone Receiver Operating Characteristic Area Under the Curve (ROC-AUC) scores, yet exhibit near-perfect prediction correlation. Current baseline empirical evidence indicates standalone OOF ROC-AUC scores of 0.96092 for CatBoost, 0.96061 for LightGBM, and 0.96037 for XGBoost, with reported inter-model Pearson correlations exceeding 0.9978 and reaching 0.9989 between LightGBM and XGBoost1.  
-A high Pearson correlation among models utilizing distinct algorithmic tree-growth policies is highly anomalous on real-world datasets, where differing inductive biases typically explore distinct hypothesis spaces. The diagnosis of this phenomenon rests on separating the measured empirical evidence from the theoretical hypotheses regarding the optimization surface.  
-The first plausible cause of this extreme prediction similarity is the existence of a genuinely low-dimensional predictive signal resulting from the synthetic data generation process. The working dataset comprises approximately 700,000 synthetic training rows and 300,000 synthetic test rows, generated from an original dataset of 130,000 rows2. Kaggle Playground Series competitions predominantly utilize generative architectures such as Conditional Tabular Generative Adversarial Networks (CTGAN) or Tabular Variational Autoencoders (TVAE) to synthesize these datasets4. While CTGANs successfully replicate marginal distributions and low-order interactions, empirical research demonstrates that they frequently fail to faithfully reproduce high-frequency, complex combinatorial interactions present in the original real-world data6. Consequently, the resulting synthetic data occupies a smoother, lower-dimensional manifold. GBDTs, acting as universal approximators, easily and rapidly model this primary manifold. Because the synthetic generation process strips out idiosyncratic variance and complex copula dependencies, the models exhaust the available predictive signal rapidly, leaving no "hard" residual patterns for structurally diverse algorithms to capture differently. The correlation is therefore hypothesized to be a reflection of a synthetic dataset containing a fundamentally limited informational capacity, rather than a failure of hyperparameter tuning.  
-The second plausible cause involves redundant feature engineering and homogenized categorical ingestion overriding algorithm-specific inductive biases. While CatBoost, LightGBM, and XGBoost handle categorical features differently in theory, practitioners frequently force identical representations, such as global label encoding or shared integer mapping, across all models to simplify the preprocessing pipeline8. If nominal variations of GBDTs are fed identical target-derived or frequency-based engineered features, the unique inductive biases of the specific tree-growth algorithms are nullified by the overwhelming strength of the engineered representation. The trees simply learn to split on the high-cardinality engineered statistics in the exact same sequence. When categorical ingestion is artificially homogenized, the learned decision boundaries inevitably homogenize, driving Pearson correlation toward 1.0.  
-The third plausible cause is sub-optimal over-regularization artificially limiting effective model capacity. Standard hyperparameter optimization frameworks, such as Optuna, often favor highly regularized parameter spaces on large tabular datasets to maximize OOF ROC-AUC by minimizing variance9. This includes enforcing large minimum data requirements per leaf, aggressive L2 regularization, and restricted maximum depths. While this restricts overfitting, it artificially compresses the hypothesis space. When three distinctly designed algorithms are heavily regularized, they are mathematically constrained to only the most dominant, global splits. By prohibiting deep, localized asymmetric splits, which LightGBM inherently favors, or deep symmetric interactions, which CatBoost is designed to capture, the models are forced to produce identical, shallow representations. The extreme correlation arises because the models lack the effective capacity to express their architectural uniqueness, converging on the exact same generalized function.
+Closing the generalization gap from 0.96128 out-of-fold (OOF) ROC-AUC to the aspirational target of 0.96243+ requires shifting the gradient-boosting optimization paradigm from aggressive exploitation of local feature interactions to robust, noise-aware regularization. The comprehensive analysis of the existing ensemble baseline—comprising CatBoost, LightGBM, and XGBoost estimators—indicates that the predictive capacity under standard binary cross-entropy minimization has saturated. Pushing beyond the current performance threshold necessitates an architectural intervention targeting the underlying data generation assumptions, algorithmic diversity, and topological regularization.  
+A forensic evaluation of the foundational hypotheses yields several critical determinations. First, the estimated 3.8% label ambiguity must be formally classified as stochastic target sampling (Bernoulli noise) rather than independent, symmetric label corruption1. Under a probabilistic generation mechanism, forced algorithmic corrections such as symmetric label smoothing or focal loss optimization risk exacerbating generalization error by forcing the estimators to memorize irreducible stochasticity2. Consequently, strategies that amplify the gradient contributions of "hard" examples are actively counterproductive. The most promising theoretical pathway to maximizing held-out ROC-AUC involves conservative target softening via cross-fitted student-teacher distillation, enforcing strict topological constraints (such as LightGBM's path\_smooth and extra\_trees), and manipulating categorical representation boundaries to induce orthogonal errors across the ensemble members5.  
+The mathematical derivations confirm that any deployment of customized objective functions directly manipulating gradients and Hessians must be strictly governed by numerical stability bounds. Specifically, bounding gradient contributions requires the simultaneous enforcement of strictly positive Hessian floors to prevent the Newton-Raphson tree-growth approximation from failing6. The final strategic consensus dictates freezing the current feature baseline while executing a tightly controlled ablation sequence across the algorithmic arms, ensuring that variance in categorical representations yields complementary decision boundaries without degrading the standalone predictive power of the constituent models.
 
-## **Research and Documentation Audit**
+## **2\. Mathematical Analysis**
 
-A rigorous audit of the official documentation for the permitted GBDT frameworks, alongside credible research on ensemble diversity, reveals several mechanical pathways that can be exploited to force architectural divergence and generate complementary predictive errors.  
-The official CatBoost documentation details its unique reliance on oblivious, or symmetric, decision trees and ordered target statistics. The grow\_policy parameter controls the architectural foundation of the model9. The default policy is SymmetricTree, which builds trees level by level, utilizing the identical split condition across all nodes at a given depth, enforcing a powerful global regularization that differs fundamentally from other frameworks13. Furthermore, CatBoost's processing of categorical features depends heavily on the execution hardware. The official documentation at https\://catboost.ai/docs/en/references/training-parameters/ctr explicitly outlines that on GPU, the CtrType for simple and combined categorical features supports unique representations such as FloatTargetMeanValue and FeatureFreq16. FloatTargetMeanValue computes the target mean for the category using only objects placed prior to the current object in an artificial time permutation, successfully mitigating target leakage14. Stochastic parameters such as bagging\_temperature and random\_strength are critical for inducing diversity; bagging\_temperature dictates the intensity of the Bayesian bootstrap, while random\_strength adds a normally distributed random variable to the calculated split score during the greedy search, perturbing the split selection without altering the underlying data sample9.  
-The official LightGBM documentation at https\://lightgbm.readthedocs.io/en/latest/Parameters.html reveals mechanisms designed to create highly localized partitions through best-first, leaf-wise growth10. A critical parameter for enforcing diversity is extra\_trees. When set to true, this parameter fundamentally alters the split-finding algorithm. Instead of exhaustively computing the histogram to find the mathematically optimal split threshold, LightGBM evaluates only one randomly chosen threshold per feature and selects the best among them10. For native categorical handling, max\_cat\_threshold restricts the number of split points evaluated, while cat\_smooth provides Laplacian-like smoothing to the target statistics of categorical splits10. Furthermore, the path\_smooth parameter acts as a Bayesian prior on leaf outputs, shrinking the leaf prediction toward the parent node's prediction utilizing the formula: \$\\text{leaf\\\_output} \= \\frac{n}{n \+ \\text{path\\\_smooth}} \\times \\text{new\\\_leaf\\\_output} \+ \\frac{\\text{path\\\_smooth}}{n \+ \\text{path\\\_smooth}} \\times \\text{old\\\_leaf\\\_output}\$23. This introduces a powerful structural regularization independent of standard tree depth constraints.  
-The official XGBoost documentation at https\://xgboost.readthedocs.io/en/stable/parameter.html details a robust depth-wise growth architecture. Native categorical support requires the explicit combination of enable\_categorical=True and tree\_method="hist"26. XGBoost utilizes one-hot encoding for low cardinality features and partition-based splits for high cardinality, governed by max\_cat\_to\_onehot and max\_cat\_threshold8. XGBoost provides granular control over feature sampling via colsample\_bytree, colsample\_bylevel, and colsample\_bynode31. The utilization of colsample\_bynode forces the model to evaluate entirely different feature subsets at every individual split, dramatically altering the structural path of the trees compared to traditional per-tree sampling.  
-The Scikit-Learn HistGradientBoostingClassifier documentation provides an additional permitted architecture. This implementation offers native categorical support without requiring manual one-hot encoding by setting categorical\_features="from\_dtype"11. A unique feature for inducing diversity in this framework is interaction\_cst, which allows the practitioner to explicitly define disjoint sets of features that are permitted to interact35. By forcing specific features into separate interaction groups, the model is compelled to build purely additive structural components, guaranteeing a mathematically distinct decision boundary from models lacking interaction constraints35.  
-Recent academic research on ensemble diversity in gradient-boosted trees emphasizes that prediction correlation is an insufficient metric for capturing the utility of an ensemble. Research published on arXiv establishes that knowledge uncertainty in GBDTs can be estimated by the level of spread or "disagreement" among models in an ensemble, and that injecting stochasticity via subsampling or randomized thresholds effectively broadens the explored hypothesis space37. Further research demonstrates that regularized ensembles, which dynamically drop base model predictions during training, successfully lower-bound ensemble diversity and prevent the formation of low-diversity combinations on complex tabular data38. Additionally, studies on the generalization gaps of tree ensembles confirm that while tree-based models achieve state-of-the-art performance on nonlinear tabular tasks, their performance is highly sensitive to the balance between model capacity and regularization on noisy datasets39.  
-An analysis of Kaggle Playground Series S6E10 public notebooks reveals a clustering of OOF ROC-AUC scores between 0.9583 and 0.961621. The baseline models heavily rely on standard parameter configurations without exploring the deeper architectural perturbations available within the GBDT frameworks. The reported inter-model Pearson correlations exceeding 0.9978 suggest that the public baseline models are virtually identical in their functional approximation of the synthetic dataset.
+The mathematical foundation of the optimization strategy dictates how objective functions, label noise models, and regularization terms interact during the gradient boosting process. It is imperative to rigorously derive the proposed mechanisms to evaluate their applicability before subjecting them to empirical computation.
 
-## **Architectural Diversity Across Candidate Configurations**
+### **Noise Models and Label Transformations**
 
-To shatter the 0.9978 Pearson correlation without sacrificing individual ROC-AUC, the configurations must exploit fundamentally different hypothesis spaces. It is critical to differentiate a genuinely distinct learning procedure from a superficial variation in random seed. The following section defines a targeted configuration search that explores meaningful structural differences while preserving the baseline capability required to clear the 0.9610 OOF ROC-AUC threshold.
+To interrogate the 3.8% label noise estimate, one must formally define the assumptions of symmetric label flipping versus stochastic target generation. Let $X$ represent the feature space and $Y\in \{0,1\}$ represent the binary target. Under a symmetric label-flip model with a uniform flip probability $\eta$, the clean conditional probability \$p(x) \= P(Y\_{\\text{clean}}=1 \\mid X=x)\$ is obscured, yielding the observed conditional probability \$q(x) \= P(Y\_{\\text{observed}}=1 \\mid X=x)\$. The transition is modeled as:
 
-### **Ranked Configuration Strategies**
+\$\$q(x) \= \\eta \\cdot P(Y\_{\\text{clean}}=0 \\mid X=x) \+ (1 \- \\eta) \\cdot P(Y\_{\\text{clean}}=1 \\mid X=x)\$\$
 
-| Candidate                | Structural Distinction                                                                                                     | Initial Parameter Ranges                                                                                             | Expected Benefit                                                                                                                          | Main Risk                                                                                                                         | Priority |
-| :----------------------- | :------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------- | :------- |
-| **LightGBM Extra-Trees** | Randomized threshold split finding (extra\_trees=true). Replaces the standard exact greedy optimal search over histograms. | num\_leaves: \[127, 511\], extra\_trees: true, path\_smooth: \[2.0, 10.0\], feature\_fraction: \[0.5, 0.7\].         | Fundamentally alters partition boundaries; presents the highest mathematical likelihood of significantly reducing prediction correlation. | Potential loss of standalone ROC-AUC due to underfitting the 700,000-row synthetic dataset if capacity is insufficient.           | 1        |
-| **CatBoost Symmetric**   | Oblivious trees with aggressive score perturbation (SymmetricTree).                                                        | depth: \[7, 9\], random\_strength: \[5, 20\], bagging\_temperature: \[1.0, 3.0\], simple\_ctr: FloatTargetMeanValue. | Enforces strict global interaction rules, maintaining a highly regularized functional form distinct from localized leaf-wise splits.      | Hardware memory constraints and high execution runtime on GPU for complex combination CTRs.                                       | 2        |
-| **XGBoost Depth-wise**   | Histogram backend with highly restricted per-node feature sampling (colsample\_bynode).                                    | max\_depth: \[7, 12\], colsample\_bynode: \[0.3, 0.6\], enable\_categorical: True, tree\_method: "hist".             | Forces deep trees to utilize weak secondary features by systematically withholding dominant primary features at the node level.           | Severe overfitting if max\_depth is set too high without a correspondingly high min\_child\_weight to control leaf variance.      | 3        |
-| **LightGBM Leaf-wise**   | Unrestricted, highly localized best-first growth targeting maximum loss reduction.                                         | num\_leaves: \[63, 127\], min\_data\_in\_leaf: \[100, 500\], feature\_fraction\_bynode: \[0.6, 0.9\].                | Generates highly specific, asymmetric partitions capable of mapping complex outlier sub-manifolds in the synthetic data.                  | Over-regularization converging to the same global splits as the depth-wise and symmetric configurations if leaves are restricted. | 4        |
+\$\$q(x) \= \\eta (1 \- p(x)) \+ (1 \- \\eta) p(x) \= \\eta \+ p(x) \- 2\\eta p(x) \\\\ q(x) \= \\eta \+ (1 \- 2\\eta)p(x)\$\$  
+Assuming $\eta <0.5$, the true probability can theoretically be recovered via the inverse transformation:
 
-### **Candidate A — CatBoost: Symmetric-Tree Architecture**
+$$p(x)=\frac{q(x)-\eta }{1-2\eta }$$
 
-The primary defensible configuration for CatBoost relies on its native architectural strengths: grow\_policy='SymmetricTree', depth=8, random\_strength=10, bagging\_temperature=2.0, and simple\_ctr='FloatTargetMeanValue' executed on GPU hardware.  
-Meaningful architectural diversity in CatBoost is generated by the symmetric tree constraints. Symmetric trees apply the exact same selected feature and optimal threshold across the entirety of a depth level. This structural mechanism fundamentally captures global, high-order interactions and is highly resistant to localized noise. By significantly elevating the random\_strength parameter, the model is mathematically forced to select sub-optimal splits early in the tree construction. Because the tree is symmetric, a perturbed split at depth one or two completely alters the downstream tree structure for every subsequent node, creating a wildly different final decision boundary compared to a model with zero random strength. Furthermore, utilizing Bayesian bootstrapping via bagging\_temperature ensures the training weights assigned to the synthetic rows vary aggressively between iterations.  
-The smallest useful hyperparameter search involves fixing the categorical processing and varying depth \[6, 8, 10\] against random\_strength \[1, 10, 20\]. The required early-stopping criterion utilizes the validation dataset to identify the iteration with the optimal ROC-AUC, terminating training if no improvement is observed after 150 iterations. The experimental result required to justify retaining this model is a Spearman rank correlation with LightGBM dropping below 0.985 while maintaining a standalone OOF ROC-AUC of at least 0.9610.
+However, this analytical transformation poses severe identifiability limits. If the generative mechanism is not symmetric deterministic flipping but rather stochastic sampling from a true continuous probability distribution ${p}^{*}(X)$, identical or highly similar feature vectors will naturally exhibit contradictory labels. Applying the inverse transformation automatically assumes all disagreement is corruption. If the estimated $\eta =0.038$ is incorrect, the mapping will generate probabilities outside the $[0,1]$ bounds for confident regions, destroying the model's calibration. Furthermore, since ROC-AUC evaluates the ranking of predictions rather than their absolute calibration, mapping $q(x)$ to $p(x)$ via a monotonic linear transformation has mathematically zero impact on the ROC-AUC score.
 
-### **Candidate B — LightGBM: Leaf-Wise Growth**
+### **Binary Log Loss vs. Label Smoothing**
 
-The initial defensible configuration for LightGBM focuses on maximizing the utility of its asymmetric partitioning: num\_leaves=127, min\_data\_in\_leaf=150, path\_smooth=5.0, and feature\_fraction\_bynode=0.7.  
-LightGBM's leaf-wise growth policy aggressively targets the specific terminal node that yields the highest absolute loss reduction, creating deeply nested, asymmetric inference paths. To prevent this configuration from converging on the exact same splits as XGBoost, the introduction of feature\_fraction\_bynode is paramount. By evaluating a restricted, randomized subset of features at every single node—rather than once per tree—the model is physically prevented from relying exclusively on a single dominant feature to guide the primary splits. Consequently, path\_smooth is deployed to act as a Bayesian prior, preventing the highly specific, deep leaves from producing overconfident probability estimates that would miscalibrate the ROC-AUC ranking.  
-The hyperparameter search should prioritize feature\_fraction\_bynode \[0.5, 0.7, 0.9\] and num\_leaves \[63, 127, 255\]. The stopping criterion is standard early stopping on the validation ROC-AUC after 100 rounds without improvement. This model represents the likely ceiling of individual performance; therefore, the retention criterion is strictly achieving a standalone OOF ROC-AUC exceeding 0.9615, establishing the foundational anchor for the final ensemble.
+The baseline objective is binary log loss (cross-entropy), defined for prediction ${p}_{i}$ and label ${y}_{i}$ as:
 
-### **Candidate C — XGBoost: Depth-Wise Growth and Regularized Splits**
+\$\$\\ell\_i \= \-y\_i \\log p\_i \- (1 \- y\_i) \\log(1 \- p\_i)\$\$  
+Log loss exhibits an unbounded penalty for confident incorrect predictions; as ${p}_{i}\rightarrow 0$ for a true label of ${y}_{i}=1$, the gradient magnitude approaches infinity. This heavily penalizes the model when evaluating stochastic outliers, coercing the gradient-boosting algorithm to grow deep, specialized tree branches to minimize this extreme local loss.  
+The proposed smoothing formulation, ${y}_{smooth}=y\cdot 0.924+0.038$, must be evaluated against the standard symmetric label smoothing equation:
 
-The targeted configuration for XGBoost requires activating its modern histogram capabilities: tree\_method="hist", enable\_categorical=True, max\_depth=9, colsample\_bynode=0.4, and subsample=0.85.  
-While depth-wise growth is inherently more balanced and symmetric than leaf-wise growth, the true driver of structural diversity in this configuration is aggressive node-level sampling via colsample\_bynode. By severely restricting the features available at the exact moment of split evaluation, XGBoost is forced to construct parallel paths of inference utilizing secondary and tertiary features that LightGBM and CatBoost simply discard in favor of primary predictive variables. This ensures the model learns a distinct feature hierarchy.  
-The essential hyperparameter search involves balancing max\_depth \[7, 9, 11\] against colsample\_bynode \[0.3, 0.5, 0.7\]. Depth must increase as node sampling decreases to allow the model sufficient capacity to combine weak features into strong predictors. The early stopping criterion relies on observing the validation ROC-AUC, halting at 100 iterations without gain. The model should be retained only if its pairwise disagreement rate on the hardest 5% of validation samples differs significantly from Candidate B, proving it has learned a distinct error topology.
+$${y}_{smooth}=(1-\alpha )y+\frac{\alpha }{2}$$
 
-### **Candidate D — LightGBM Extra-Trees**
+Substituting $\alpha =0.076$ yields ${y}_{smooth}=(1-0.076)y+0.038=y\cdot 0.924+0.038$. This establishes that the proposed formula is mathematically identical to symmetric label smoothing with an $\alpha$ parameter of $0.076$9. This technique maps binary targets to $0.962$ and $0.038$, which mathematically bounds the maximum possible gradient an incorrectly labeled example can produce. However, label smoothing encodes the assumption that the true label distributions are uniformly uncertain across the entire feature space. It does not intelligently distinguish between genuinely ambiguous decision boundaries and regions of absolute certainty, making it a crude regularizer rather than a verified correction for a 3.8% noise rate.
 
-The configuration for the Extra-Trees architecture fundamentally alters the optimization mathematics of the framework: extra\_trees=true, num\_leaves=511, min\_data\_in\_leaf=20, and feature\_fraction=0.6.  
-Extremely Randomized Trees abandon the exact calculation of the maximum split gain over the entire feature histogram. By selecting random thresholds for the evaluated features, the decision boundaries become inherently stochastic. The explicit trade-off here involves a massive reduction in variance and split-search flexibility at the cost of significantly higher bias. To compensate for the reduced precision of random splits on a 700,000-row synthetic dataset, the model capacity, dictated by num\_leaves, must be substantially increased, while min\_data\_in\_leaf is relaxed. The expectation is an error profile that is highly orthogonal to exact-greedy models, producing complementary errors suitable for ensembling.  
-The hyperparameter search is isolated to num\_leaves \[255, 511, 1024\] and feature\_fraction \[0.4, 0.6, 0.8\]. Early stopping is configured for 150 rounds. This model is not expected to achieve the absolute highest standalone AUC. Therefore, it is retained solely if the fixed-weight ensemble of Candidate B and Candidate D exceeds the AUC of Candidate B alone by a statistically significant margin, directly proving the utility of the randomized threshold architecture.
+### **Focal Loss Critique**
 
-## **Maximizing Useful Error Diversity**
+Binary focal loss is parameterized by a focusing parameter $\gamma$ and a balancing parameter ${\alpha }_{t}$:
 
-The optimization of a multi-model ensemble relies entirely on the extraction of complementary predictions without sacrificing individual model discrimination. A low Pearson correlation is not synonymous with useful diversity. A model can produce wildly uncorrelated probability estimates simply by injecting poorly calibrated noise into its predictions; this effectively lowers linear correlation but destroys ranking utility and severely damages the ensemble ROC-AUC37.
+\$\$\\operatorname{FL}(p\_t) \= \-\\alpha\_t(1 \- p\_t)^\\gamma \\log(p\_t)\$\$  
+where ${p}_{t}$ is the predicted probability assigned to the observed class2. As ${p}_{t}\rightarrow 1$, the modulating factor $(1-{p}_{t}{)}^{\gamma }\rightarrow 0$, exponentially down-weighting the influence of easy, well-classified examples. Conversely, when ${p}_{t}\rightarrow 0$, the loss remains high, forcing the model to update heavily on difficult instances.  
+In the presence of irreducible stochastic noise or corrupted labels, the "difficult" examples are predominantly the mislabeled or inherently ambiguous observations3. By emphasizing hard examples, focal loss amplifies the gradients of the suspected noise, actively worsening the generalization capability of the ensemble. Consequently, focal loss is theoretically contraindicated for this dataset, as it explicitly prevents the model from ignoring the 3.8% ambiguity.
 
-### **Defining Useful Error Diversity Correctly**
+### **Custom Objective Derivatives and Hessian Stability**
 
-Useful error diversity exists strictly when two models make complementary ranking errors without degrading the overall statistical distribution of the true positive rates. Because ROC-AUC measures the probability that a randomly chosen positive instance is ranked higher than a randomly chosen negative instance, diversity is only mathematically valuable if Model B successfully ranks difficult positive-negative pairs that Model A incorrectly inverses, and vice versa.  
-The diagnostic metrics required to evaluate this property include:
+Gradient boosting frameworks approximate the objective function at iteration $t$ using a second-order Taylor expansion around the current prediction ${f}_{t-1}({x}_{i})$:
 
-> 1. **Individual OOF ROC-AUC:** The foundational baseline. Models failing to approach the 0.9610 threshold are rejected unless their incremental ensemble contribution is exceptionally high.
-> 2. **Pearson Correlation:** Measures the linear relationship between predicted probabilities. It is highly sensitive to the calibration of the raw probabilities. The aspiration of reaching \$\\leq 0.965\$ serves as a diagnostic warning; if correlations remain \$\> 0.995\$, the models are functionally identical.
-> 3. **Spearman Rank Correlation:** The most critical inter-model evaluation metric. Because ROC-AUC is a purely rank-based metric, Spearman correlation isolates structural similarity in the models' learned decision functions, ignoring probability calibration artifacts entirely.
-> 4. **Pairwise Disagreement Rate on Margin (PDR-M):** This metric isolates the OOF predictions where the true label is 1 but the predicted probability resides within the highly uncertain margin (e.g., between 0.3 and 0.7). It calculates the percentage of these specific margin instances where Model A and Model B rank the instance differently relative to their respective global thresholds.
-> 5. **Ensemble ROC-AUC:** The ultimate arbiter of value. Evaluated using controlled fixed-weight combinations on out-of-sample holdouts to measure the true incremental contribution of a candidate model.
+$${L}^{(t)}\approx \sum\limits_{i=1}^{n}\left[{{g}_{i}{f}_{t}({x}_{i})+\frac{1}{2}{h}_{i}{f}_{t}^{2}({x}_{i})}\right]+\Omega ({f}_{t})$$
 
-### **Investigating Sources of Diversity**
+where ${g}_{i}$ and ${h}_{i}$ are the first (gradient) and second (Hessian) derivatives of the loss with respect to the raw margin $z$6. For binary logistic regression, where $p=\sigma (z)=(1+{e}^{-z}{)}^{-1}$:
 
-To generate the necessary error diversity, several controlled interventions must be implemented and compared.  
-The most potent mechanism is manipulating the tree structure itself. Transitioning from exact greedy evaluations to randomized-threshold growth (extra\_trees=true) fundamentally alters the gradient descent path of the algorithm. This carries a high risk of degrading the standalone AUC if the data manifold is extremely simple, but it represents the minimum necessary experiment to induce structural orthogonality.  
-Feature availability and node-level sampling represent the second source of diversity. Transitioning from traditional row-level bagging to strict node-level feature subsampling (colsample\_bynode) forces the utilization of surrogate splits. By withholding the dominant features at the point of node creation, the model must map the target utilizing the remaining weak features, creating a diverse functional representation.  
-The third major source of diversity lies in the categorical feature representation. Shifting from generic integer-encoded ordinal representations to target-encoded permutation spaces (CatBoost's ordered CTRs) completely transforms the numerical space the tree algorithm navigates, ensuring a different split hierarchy.
+$$g=p-y$$
 
-### **Prioritizing Conditional Error Diversity**
+$$h=p(1-p)$$
 
-To rigorously measure conditional error diversity, the OOF predictions must be analyzed across distinct categorical strata to identify subgroup-specific model strengths. The assumption that a specific subgroup is inherently difficult must be suspended until empirically measured.  
-The methodology requires isolating specific combinatorial cohorts based on the actual column distributions—for example, comparing passengers where Customer Type \= "Disloyal" and Class \= "Eco" against passengers in "Business" class with high Flight Distance. By calculating cohort-specific ROC-AUC metrics for CatBoost and LightGBM independently, the analysis reveals conditional structure. If CatBoost achieves an AUC of 0.9400 on the "Disloyal Eco" cohort while LightGBM achieves 0.9300, but LightGBM significantly dominates the "Business" cohort, the differences arise from useful learned structure rather than stochastic noise. This empirical finding explicitly justifies rank-averaging or probability blending, as the models have definitively learned specialized representations for different sub-manifolds of the feature space. Validation labels must never be used to construct training-time features or to inform model-routing decisions, preserving strict leakage safety.
+During tree construction, the optimal weight ${w}_{j}$ for leaf $j$ is calculated via the Newton-Raphson step:
 
-### **Direct Ensemble Value Testing and Leakage-Safe Selection**
+$${w}_{j}=-\frac{\sum\limits_{i\in {I}_{j}}^{}{g}_{i}}{\sum\limits_{i\in {I}_{j}}^{}{h}_{i}+\lambda }$$
 
-The evaluation of fixed-weight combinations of the strongest models must be conducted using a leakage-safe protocol. For a small set of models, the combined prediction is defined as a generalized arithmetic blend: \$\\sum w\_i p\_i(x)\$, where \$w\_i \\geq 0\$ and \$\\sum w\_i \= 1\$.  
-To prevent selection bias and avoid overfitting the blend weights to the OOF set, a strict validation procedure is required. The OOF predictions must be partitioned; for example, utilizing the predictions from folds 1 through 3 exclusively for weight optimization, and reserving the predictions from folds 4 and 5 strictly for confirmatory evaluation. A coarse, controlled grid search or a bounded optimization algorithm (such as Nelder-Mead) is applied to the optimization subset. The resulting weights are then evaluated on the reserved confirmation subset. If the ensemble ROC-AUC on the confirmation subset demonstrates a statistically significant improvement over the single strongest model, the weights are considered stable and the ensemble is validated. Utilizing linear stacking models or unrestricted optimization procedures directly on the entire OOF matrix introduces severe target leakage and is explicitly prohibited. Furthermore, the analysis must evaluate whether probability averaging or rank averaging is more robust; rank averaging transforms the raw probabilities into percentiles before blending, which frequently stabilizes ensembles composed of poorly calibrated models.
+The values of $g$ and $h$ directly dictate split gain and leaf regularization6. If a custom objective independently clips the gradient (e.g., to bound the influence of outliers) without maintaining the mathematically derived relationship with the Hessian, the Newton step is compromised. Furthermore, if $p\rightarrow 0$ or $p\rightarrow 1$, the Hessian $h\rightarrow 0$. In these regions, if $h$ reaches absolute zero or a negative value, the denominator is governed solely by the L2 regularization parameter $\lambda$, potentially causing instability, infinite leaf weights, or algorithmic divergence7. Any custom objective modification must enforce a strictly positive Hessian floor.
 
-## **Categorical Ingestion and Model-Specific Representations**
+## **3\. Production-Ready Model Configurations**
 
-The handling of categorical features represents the most significant opportunity to generate disparate decision boundaries on tabular data. Forcing all GBDT models to ingest identical one-hot or generically label-encoded variables destroys the unique inductive biases inherent in their native categorical handlers, homogenizing the resultant trees.  
-An inspection of the synthetic dataset is required to delineate truly categorical columns (e.g., Gender, Customer Type, Type of Travel, Class) from discrete numerical columns or continuous features2.
+To test the hypotheses regarding topological constraints and ensemble diversity, four distinct model arms are formalized. Each arm incorporates a baseline configuration, representing standard competitive optimization, and an alternative diversity/robustness configuration designed to induce complementary representations of the feature space5.
 
-### **Model-Specific Ingestion Strategy**
+### **Arm 1: CatBoost GPU Oblivious Trees / CTR**
 
-| Model                    | Recommended Representation                                        | Primary Parameters                                                    | Diversity Hypothesis                                                                                                                                                          | Main Leakage or Overfitting Risk                                                                                         |
-| :----------------------- | :---------------------------------------------------------------- | :-------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------- |
-| **CatBoost**             | Native ordered categorical target statistics (CTR).               | simple\_ctr='FloatTargetMeanValue', bagging\_temperature=1.0          | Target means calculated sequentially via artificial time permutations prevent look-ahead bias and construct highly continuous numeric proxies distinct from partition splits. | Overfitting if CtrBorderCount is set too high for rare or synthetic-hallucinated categories.                             |
-| **LightGBM**             | Native Fisher optimal categorical splits.                         | max\_cat\_threshold=32, cat\_smooth=20.0, cat\_l2=10.0                | Grouping high-cardinality categories into dynamic bins at each split allows for complex, non-linear categorical interaction mapping.                                          | Setting cat\_smooth too low allows the model to isolate and memorize rare synthetic identifiers generated by the CTGAN.  |
-| **XGBoost**              | Native histogram-based categorical splits.                        | enable\_categorical=True, tree\_method="hist", max\_cat\_to\_onehot=4 | Distinct from LightGBM's Laplacian smoothing, XGBoost treats categoricals natively but relies exclusively on min\_child\_weight for structural regularization.                | Unseen categories in the test set causing inference path failures if synthetic data schema drifts.                       |
-| **HistGradientBoosting** | Native categorical support with explicit interaction constraints. | categorical\_features="from\_dtype", interaction\_cst defined sets.   | Blocking specific categorical features from interacting with dominant numerical features forces orthogonal predictive paths.                                                  | Requires domain knowledge to define interaction groups; risk of underfitting if key predictive interactions are blocked. |
+CatBoost relies on symmetric (oblivious) trees, meaning the same splitting criterion is applied across all nodes at a given depth. This architecture acts as a powerful regularizer and excels at extracting dense categorical combinations14.  
+The configuration utilizes bootstrap\_type="Bayesian", which assigns random continuous weights to objects drawn from an exponential distribution. The bagging\_temperature parameter modulates the variance of this distribution; higher values exponentially increase the diversity of the trees13. On the GPU, the FloatTargetMeanValue target statistic replaces categorical values with the mean of the target computed sequentially over random permutations14.
 
-### **Prioritized Categorical Ablation Plan**
+| Parameter               | Baseline Dictionary | Diversity / Robustness Variant      |
+| :---------------------- | :------------------ | :---------------------------------- |
+| task\_type              | "GPU"               | "GPU"                               |
+| loss\_function          | "Logloss"           | "Logloss"                           |
+| eval\_metric            | "AUC"               | "AUC"                               |
+| iterations              | 4500                | 6000                                |
+| learning\_rate          | 0.025               | 0.015                               |
+| depth                   | 7                   | 6 (Shallower for noise robustness)  |
+| l2\_leaf\_reg           | 5.0                 | 12.0 (Conservative leaf values)     |
+| bootstrap\_type         | "Bayesian"          | "Bayesian"                          |
+| bagging\_temperature    | 1.0                 | 1.5 (Increases random weighting)    |
+| max\_ctr\_complexity    | 2                   | 4 (Deeper categorical interactions) |
+| simple\_ctr             | _Default_           | "FloatTargetMeanValue"              |
+| combinations\_ctr       | _Default_           | "FloatTargetMeanValue"              |
+| early\_stopping\_rounds | 200                 | 200                                 |
 
-The ablation plan systematically isolates the effect of categorical representations on model diversity.
+_Experiment Requirement:_ Train both variants on identically matched folds. The objective is to verify whether max\_ctr\_complexity=4 integrated with a high l2\_leaf\_reg creates a model that generalizes better against the 3.8% label noise without drastically increasing GPU VRAM exhaustion14.
 
-> 1. **Baseline Generation:** Train all candidate models using a single, unified integer label encoding, treating the categorical variables as continuous numericals. This configuration establishes the high-correlation baseline.
-> 2. **Native Activation:** Transition CatBoost, LightGBM, and XGBoost to their respective native categorical implementations as defined in the ingestion table. Record changes in OOF ROC-AUC and the reduction in Spearman rank correlation.
-> 3. **Target Statistic Perturbation (CatBoost):** Execute an ablation on CatBoost by switching the CTR configuration from the default Borders or Buckets to FloatTargetMeanValue (requiring GPU execution). This fundamentally alters the numeric mapping of the categories.
-> 4. **Category Smoothing Escalation (LightGBM):** Escalate the cat\_smooth parameter from the default 10.0 to 50.0. This aggressively penalizes splits that attempt to isolate very small categorical subsets, forcing the tree to rely on broader, generalizable passenger characteristics.
+### **Arm 2: LightGBM Leaf-Wise Growth**
 
-### **Investigating Category Distribution Shift**
+LightGBM constructs trees by splitting the leaf with the maximum delta loss (leaf-wise growth). While this ensures rapid convergence, it is highly susceptible to fitting anomalies deep within the feature space12. Controlling this behavior requires strict regulation of num\_leaves and min\_child\_samples.  
+The path\_smooth parameter acts as a topological regularizer by shrinking the output of a deep leaf toward its parent node, with stronger shrinkage applied when the leaf contains fewer samples5. This mathematically prevents deep, sample-poor leaves from adopting extreme logits in response to isolated noisy labels.
 
-Because the S6E10 dataset is synthetic, distribution shift is a paramount concern. Generative models like CTGANs occasionally hallucinate rare category combinations or skew marginal distributions between the training and test sets4. To mitigate this risk, all target-derived categorical features must strictly utilize a fold-safe procedure, such as CatBoost's artificial time permutations, to prevent validation leakage. Furthermore, if any unsupervised preprocessing, such as global frequency encoding, is justified to induce model diversity, it must be fit on the combined synthetic training and unlabeled synthetic test populations simultaneously. This ensures the frequency statistics are globally consistent across the evaluation boundary, distinguishing unsupervised representation mapping from prohibited test-label leakage. Original-data target statistics must never be automatically transferred to the synthetic population, as the conditional joint distributions likely differ.
+| Parameter               | Baseline Dictionary | Diversity / Robustness Variant      |
+| :---------------------- | :------------------ | :---------------------------------- |
+| objective               | "binary"            | "binary"                            |
+| metric                  | "auc"               | "auc"                               |
+| num\_leaves             | 127                 | 75 (Constrains global capacity)     |
+| max\_depth              | \-1                 | 10                                  |
+| learning\_rate          | 0.02                | 0.02                                |
+| min\_child\_samples     | 50                  | 100 (Resists local noise isolation) |
+| min\_child\_weight      | 0.001               | 0.1                                 |
+| path\_smooth            | 0.0                 | 10.0 (Parent-node shrinkage)        |
+| lambda\_l1 / lambda\_l2 | 0.1 / 1.0           | 1.0 / 5.0                           |
+| feature\_fraction       | 0.80                | 0.65                                |
+| cat\_smooth             | 10.0                | 25.0                                |
 
-## **Ranked Experiment Queue**
+_Experiment Requirement:_ Validate whether path\_smooth=10.0 limits the asymptotic memorization of adversarial hold-out samples compared to the standard configuration5.
 
-The computational budget must be meticulously allocated to rule in or rule out the strongest hypotheses with the smallest possible experiments, adhering to a compute-aware methodology.
+### **Arm 3: LightGBM Extra-Trees**
 
-| Priority | Experiment ID      | Model    | Change                                                        | Main Hypothesis                                                                                                                                    | Cost   | Success Criterion                                                                                              |
-| :------- | :----------------- | :------- | :------------------------------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------- | :----- | :------------------------------------------------------------------------------------------------------------- |
-| 1        | EXP\_01\_LGB\_XTR  | LightGBM | Enable extra\_trees=true, increase num\_leaves to 511\.       | Randomized thresholds will significantly drop Spearman rank correlation against exact-greedy baselines by altering the mathematical gradient path. | Low    | Spearman correlation \$\< 0.985\$ with baseline LightGBM; standalone OOF ROC-AUC remains \$\\geq 0.9600\$.     |
-| 2        | EXP\_02\_XGB\_NODE | XGBoost  | Implement colsample\_bynode=0.4 instead of colsample\_bytree. | Node-level subsampling forces distinctly different tree architectures by withholding dominant features during split evaluations.                   | Medium | Standalone OOF ROC-AUC \$\\geq 0.9605\$; high pairwise margin disagreement compared to LightGBM baselines.     |
-| 3        | EXP\_03\_CAT\_CTR  | CatBoost | Change CTR from default to FloatTargetMeanValue (GPU).        | Altering the categorical target calculation creates a distinctly different, continuous numerical feature space mapping.                            | High   | Standalone OOF ROC-AUC \$\\geq 0.9610\$; measurable improvement in subgroup-specific ROC-AUC.                  |
-| 4        | EXP\_04\_LGB\_SMTH | LightGBM | Increase path\_smooth=10.0, cat\_smooth=40.0.                 | Heavy structural regularization will physically prevent the model from converging on the exact same specific synthetic data anomalies.             | Medium | AUC remains highly stable (\$\\geq 0.9605\$) while simultaneously lowering pairwise correlation with CatBoost. |
+The extra\_trees=True parameter fundamentally alters the splitting algorithm. Instead of calculating optimal histogram cut-points for every feature, it selects a single, uniformly random split threshold per feature and evaluates only that threshold5. This injects massive variance into the decision boundaries.  
+Because the splits are randomized, the individual tree is significantly weaker. Thus, the model requires a vastly increased capacity (num\_leaves=255) and lower feature\_fraction to ensure the ensemble converges on a strong approximation5. This randomization prevents the algorithm from finding the precise hyperplanes that isolate noise.
 
-The research plan is organized into three tiers. Tier 1 executes fast diagnostic experiments (EXP\_01\_LGB\_XTR and EXP\_02\_XGB\_NODE) utilizing a single 20% holdout fold to rapidly compute the Spearman correlation between the generated predictions. If the combination of randomized thresholds and node-level sampling fails to drop the correlation below 0.990, it conclusively demonstrates that the predictive signal is fundamentally low-dimensional, and broad hyperparameter tuning will yield diminishing returns.  
-Tier 2 involves targeted optimization. Surviving candidates from Tier 1 proceed to full 5-fold cross-validation. OOF probability predictions are extracted to execute the leakage-safe ensemble-weight selection procedure.  
-Tier 3 encompasses expensive experiments, specifically deploying Scikit-Learn's HistGradientBoostingClassifier with meticulously defined interaction\_cst arrays. This is executed only if Tiers 1 and 2 demonstrate a credible mathematical opportunity for ensemble improvement that justifies the high computational cost of isolating feature interactions.
+| Parameter           | Baseline Dictionary | Diversity / Robustness Variant       |
+| :------------------ | :------------------ | :----------------------------------- |
+| objective           | "binary"            | "binary"                             |
+| metric              | "auc"               | "auc"                                |
+| extra\_trees        | False               | True                                 |
+| num\_leaves         | 127                 | 255                                  |
+| learning\_rate      | 0.02                | 0.03                                 |
+| min\_child\_samples | 50                  | 20                                   |
+| feature\_fraction   | 0.80                | 0.50 (Orthogonal subspace selection) |
+| bagging\_fraction   | 0.80                | 0.75                                 |
+| path\_smooth        | 0.0                 | 5.0                                  |
 
-## **Implementation Blueprint**
+_Experiment Requirement:_ Evaluate whether the randomized split thresholds sacrifice excessive standalone ROC-AUC (e.g., dropping below 0.959) or if the resulting predictions are sufficiently de-correlated to improve the meta-ensemble.
 
-The following Python-oriented pseudocode dictates the strict, leakage-safe pipeline for fold generation, model training, OOF artifact generation, and fixed-weight ensemble evaluation.
+### **Arm 4: XGBoost Depth-Wise Growth / Psychometric Features**
+
+XGBoost builds trees depth-wise (by default), ensuring all branches reach a symmetrical depth before expanding further. This naturally isolates psychometric features (the 0-5 categorical ratings) differently than leaf-wise growth. The gamma parameter (min\_split\_loss) acts as a strict penalty applied to the structure score of every node; splits are rejected if the gradient reduction does not exceed gamma6.
+
+| Parameter           | Baseline Dictionary | Diversity / Robustness Variant        |
+| :------------------ | :------------------ | :------------------------------------ |
+| objective           | "binary:logistic"   | "binary:logistic"                     |
+| eval\_metric        | "auc"               | "auc"                                 |
+| tree\_method        | "hist"              | "hist"                                |
+| enable\_categorical | True                | True                                  |
+| max\_depth          | 8                   | 9 (Experimental range)                |
+| learning\_rate      | 0.02                | 0.015                                 |
+| min\_child\_weight  | 10                  | 20 (Hessian sum floor constraint)     |
+| colsample\_bynode   | 1.0                 | 0.40 (Forces alternate feature paths) |
+| subsample           | 0.80                | 0.80                                  |
+| gamma               | 0.0                 | 1.5 (Strict loss reduction barrier)   |
+
+_Experiment Requirement:_ Test whether a high gamma combined with a low colsample\_bynode creates robust sub-trees that effectively ignore random Bernoulli noise without sacrificing signal extraction6.
+
+## **4\. Custom-Objective Implementations**
+
+If topological regularizers (path\_smooth, gamma, extra\_trees) fail to mitigate the 3.8% ambiguity saturation, explicit robust gradients must be deployed. The implementations below interface with the frameworks via raw margins and enforce mathematically consistent Hessian behaviors.
+
+### **LightGBM Custom Objective**
+
+The LightGBM Python API requires the custom objective to accept preds and train\_data and return gradients and Hessians. The preds argument provides the raw, untransformed logits (the margin), mandating the use of a numerically stable sigmoid transformation prior to derivative calculation18.
 
 Python  
 import numpy as np  
-import pandas as pd  
-from sklearn.model\_selection import StratifiedKFold  
-from sklearn.metrics import roc\_auc\_score  
-from scipy.stats import spearmanr  
-from scipy.optimize import minimize  
 import lightgbm as lgb  
-import catboost as cb  
-import xgboost as xgb
+from typing import Tuple
 
-\# 1\. Immutable Fold Generation ensuring Leakage-Safe Boundaries  
-def generate\_immutable\_folds(df, target\_col, n\_splits=5, seed=42):  
-skf \= StratifiedKFold(n\_splits=n\_splits, shuffle=True, random\_state=seed)  
-folds \= list(skf.split(df, df\[target\_col\]))  
-\# Artifact generation for reproducibility across all experiment scripts  
-return folds
+def stable\_sigmoid(z: np.ndarray) \-\> np.ndarray:  
+"""Computes a numerically stable sigmoid to prevent overflow."""  
+return np.where(z \>= 0,  
+1.0 / (1.0 \+ np.exp(-z)),  
+np.exp(z) / (1.0 \+ np.exp(z)))
 
-\# 2\. Fold-Safe Model Training and OOF Artifact Generation  
-def train\_lightgbm\_extra\_trees(df, target\_col, categorical\_cols, folds):  
-oof\_preds \= np.zeros(len(df))
+def robust\_binary\_logloss\_lgbm(preds: np.ndarray, train\_data: lgb.Dataset) \-\> Tuple\[np.ndarray, np.ndarray\]:  
+"""  
+LightGBM Custom Objective: Robust Binary Cross-Entropy.  
+Applies gradient clipping for noise resilience while maintaining  
+a strictly positive Hessian floor for numerical stability.  
+"""  
+\# Extract ground truth labels  
+labels \= train\_data.get\_label()
 
-    \# Candidate D: LightGBM Extra-Trees configuration
-    params \= {
-        'objective': 'binary',
-        'metric': 'auc',
-        'boosting\_type': 'gbdt',
-        'extra\_trees': True,          \# Initiates randomized threshold split finding
-        'num\_leaves': 511,            \# High capacity required to offset random splits
-        'path\_smooth': 5.0,           \# Bayesian leaf output smoothing
-        'feature\_fraction': 0.6,
-        'cat\_smooth': 20.0,           \# Laplacian categorical smoothing
-        'random\_state': 42,
-        'n\_jobs': \-1
-    }
+    \# Transform raw margins to probabilities
+    p \= stable\_sigmoid(preds)
 
-    for fold, (train\_idx, val\_idx) in enumerate(folds):
-        X\_train, y\_train \= df.iloc\[train\_idx\].drop(columns=\[target\_col\]), df.iloc\[train\_idx\]\[target\_col\]
-        X\_val, y\_val \= df.iloc\[val\_idx\].drop(columns=\[target\_col\]), df.iloc\[val\_idx\]\[target\_col\]
+    \# Analytical derivatives of standard log loss
+    grad \= p \- labels
+    hess \= p \* (1.0 \- p)
 
-        train\_set \= lgb.Dataset(X\_train, y\_train, categorical\_feature=categorical\_cols)
-        val\_set \= lgb.Dataset(X\_val, y\_val, categorical\_feature=categorical\_cols, reference=train\_set)
+    \# 1\. Gradient Clipping: Bound the extreme penalties caused by label noise
+    clip\_threshold \= 0.85
+    grad\_clipped \= np.clip(grad, \-clip\_threshold, clip\_threshold)
 
-        \# Train with stringent early stopping to prevent overfitting
-        model \= lgb.train(
-            params,
-            train\_set,
-            valid\_sets=\[train\_set, val\_set\],
-            num\_boost\_round=4000,
-            callbacks=\[lgb.early\_stopping(stopping\_rounds=150, verbose=False)\]
-        )
+    \# 2\. Hessian Floor: Prevent zero-division in Newton-Raphson update step
+    \# As p \-\> 0 or p \-\> 1, p\*(1-p) approaches 0\.
+    hess\_floor \= 1e-4
+    hess\_stable \= np.maximum(hess, hess\_floor)
 
-        \# Construct exact OOF prediction array
-        oof\_preds\[val\_idx\] \= model.predict(X\_val, num\_iteration=model.best\_iteration)
+    return grad\_clipped, hess\_stable
 
-    return oof\_preds
+\# Unit/Integration Verification Blueprint  
+def test\_lgbm\_objective():  
+"""Validates shapes and numerical bounds."""  
+y \= np.array(\[0, 1, 0, 1\])  
+z \= np.array(\[-5.0, 5.0, 10.0, \-10.0\]) \# Includes confident errors  
+ds \= lgb.Dataset(data=np.random.rand(4, 5), label=y)
 
-\# 3\. Correlation Diagnostics  
-def evaluate\_diversity(preds\_a, preds\_b, y\_true):  
-pearson\_corr \= np.corrcoef(preds\_a, preds\_b)\[0, 1\]  
-spearman\_corr, \_ \= spearmanr(preds\_a, preds\_b)  
-print(f"Pearson Correlation: {pearson\_corr:.5f}")  
-print(f"Spearman Rank Correlation: {spearman\_corr:.5f}")  
-return spearman\_corr
+    g, h \= robust\_binary\_logloss\_lgbm(z, ds)
 
-\# 4\. Leakage-Safe Fixed-Weight Ensemble Optimization  
-def optimize\_and\_validate\_ensemble(oof\_dict, y\_true, splits):  
-\# Segregate OOF into optimization (Folds 1-3) and validation (Folds 4-5) limits selection bias  
-opt\_idx \= np.concatenate(\[splits\[0\]\[1\], splits\[1\]\[1\], splits\[2\]\[1\]\])  
-val\_idx \= np.concatenate(\[splits\[3\]\[1\], splits\[4\]\[1\]\])
+    assert g.shape \== h.shape \== z.shape, "Shape mismatch."
+    assert np.all(h \>= 1e-4), "Hessian floor violated."
+    assert np.all(np.abs(g) \<= 0.85), "Gradient clipping failed."
+    print("LightGBM custom objective passed stability validation.")
 
-    model\_names \= list(oof\_dict.keys())
+### **XGBoost Custom Objective**
 
-    def loss\_function(weights):
-        \# Normalize weights to sum to 1
-        weights \= weights / np.sum(weights)
-        blend\_opt \= np.zeros(len(opt\_idx))
-        for i, name in enumerate(model\_names):
-            blend\_opt \+= weights\[i\] \* oof\_dict\[name\]\[opt\_idx\]
-        return \-roc\_auc\_score(y\_true.iloc\[opt\_idx\], blend\_opt)
+The XGBoost interface similarly provides raw margins but expects interaction with xgb.DMatrix7. Note that utilizing custom objectives in XGBoost disables highly optimized SSE/AVX vectorization used in default histogram construction, increasing training times11.
 
-    \# Execute bounded optimization on isolated subset
-    init\_weights \= np.ones(len(model\_names)) / len(model\_names)
-    bounds \= \[(0, 1\) for \_ in range(len(model\_names))\]
-    result \= minimize(loss\_function, init\_weights, bounds=bounds, method='Nelder-Mead')
+Python  
+import numpy as np  
+import xgboost as xgb  
+from typing import Tuple
 
-    optimal\_weights \= result.x / np.sum(result.x)
+def robust\_binary\_logloss\_xgb(preds: np.ndarray, dtrain: xgb.DMatrix) \-\> Tuple\[np.ndarray, np.ndarray\]:  
+"""  
+XGBoost Custom Objective: Robust Binary Cross-Entropy.  
+Requires passing objective='binary:logitraw' to XGBClassifier/XGBRegressor  
+to guarantee raw margins are returned in 'preds'.  
+"""  
+labels \= dtrain.get\_label()
 
-    \# Validate strictly on reserved hold-out folds
-    blend\_val \= np.zeros(len(val\_idx))
-    for i, name in enumerate(model\_names):
-        blend\_val \+= optimal\_weights\[i\] \* oof\_dict\[name\]\[val\_idx\]
+    \# Stable exp transformation clipping bounds to \[-15, 15\]
+    p \= 1.0 / (1.0 \+ np.exp(-np.clip(preds, \-15.0, 15.0)))
 
-    val\_auc \= roc\_auc\_score(y\_true.iloc\[val\_idx\], blend\_val)
-    print(f"Validated Hold-Out Ensemble AUC: {val\_auc:.5f}")
+    grad \= p \- labels
+    hess \= p \* (1.0 \- p)
 
-    return optimal\_weights, val\_auc
+    \# Apply soft attenuation to high-magnitude gradients (potential label noise)
+    noise\_mask \= np.abs(grad) \> 0.90
+    grad\[noise\_mask\] \= grad\[noise\_mask\] \* 0.5  \# Halve the pull of extreme errors
 
-## **Final Recommendation**
+    \# Strict Hessian positive floor
+    hess \= np.maximum(hess, 1e-4)
 
-Given the constraints of the Kaggle S6E10 dataset and the current baseline stagnation, the single most critical experiment to execute immediately is **EXP\_01\_LGB\_XTR** (Candidate D).  
-The exact configuration must deploy LightGBM utilizing extra\_trees=true, escalating num\_leaves to 511 to counteract the high bias of randomized splits, restricting feature\_fraction to 0.6 to enforce variable diversity, and utilizing path\_smooth=5.0 to stabilize the terminal nodes.  
-The rationale for prioritizing this specific configuration is rooted in the mathematical mechanics of the algorithm. The current 0.9978 Pearson correlation is a direct symptom of baseline models traversing the exact same greedy optimization path over the synthetic dataset's inherently low-dimensional manifold. By invoking the extra\_trees parameter, the split-finding algorithm randomly proposes a threshold for each feature rather than exhaustively scanning the histogram for the mathematically optimal threshold. This structural perturbation guarantees a distinct formulation of the decision boundary with minimal computational overhead.  
-The success of this experiment is determined by evaluating the diagnostic metrics. Success is achieved if the Spearman rank correlation between the extra\_trees model predictions and the baseline LightGBM model predictions falls below the 0.985 threshold, while the standalone OOF ROC-AUC of the extra\_trees model remains above 0.9600.  
-The definitive decision rule mandates that the model is _retained_ only if the fixed-weight combination of this model with the baseline LightGBM model improves the combined OOF ROC-AUC by a margin greater than 0.0002 when evaluated strictly on the held-out validation subset using the leakage-safe optimization protocol. The model must be _rejected_ if the standalone AUC drops below 0.9580, or if the Spearman correlation remains above 0.995, which would indicate that the data structure is so elementary that even randomized thresholds easily and unavoidably discover the identical primary splits.  
-Following the outcome of EXP\_01\_LGB\_XTR, the next step is determined entirely by the result. If the model is retained, the research queue progresses immediately to EXP\_02\_XGB\_NODE to introduce a third, uncorrelated architectural perspective utilizing node-level subsampling. If the model is rejected due to persistently high correlation, it conclusively proves that structural variations cannot overcome the synthetic manifold collapse. In that scenario, the research focus must instantly pivot away from tree mechanics and toward Tier 2, heavily manipulating the categorical processing algorithms (EXP\_03\_CAT\_CTR) to alter the underlying numeric representations before the decision trees can even attempt to split on them.
+    return grad, hess
+
+\# Integration Requirement  
+\# clf \= xgb.XGBClassifier(objective='binary:logitraw', tree\_method='hist')  
+\# clf.set\_params(objective=robust\_binary\_logloss\_xgb)
+
+## **5\. Categorical Preprocessing Matrix**
+
+The dataset schema consists of several distinct data types requiring specialized engine representations to maximize complementary decision boundaries. The explicit schema identified is:
+
+> - **Numerical Continuous**: _Age, Flight Distance, Departure Delay in Minutes, Arrival Delay in Minutes_.
+> - **Ordinal Categorical (0-5 integers)**: _Inflight wifi service, Ease of Online booking, Seat comfort, Food and drink, Cleanliness, etc._
+> - **Nominal Categorical**: _Gender, Customer Type, Type of Travel, Class_.
+> - **Binary Target**: _satisfaction_.
+
+Artificial diversity induced by arbitrarily modifying encodings is a documented anti-pattern14. The preprocessing matrix assigns representations tailored to the algorithmic specificities of each framework.
+
+| Feature Type                          | CatBoost Strategy                                                                                  | LightGBM (Leaf-Wise)                                                                   | LightGBM (Extra-Trees)                                                                            | XGBoost Strategy                                                                 |
+| :------------------------------------ | :------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------ | :------------------------------------------------------------------------------- |
+| **Nominal Categorical**               | Leave as strings. Passed to cat\_features. CatBoost computes CTRs14.                               | Mapped to contiguous integers (0 to N-1). Passed to categorical\_feature5.             | One-Hot Encoded via Pandas get\_dummies. Forces randomized thresholds across explicit bins.       | Converted to Pandas category dtype. Used natively with enable\_categorical=True. |
+| **Ordinal Categorical (0-5 Ratings)** | Converted to strings. Processed as high-cardinality categorical variables for deep combinations14. | Mapped to integers. Split naturally using Fisher's exact test proxy internal to LGBM5. | Left as integers. Treated strictly as continuous numerical variables for threshold randomization. | Left as integers. Split via continuous numerical rules (e.g., Rating \<= 3).     |
+| **Continuous Numerical**              | Unmodified.                                                                                        | Unmodified.                                                                            | Unmodified.                                                                                       | Unmodified.                                                                      |
+| **Missing Values**                    | Treated as a distinct string class "None" for CTR computation14.                                   | Retained as np.nan; algorithm routes to maximize gain natively.                        | Imputed with median or distinct out-of-bounds constant (e.g., \-999).                             | Retained as np.nan; algorithm utilizes sparsity-aware split routing17.           |
+
+## **6\. Experimental Ablation Plan**
+
+The experimental pathway prioritizes interventions by their theoretical expected AUC improvement and operational risk profile. Baseline conditions must be strictly preserved across folds, seeds, and hardware versions to establish paired statistical significance.
+
+### **Phase 1: Baseline and Compatibility Audit**
+
+> - **Objective:** Confirm OOF stability and measure raw correlation.
+> - **Action:** Reproduce the existing 0.96128 AUC baseline. Log precise versions of CUDA and framework binaries.
+> - **Acceptance Criteria:** Successful derivation of the pairwise Pearson and Spearman correlation matrices across the OOF predictions of all four un-tuned models.
+
+### **Phase 2: Topological Regularization (High Expected Value, Low Risk)**
+
+> - **Objective:** Prevent memorization of the 3.8% ambiguity via tree geometry constraints.
+> - **Action:**
+
+- Test CatBoost bagging\_temperature variations (1.5, 2.5)13.
+- Test LightGBM path\_smooth variations (5.0, 10.0, 20.0)5.
+- Test XGBoost gamma constraints (1.0, 2.0)17.
+
+> - **Safeguard:** Maintain identical K-Fold validation splits. Record training times to detect algorithm deceleration.
+
+### **Phase 3: Categorical Representation (Medium Expected Value, Medium Risk)**
+
+> - **Objective:** Validate that the Categorical Preprocessing Matrix induces orthogonal errors without catastrophic standalone AUC degradation.
+> - **Action:** Deploy the isolated preprocessing pipelines. Measure individual model OOF AUC. Measure ranking disagreement (the percentage of sample pairs ranked inversely by two models).
+> - **Acceptance Criteria:** Incremental blend gain in logit space must exceed the baseline average by at least $+0.00015$ ROC-AUC.
+
+### **Phase 4: Objective Experiments (Medium Expected Value, High Risk)**
+
+> - **Objective:** Test targeted loss alterations if topological regularization proves insufficient.
+> - **Action:**
+
+- _Exp 4A:_ Apply label smoothing ($\alpha =0.038,0.076$) to the targets before training9.
+- _Exp 4B:_ Construct cross-fitted student-teacher soft targets (${s}_{i}=0.75{y}_{i}+0.25{t}_{i}$), utilizing the baseline ensemble predictions as ${t}_{i}$.
+- _Exp 4C:_ Deploy the robust\_binary\_logloss\_lgbm Python implementation on the LightGBM arm.
+
+> - **Safeguard:** Reject any objective that severely degrades log loss calibration without providing a statistically significant boost to held-out ROC-AUC ranking.
+
+## **7\. Ensemble-Diversity Analysis**
+
+An ensemble whose constituent members exhibit Pearson correlations exceeding 0.998 on the predicted probability scale is approaching the asymptotic limit of naive equal-weight probability blending1. However, probabilities concentrated near 0.0 and 1.0 artificially inflate Pearson correlation coefficients while masking crucial rank disagreements in the uncertain boundary region ($p\approx 0.5$).  
+To isolate and exploit genuine diversity, the following diagnostic and blending framework is mandated:
+
+> 1. **Logit-Space Averaging:** Ensembling must be computed in the raw margin (logit) space: ${P}_{ensemble}=\sigma \left({\frac{1}{M}\sum\limits_{m=1}^{M}{\sigma }^{-1}({p}_{m})}\right)$. Logit averaging prevents highly confident, saturated predictions (e.g., $p=0.999$) from linearly overpowering less confident, but potentially more accurate, predictions22.
+> 2. **Ranking Disagreement Matrix:** Compute the pairwise percentage of discordant pairs exclusively for instances where the ensemble average falls within the $[0.1,0.9]$ uncertainty band. A robust extra-trees model should demonstrate a \$\>5\\%\$ discordance rate within this band compared to the leaf-wise model, despite high global correlation.
+> 3. **Shallow Meta-Learner Generation:** Train a highly constrained LightGBM meta-estimator (max\_depth=2, num\_leaves=4) on the cross-validated OOF base predictions. Set feature\_fraction=1.0 to force the estimator to construct logical AND/OR hyperplanes across the base model outputs rather than heavily weighting a single dominant arm.
+
+## **8\. Final Execution Plan**
+
+The sequential pipeline ensures full reproducibility and mitigates target leakage across all evaluation criteria.
+
+> 1. **Environment Initialization:** Freeze Python environment parameters. Standardize CatBoost, LightGBM, and XGBoost library versions. Verify GPU kernel compatibility for task\_type="GPU".
+> 2. **Schema Execution:** Process the raw train.csv and test.csv independently through the four distinct categorical pipelines dictated in the Categorical Preprocessing Matrix.
+> 3. **Baseline Generation:** Fit the hyperparameter baselines documented in Section 3 across identical K-Fold schemas. Archive OOF arrays and diagnostic matrices.
+> 4. **Topological Sweeps:** Execute Phase 2 ablations (path\_smooth, extra\_trees, gamma, bagging\_temperature). Identify the configuration per arm that maximizes validation AUC.
+> 5. **Objective Intervention:** Apply student-teacher knowledge distillation (Exp 4B) exclusively to the LightGBM Leaf-Wise arm as a targeted noise regularizer. Compare against standard binary log loss.
+> 6. **Meta-Optimization:** Collate the optimized OOF arrays. Optimize logit-space weights and evaluate the depth-2 LightGBM meta-learner via nested cross-validation.
+> 7. **Submission Generation:** Fit the finalized estimators on the complete 700,000-row synthetic dataset. Predict the 300,000-row test instances. Apply the finalized ensemble schema. Conduct boundary verification to ensure all probabilities fall within the $(0,1)$ interval. Save the artifact record.
 
 #### **Works cited**
 
-> 1. Predicting Airline Satisfaction | Kaggle, [https\://www\.kaggle.com/competitions/playground-series-s6e10/code](https://www.kaggle.com/competitions/playground-series-s6e10/code)
-> 2. S6E10 | Airline Satisfaction: EDA, ML & XAI \- Kaggle, [https\://www\.kaggle.com/code/mohankrishnathalla/s6e10-airline-satisfaction-eda-ml-xai/log](https://www.kaggle.com/code/mohankrishnathalla/s6e10-airline-satisfaction-eda-ml-xai/log)
-> 3. Predicting Airline Satisfaction | Kaggle, [https\://www\.kaggle.com/competitions/playground-series-s6e10](https://www.kaggle.com/competitions/playground-series-s6e10)
-> 4. Synthetic Tabular Data Generator \- Medium, [https\://medium.com/@ashish28082002.ak/tabular-synthetic-data-generator-using-conditional-gans-d98fcd974148](https://medium.com/@ashish28082002.ak/tabular-synthetic-data-generator-using-conditional-gans-d98fcd974148)
-> 5. Modeling Tabular Data using Conditional GAN \- arXiv, [https\://arxiv.org/pdf/1907.00503](https://arxiv.org/pdf/1907.00503)
-> 6. CTGAN for Credit Analysis Synthetic Data \- Medium, [https\://rayislam.medium.com/ctgan-for-credit-analysis-synthetic-data-bbb1d04ff6f3](https://rayislam.medium.com/ctgan-for-credit-analysis-synthetic-data-bbb1d04ff6f3)
-> 7. Rigorous Experimental Analysis of Tabular Data Generated using, [https\://thesai.org/Downloads/Volume15No4/Paper\_125-Rigorous\_Experimental\_Analysis\_of\_Tabular\_Data\_Generated.pdf](https://thesai.org/Downloads/Volume15No4/Paper_125-Rigorous_Experimental_Analysis_of_Tabular_Data_Generated.pdf)
-> 8. 12 GBDT Tricks to Squeeze the Last 5% AUC | by Thinking Loop, [https\://medium.com/@ThinkingLoop/12-gbdt-tricks-to-squeeze-the-last-5-auc-185f4084e9ac](https://medium.com/@ThinkingLoop/12-gbdt-tricks-to-squeeze-the-last-5-auc-185f4084e9ac)
-> 9. Parameter tuning \- CatBoost, [https\://catboost.ai/docs/en/concepts/parameter-tuning](https://catboost.ai/docs/en/concepts/parameter-tuning)
-> 10. Parameters — LightGBM 4.7.0.99 documentation, [https\://lightgbm.readthedocs.io/en/latest/Parameters.html](https://lightgbm.readthedocs.io/en/latest/Parameters.html)
-> 11. HistGradientBoostingClassifier — scikit-learn 1.9.1 documentation, [https\://scikit-learn.org/stable/modules/generated/sklearn.ensemble.HistGradientBoostingClassifier.html](https://scikit-learn.org/stable/modules/generated/sklearn.ensemble.HistGradientBoostingClassifier.html)
-> 12. catboost.train, [https\://catboost.ai/docs/en/concepts/r-reference\_catboost-train](https://catboost.ai/docs/en/concepts/r-reference_catboost-train)
-> 13. Fast Gradient Boosting with CatBoost \- KDnuggets, [https\://www\.kdnuggets.com/2020/10/fast-gradient-boosting-catboost.html](https://www.kdnuggets.com/2020/10/fast-gradient-boosting-catboost.html)
-> 14. The Gradient Boosters V: CatBoost \- Deep & Shallow, [https\://deep-and-shallow.com/2020/02/29/the-gradient-boosters-v-catboost/](https://deep-and-shallow.com/2020/02/29/the-gradient-boosters-v-catboost/)
-> 15. Common parameters \- CatBoost, [https\://catboost.ai/docs/en/references/training-parameters/common](https://catboost.ai/docs/en/references/training-parameters/common)
-> 16. CTR settings \- CatBoost, [https\://catboost.ai/docs/en/references/training-parameters/ctr](https://catboost.ai/docs/en/references/training-parameters/ctr)
-> 17. quantize \- CatBoost, [https\://catboost.ai/docs/en/concepts/python-reference\_pool\_quantized](https://catboost.ai/docs/en/concepts/python-reference_pool_quantized)
-> 18. Categorical features parameters in CatBoost \- Medium, [https\://medium.com/data-science/categorical-features-parameters-in-catboost-4ebd1326bee5](https://medium.com/data-science/categorical-features-parameters-in-catboost-4ebd1326bee5)
-> 19. CatBoost: A Solution for Building Model with Categorical Data, [https\://www\.analyticsvidhya.com/blog/2023/07/catboost-building-model-with-categorical-data/](https://www.analyticsvidhya.com/blog/2023/07/catboost-building-model-with-categorical-data/)
-> 20. CatBoost hyperparameters \- Amazon SageMaker AI, [https\://docs.aws.amazon.com/sagemaker/latest/dg/catboost-hyperparameters.html](https://docs.aws.amazon.com/sagemaker/latest/dg/catboost-hyperparameters.html)
-> 21. What are bagging temperature and random strength? \#373 \- GitHub, [https\://github.com/catboost/catboost/issues/373](https://github.com/catboost/catboost/issues/373)
-> 22. Parameters Tuning — LightGBM 4.7.0.99 documentation, [https\://lightgbm.readthedocs.io/en/latest/Parameters-Tuning.html](https://lightgbm.readthedocs.io/en/latest/Parameters-Tuning.html)
-> 23. PDF \- LightGBM's documentation\!, [https\://lightgbm.readthedocs.io/\_/downloads/en/latest/pdf/](https://lightgbm.readthedocs.io/_/downloads/en/latest/pdf/)
-> 24. 参数— LightGBM 4.6.0 文档, [https\://lightgbm.cn/en/stable/Parameters.html](https://lightgbm.cn/en/stable/Parameters.html)
-> 25. Release 1.8.0 Fabio Sigrist \- Documentation of GPBoost, [https\://gpboost.readthedocs.io/\_/downloads/en/latest/pdf/](https://gpboost.readthedocs.io/_/downloads/en/latest/pdf/)
-> 26. xgboost\_distribution.XGBDistribution \- xgboost-distribution, [https\://xgboost-distribution.readthedocs.io/en/latest/api/xgboost\_distribution.XGBDistribution.html](https://xgboost-distribution.readthedocs.io/en/latest/api/xgboost_distribution.XGBDistribution.html)
-> 27. snowflake.ml.modeling.xgboost.XGBRegressor, [https\://docs.snowflake.com/fr/developer-guide/snowpark-ml/reference/1.0.9/api/modeling/snowflake.ml.modeling.xgboost.XGBRegressor](https://docs.snowflake.com/fr/developer-guide/snowpark-ml/reference/1.0.9/api/modeling/snowflake.ml.modeling.xgboost.XGBRegressor)
-> 28. Python API Reference — xgboost 3.4.2 documentation, [https\://xgboost.readthedocs.io/en/stable/python/python\_api.html](https://xgboost.readthedocs.io/en/stable/python/python_api.html)
-> 29. xgboost/NEWS.md at master · dmlc/xgboost \- GitHub, [https\://github.com/dmlc/xgboost/blob/master/NEWS.md](https://github.com/dmlc/xgboost/blob/master/NEWS.md)
-> 30. Python API Reference — xgboost 1.7.6 documentation, [https\://xgboost.readthedocs.io/en/release\_1.7.0/python/python\_api.html](https://xgboost.readthedocs.io/en/release_1.7.0/python/python_api.html)
-> 31. XGBoost hyperparameters \- Amazon SageMaker AI, [https\://docs.aws.amazon.com/sagemaker/latest/dg/xgboost\_hyperparameters.html](https://docs.aws.amazon.com/sagemaker/latest/dg/xgboost_hyperparameters.html)
-> 32. XGBoost Parameters — xgboost 3.4.2 documentation, [https\://xgboost.readthedocs.io/en/stable/parameter.html](https://xgboost.readthedocs.io/en/stable/parameter.html)
-> 33. XGBoost Parameters — xgboost 0.90 documentation, [https\://xgboost.readthedocs.io/en/release\_0.90/parameter.html](https://xgboost.readthedocs.io/en/release_0.90/parameter.html)
-> 34. Post-tuning the decision threshold for cost-sensitive learning, [https\://scikit-learn.org/stable/auto\_examples/model\_selection/plot\_cost\_sensitive\_learning.html](https://scikit-learn.org/stable/auto_examples/model_selection/plot_cost_sensitive_learning.html)
-> 35. Release Highlights for scikit-learn 1.2, [https\://scikit-learn.org/stable/auto\_examples/release\_highlights/plot\_release\_highlights\_1\_2\_0.html](https://scikit-learn.org/stable/auto_examples/release_highlights/plot_release_highlights_1_2_0.html)
-> 36. 1.11. Ensembles: Gradient boosting, random forests, bagging, voting, [https\://scikit-learn.org/stable/modules/ensemble.html](https://scikit-learn.org/stable/modules/ensemble.html)
-> 37. uncertainty in gradient boosting \- arXiv, [https\://arxiv.org/pdf/2006.10562](https://arxiv.org/pdf/2006.10562)
-> 38. Regularized Neural Ensemblers \- arXiv, [https\://arxiv.org/pdf/2410.04520](https://arxiv.org/pdf/2410.04520)
-> 39. A Bias–Variance Perspective on Tabular Data \- arXiv, [https\://arxiv.org/html/2512.05469v1](https://arxiv.org/html/2512.05469v1)
-> 40. An Optimised Greedy-Weighted Ensemble Framework for Financial, [https\://arxiv.org/pdf/2603.18927](https://arxiv.org/pdf/2603.18927)
+> 1. train.csv
+> 2. Estimating Calibrated Risks Using Focal Loss and Gradient-Boosted, [https\://www\.mdpi.com/2079-9292/14/9/1838](https://www.mdpi.com/2079-9292/14/9/1838)
+> 3. Noise-Dependent Robustness of XGBoost, LightGBM, and CatBoost, [https\://www\.mdpi.com/1999-4893/19/9/730](https://www.mdpi.com/1999-4893/19/9/730)
+> 4. Predicting lncRNA and disease associations with graph ... \- PMC \- NIH, [https\://pmc.ncbi.nlm.nih.gov/articles/PMC12126542/](https://pmc.ncbi.nlm.nih.gov/articles/PMC12126542/)
+> 5. Parameters — LightGBM 4.7.0.99 documentation, [https\://lightgbm.readthedocs.io/en/latest/Parameters.html](https://lightgbm.readthedocs.io/en/latest/Parameters.html)
+> 6. XGBoost: Extreme Gradient Boosting \- Michael Brenndoerfer, [https\://mbrenndoerfer.com/writing/xgboost-extreme-gradient-boosting-complete-guide-mathematical-foundations-python-implementation](https://mbrenndoerfer.com/writing/xgboost-extreme-gradient-boosting-complete-guide-mathematical-foundations-python-implementation)
+> 7. Custom Objective and Evaluation Metric \- XGBoost Documentation, [https\://xgboost.readthedocs.io/en/stable/tutorials/custom\_metric\_obj.html](https://xgboost.readthedocs.io/en/stable/tutorials/custom_metric_obj.html)
+> 8. Advanced Usage of Custom Objectives \- XGBoost Documentation, [https\://xgboost.readthedocs.io/en/latest/tutorials/advanced\_custom\_obj.html](https://xgboost.readthedocs.io/en/latest/tutorials/advanced_custom_obj.html)
+> 9. Information Theory & Loss Functions: Why Cross-Entropy ... \- Medium, [https\://medium.com/@spjosyula2005/information-theory-loss-functions-why-cross-entropy-when-it-fails-and-how-to-fix-it-845ca31b47be](https://medium.com/@spjosyula2005/information-theory-loss-functions-why-cross-entropy-when-it-fails-and-how-to-fix-it-845ca31b47be)
+> 10. GBDT with Nonconvex Loss for Tabular Classification in the ... \- arXiv, [https\://arxiv.org/pdf/2310.05067](https://arxiv.org/pdf/2310.05067)
+> 11. XGBoost Train Model With Custom Objective Function, [https\://xgboosting.com/xgboost-train-model-with-custom-objective-function/](https://xgboosting.com/xgboost-train-model-with-custom-objective-function/)
+> 12. Parameters Tuning — LightGBM 4.7.0.99 documentation, [https\://lightgbm.readthedocs.io/en/latest/Parameters-Tuning.html](https://lightgbm.readthedocs.io/en/latest/Parameters-Tuning.html)
+> 13. Large-scale modeling for housing condition prediction using ... \- PMC, [https\://pmc.ncbi.nlm.nih.gov/articles/PMC13111609/](https://pmc.ncbi.nlm.nih.gov/articles/PMC13111609/)
+> 14. Categorical features parameters in CatBoost \- Medium, [https\://medium.com/data-science/categorical-features-parameters-in-catboost-4ebd1326bee5](https://medium.com/data-science/categorical-features-parameters-in-catboost-4ebd1326bee5)
+> 15. CatBoost Parameters and Hyperparameters \- GeeksforGeeks, [https\://www\.geeksforgeeks.org/machine-learning/catboost-parameters-and-hyperparameters/](https://www.geeksforgeeks.org/machine-learning/catboost-parameters-and-hyperparameters/)
+> 16. LightGBM Tuning Guide｜株式会社United Code \- note, [https\://note.com/united\_code/n/n2d809bb29262?hl=en](https://note.com/united_code/n/n2d809bb29262?hl=en)
+> 17. The Notorious XGBoost \- Towards Data Science, [https\://towardsdatascience.com/the-notorious-xgboost-c7f7adc4c183/](https://towardsdatascience.com/the-notorious-xgboost-c7f7adc4c183/)
+> 18. lightgbm.train — LightGBM 3.3.2 documentation, [https\://lightgbm.readthedocs.io/en/v3.3.2/pythonapi/lightgbm.train.html](https://lightgbm.readthedocs.io/en/v3.3.2/pythonapi/lightgbm.train.html)
+> 19. lightgbm.LGBMClassifier — LightGBM 4.7.0.99 documentation, [https\://lightgbm.readthedocs.io/en/latest/pythonapi/lightgbm.LGBMClassifier.html](https://lightgbm.readthedocs.io/en/latest/pythonapi/lightgbm.LGBMClassifier.html)
+> 20. lightgbm.train — LightGBM 4.7.0 documentation, [https\://lightgbm.readthedocs.io/en/stable/pythonapi/lightgbm.train.html](https://lightgbm.readthedocs.io/en/stable/pythonapi/lightgbm.train.html)
+> 21. Custom Objective Functions and Evaluation Metrics in XGBoost, [https\://xgboost.org/concept/xgboost-custom-objective-function/](https://xgboost.org/concept/xgboost-custom-objective-function/)
+> 22. Python API Reference — xgboost 0.80 documentation, [https\://xgboost.readthedocs.io/en/release\_0.80/python/python\_api.html](https://xgboost.readthedocs.io/en/release_0.80/python/python_api.html)
+> 23. Prediction — xgboost 3.4.2 documentation, [https\://xgboost.readthedocs.io/en/stable/prediction.html](https://xgboost.readthedocs.io/en/stable/prediction.html)

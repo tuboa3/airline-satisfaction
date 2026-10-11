@@ -1,406 +1,358 @@
-# Kaggle Playground S6E10 — Leakage-Safe GBDT Ensembling: Integrity Diagnosis, Rank Optimization, and Meta-Learning
+# S6E10 Grandmaster Research Brief
+
+**Kaggle Playground Series S6E10 — Predicting Airline Satisfaction (ROC-AUC)**
+
+## Question
+
+Can leakage-free GBDT stacking, mathematically constrained blend optimization, stronger validation (5-fold vs 10-fold), and ranking postprocessing lift a ~0.96076 public-LB / ~0.96128 OOF GBDT-only ensemble (CatBoost, LightGBM, LightGBM Extra-Trees, XGBoost) toward 0.96243+, reproducibly and without target leakage?
+
+## Methodology
+
+- **Sources.** Official competition page and public notebook/code listing (LB scores and community experiment titles); seven public S6E10 solution repositories with recorded CV/LB numbers and ablations (ayman-43, bansal1600, ChrisLegge, aditbytes, wozhenshiliudada, ALPHAMAN-0, mrjohnsonsea, BSergey2000); official LightGBM / XGBoost / CatBoost parameter documentation; Caruana et al. (2004) ensemble selection; Kaggle/CrossValidated threads on stacking validation.
+- **What was inspected.** Because no local repository, saved predictions, or baseline notebook were available in this workspace, Phase 1 (repository inspection) was replaced by an audit of the published S6E10 ecosystem with recorded scores. **Every number below is attributed to its public source; no benchmark score in this report was fabricated or run locally.** All code blocks are executable blueprints, not executed results.
+- **Limitations.** (a) Public repos self-report scores; their fold definitions, feature sets, and blend code could not be independently executed. (b) The current 0.96128 OOF ensemble's exact composition is unknown to this brief, so correlations and weight-stability claims are framed as audits to run, not as established facts. (c) Kaggle discussions referenced by title ("10 OOF members lose 0.000245 AUC", "Can the Leaderboard See a Stack Gain?") were confirmed to exist but their full bodies could not be read; only their titles/existences are used as directional evidence.
 
 ---
 
-## 1. Question
+## 1. Executive verdict
 
-**Interpreted research goal.** For Kaggle Playground Series S6E10 (_Predicting Airline Satisfaction_, ROC-AUC metric, ~700k synthetic train rows, ~300k unlabeled test rows, ~130k original-data rows available as external data), identify the strongest defensible strategy for combining an existing set of CatBoost / LightGBM / XGBoost / HistGradientBoosting models, under a strict GBDT-only model-family constraint:
+**Ranked by expected value:**
 
-1. Direct **rank blending** with constrained weight optimization,
-2. Direct **probability / logit blending** with constrained weight optimization,
-3. A **shallow GBDT meta-learner** trained on leakage-safe out-of-fold (OOF) predictions,
+1. **Stronger members, not a smarter combiner, is where the points are.** The single largest documented gain in this competition is feature engineering, not ensembling: label-free Flight-Distance group statistics (row counts, rating means, original-data satisfaction rates per Flight-Distance value, computed over train+test+original with no target leakage) lifted one LightGBM from 0.95874 to 0.96071 — roughly +20 bp, an order of magnitude larger than any combiner improvement available ([ChrisLegge repo](https://github.com/ChrisLegge/kaggleAirlineSatisfaction)). Auxiliary "expected-rating" features added ~+0.9 bp per tree model and much more for NN members ([ayman-43 repo](https://github.com/ayman-43/-kaggle-s6e10-airline-satisfaction)).
+2. **Constrained rank/logit blending with concentration control is the most reliable combiner.** Community evidence shows optimized weights and stackers buy only single-digit bp on this dataset: bansal1600's nested hill-climb reached OOF 0.961643 but still _below_ their nested logistic-regression stacker ([PR #4](https://github.com/bansal1600/kaggle-airline-prediction/pull/4)); adding CatBoost to ayman-43's stack changed CV by 0.0000001 (0.9615343 → 0.9615332) ([ayman-43](https://github.com/ayman-43/-kaggle-s6e10-airline-satisfaction)).
+3. **A GBDT meta-learner is a low-expected-value, high-leakage-risk addition.** Four GBDT arms trained on the same features produce near-collinear OOF predictions; a depth-2 meta-tree can at best reweight them, which constrained blending already does with far fewer degrees of freedom. Test it last, with minimal meta-features, inside a nested design, and expect ~0 to +1 bp.
+4. **0.96243+ is not reachable by combiner work alone under the GBDT-only constraint.** As of 2026-10-10/11, the best public notebooks sit at 0.96176–0.96184 ([Kaggle code listing](https://www.kaggle.com/competitions/playground-series-s6e10/code)), and those include RealMLP/TabPFN members that our constraint excludes. A realistic GBDT-only ceiling based on public evidence is ~0.9618–0.9620 LB. Treat 0.96243+ as achievable only via member strength (features + external original data), not via blending arithmetic. **Do not promise it.**
+5. **Postprocessing cannot create score.** ROC-AUC is invariant to strictly increasing transformations of a single final score (mathematical property). Every postprocessing idea should be judged only by numerical safety and tie handling.
 
-while (a) diagnosing the reported OOF→leaderboard gap (OOF 0.96126 vs. public LB 0.95975, gap = 0.00151, with a reported categorical-code inversion and observed prediction-distribution differences), (b) eliminating train–test inconsistencies, and (c) minimizing ensemble-selection overfitting.
+## 2. Forensic audit of current assumptions
 
-**Decision supported:** which experiment to run next, in what order, with what rejection criteria.
+| Assumption                                                 | Verdict                                     | Evidence & reasoning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ---------------------------------------------------------- | ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Adversarial validation AUC ≈ 0.500 ⇒ same DGP              | **Partially supported, weakly informative** | An AUC ≈ 0.5 means one particular classifier, on one feature representation, cannot separate train from test. One repo reports all feature means differ <2% between train and test ([aditbytes](https://github.com/aditbytes/kaggle-s6e10-airline-satisfaction)), consistent with no covariate shift. But AUC ≈ 0.5 does **not** rule out: concept drift in P(y\|x); shift detectable only in engineered/interaction representations the adversarial model lacked capacity to use; shift concentrated in rare regions. **Required audit:** rerun adversarial validation with the _final engineered feature set_, both a deep GBDT and a shallow one, and with id-like columns excluded. FastML documents the procedure and its interpretation ([FastML](https://fastml.com/adversarial-validation-part-one/)). |
+| OOF ≈ generalization, LB gap needs explanation             | **Supported with caveats**                  | OOF AUC is (approximately) unbiased for the _procedure that produced it_ under IID rows — not for a procedure that also selected hyperparameters, members, and blend weights using the same OOF. Community CV→LB decays on this competition: 0.96175→0.96140 (ayman-43), 0.9591→0.9584 (BSergey2000), and "CV and LB agree within 0.0006" (aditbytes). Our 0.96128→0.96076 (−5.2 bp) is in family with these; the components to quantify are (a) public-LB sampling variance (public LB is a subsample of the 300k test rows), (b) selection overfitting across experiments, (c) fold-seed variance. **Do not claim zero decay is guaranteeable.**                                                                                                                                                             |
+| Base predictions highly correlated                         | **Plausible, must be re-verified**          | Correlation is only meaningful computed row-aligned on genuine OOF predictions. Corroborating signal: adding CatBoost to ayman-43's stack moved CV by ~1e-7; bansal1600 found a second auxiliary-feature RealMLP carrier "adds nothing" ([PR #6](https://github.com/bansal1600/kaggle-airline-prediction/pull/6)). **Required audit:** Spearman and Pearson correlations of OOF predictions on identical rows; report the incremental gain of each member over the best blend without it (leave-one-out ablation), which is the decision-relevant quantity — correlation itself is not (rule 8).                                                                                                                                                                                                               |
+| 10-fold proposed to improve test-time generalization       | **Inconclusive; do not claim 10–15 bp**     | No public S6E10 evidence supports a 10-fold LB gain. Ten-fold gives each base model ~11% more training data per fold (90% vs 80%), which _on average_ slightly raises each fold model — this raises OOF realism, not the test score of the final model. wozhenshiliudada used 10-fold members but explicitly warns their blend validation reused historical OOF and was _not_ fully nested ([repo](https://github.com/wozhenshiliudada/kaggle-airline-satisfaction-s6e10)). Ten-fold costs 2× compute for inner OOF and yields fold scores that are more correlated (more training-set overlap). Verdict: run the matched-seed A/B in Section 6; assume no LB gain until measured.                                                                                                                             |
+| Pipeline generates predictions/folds/checkpoints correctly | **Cannot be audited here**                  | No repository was available in this workspace. Section 10 provides the leakage-assertion harness to run against the actual pipeline: OOF coverage (every training row has exactly one out-of-fold prediction), fold-index persistence, id-alignment checks, and an in-sample-substitution detector.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 
----
+**Why OOF is not an oracle for the leaderboard (mechanism, not folklore):** (i) OOF estimates E[AUC] of the _fold-model ensemble_ (models trained on (K−1)/K of data), while the submitted model's test predictions come from a different object (fold models averaged over full training runs or refits on 100%); (ii) public LB uses only a fraction of test rows, adding ± a few bp of pure sampling noise; (iii) any decision made by looking at OOF (weights, members, meta-features) transfers some of OOF's noise into the procedure, a selection bias the OOF number itself cannot display. Cross-validated community CV→LB gaps above are the empirical size of this combined effect.
 
-## 2. Executive Summary
+## 3. Stacking architecture (Track A)
 
-Ranked takeaways:
+### 3.1 Exact fold logic
 
-1. **The leaderboard gap is a pipeline problem first, a blending problem second.** ROC-AUC is a pure ranking metric ([sklearn docs](https://scikit-learn.org/stable/modules/generated/sklearn.metrics.roc_auc_score.html)), so any strictly increasing recalibration is score-neutral. A global sigmoid/calibration story _cannot_ explain a 0.00151 AUC drop. A reported **categorical-code inversion at test time**, by contrast, is a concrete mechanism that changes the ranking of test predictions while leaving OOF untouched. Audit category mappings before touching any blender.
-2. **The gap magnitude is ~2.1σ of pure test-set sampling noise, so noise alone is a possible but weak explanation.** With ~300k test rows (≈165k / 135k class split), the large-sample standard error of an AUC ≈ 0.961 is ≈ 0.0007; the observed 0.00151 gap is ≈ 2.1 SE. Sampling variation is plausible, but independent S6E10 teams report CV–LB agreement within ~0.0006 ([aditbytes repo](https://github.com/aditbytes/kaggle-s6e10-airline-satisfaction)), which makes an implementation defect the higher-prior hypothesis. Both mechanisms can coexist.
-3. **Blending cannot recover a 0.00151 deficit.** GBDT-family models on this dataset are highly rank-correlated (typical pairwise Spearman ρ > 0.98 between well-tuned GBDTs). Realistic blend gains over the best single model are ~0.0002–0.0008 in this regime — smaller than the gap. Expect blending to move you from ~0.960 to ~0.961, not from 0.95975 to 0.96243 (current public LB best).
-4. **Do not use plain Nelder–Mead for weight optimization.** Pooled OOF AUC is a piecewise-constant function of the simplex weights (flat plateaus separated by pairwise-comparison flip hyperplanes), and SciPy's Nelder–Mead supports at most box bounds, not the simplex constraint ([SciPy docs](https://docs.scipy.org/doc/scipy/reference/optimize.minimize-neldermead.html)). A predeclared coarse simplex grid + Dirichlet random search + one local coordinate refinement is cheaper, reproducible, and immune to NM's initialization sensitivity on nonsmooth objectives.
-5. **Equal-weight rank blending is the reference baseline; a constrained optimized blend must beat it by a predeclared margin to be retained.** Use the effective-number-of-models diagnostic N_eff = 1/Σw²ᵢ (equal weights on 4 models → 4; a 0.7-dominated vector → 1.9; a single model → 1) as a stability/robustness diagnostic, not as a hard constraint without evidence.
-6. **A shallow GBDT meta-learner is justified only if the base models have complementary _conditional_ errors** (agreement/disagreement regions that carry label signal). With four same-family GBDTs on a largely monotone feature space, the prior is against it. Retain it only if a cross-fitted, independently confirmed meta-learner beats the best constrained blend by ≥ 0.0002 pooled OOF AUC with a 4/5-fold sign consistency.
-7. **Recommended order of operations:** (Tier 1) category-mapping audit + submission-integrity harness + fixed-pipeline resubmission with an equal-weight blend; (Tier 2) coarse constrained rank-weight search with a held-out confirmation fold protocol; (Tier 3) shallow LightGBM meta-learner ablation; (Tier 4) only what Tiers 1–3 justify.
+Notation: outer folds O = {o1..o5} (stratified, seed 42, persisted to disk). Within each outer-training partition, inner folds I(o) = {i1..iK}, K ∈ {5, 10} under test.
 
----
+```
+FOR each outer fold o in O:
+    OUTER_TRAIN := train \ o ; OUTER_VAL := o          # OUTER_VAL labels sealed until scoring
+    FOR each inner fold j in I(OUTER_TRAIN):
+        FOR each base arm k in {LGBM, LGBM_ETS, XGB, CAT}:
+            f_k^(o,-j) := fit(arm_k, OUTER_TRAIN \ j)        # target-encoding / supervised FE fit HERE only
+            z[i,k] := f_k^(o,-j)(x_i)  for i in j            # inner OOF predictions
+    META := fit_metalearner(Z_inner, y_inner)                 # uses only inner-OOF rows/labels
+    # size-matched base refit for OUTER_VAL predictions (see 3.3):
+    FOR each inner fold j in I(OUTER_TRAIN):
+        g_k^(o,j) := fit(arm_k, OUTER_TRAIN \ j)
+        u[i,k] := g_k^(o,j)(x_i)  for i in OUTER_VAL         # same (1 - 1/K) training fraction as z
+    score_o := AUC( META(u_o), y_o )                          # OUTER_VAL labels used exactly once
+FINAL: average score_o over o; never report inner-OOF meta scores as system performance
+```
 
-## 3. Methodology
+Key invariants (enforced by assertions in Section 10):
 
-**Search angles.** (i) Official S6E10 rules, evaluation, and data provenance (Kaggle competition + data pages); (ii) tool-authoritative documentation for ROC-AUC semantics, calibration behavior, LightGBM / CatBoost shallow-tree regularization and early stopping, and SciPy Nelder–Mead constraint handling; (iii) community/competition-specific evidence: public S6E10 repositories reporting CV–LB agreement, feature AUCs, and leaderboard structure; (iv) standard references on stacking leakage and cross-fitting.
+- No model that saw row i's target ever predicts z[i,·] or u[i,·].
+- Any supervised preprocessing (target encoding, learned calibrations, aux-feature models fitted on competition labels) is fit inside the same fold boundary as the base model.
+- OUTER_VAL labels are touched only by the final AUC call.
 
-**Source types.** Official Kaggle pages; official library documentation; a scikit-learn GitHub issue documenting isotonic calibration changing rank-based metrics; the standard large-sample AUC variance approximation; public S6E10 experiment repositories for competition-specific numbers.
+### 3.2 Meta-features (build minimal first, expand only on ablation evidence)
 
-**Limitations.** The reported scores (OOF 0.96126, LB 0.95975, categorical inversion, calibration shift) are treated as reported experimental facts, not independently verified — we have no access to the repo's artifacts. Base-model pairwise correlations, exact fold construction, and the specific inverted category are unknown to us; where a conclusion depends on them, this is stated and a measurement is prescribed. Public-repository claims are single-team evidence, not leaderboards.
+For prediction p and documented clipping constant ε = 1e-6: logit_ε(p) = log( clip(p, ε, 1−ε) / (1 − clip(p, ε, 1−ε)) ).
 
-**Verified vs. hypothesis tagging.** Statements sourced from documentation are marked [V] (verified); competition-specific or inferred statements are marked [H] (hypothesis requiring local measurement).
+| Meta-feature                                             | Status                       | Rationale                                                                                                                                                                            |
+| -------------------------------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Raw probabilities p_k                                    | **Core**                     | Baseline representation.                                                                                                                                                             |
+| Clipped logits logit_ε(p_k)                              | **Core**                     | Compresses mid-range, expands tail separation; makes near-collinear predictions less redundant in the tails.                                                                         |
+| Per-row mean of p_k                                      | Optional                     | Nearly a function of the p_k's; a meta-tree can build it internally with one split; low incremental value expected.                                                                  |
+| Per-row std of p_k, max−min spread                       | **Ablate, expect rejection** | With 4 near-collinear GBDT arms these are ~monotone functions of                                                                                                                     | p_best − p_worst | ; "model disagreement" is not validated uncertainty. Only include if leave-one-out outer-fold AUC improves. |
+| Pairwise differences p_a − p_b (6 pairs)                 | Ablate                       | Same concern; 6 extra features for 4 arms invites meta-overfit on 700k rows (still cheap, but keep the minimal-first discipline).                                                    |
+| Rank transforms of p_k                                   | Optional                     | Scale-free; interacts with blend-space comparison (Section 5).                                                                                                                       |
+| Interactions with Class / Type of Travel / Customer Type | Ablate last                  | The only plausible use is segment-conditional model trust; with correlated same-feature arms there is little differential signal to gate on. Test as a single grouped feature block. |
 
----
+### 3.3 Training-size mismatch (the subtle stacking bug)
 
-## 4. Findings
+Inner-OOF features z come from models trained on (1 − 1/K) of outer-train; the final production base models train on 100% of data and their predictions are _sharper_ (more confident, pushed toward 0/1). A meta-learner trained on z-distribution and applied to sharper predictions faces covariate shift in its inputs. Mitigations, in order of cost:
 
-### 4.1 Part I — Audit the OOF–Leaderboard gap (do this before any new ensemble)
+1. **Apply the meta-learner only to predictions from fold models at the same training fraction** (the `u[i,k]` above): the production analogue is to score test with the average of the K fold models — the same objects that produced OOF — rather than a refit-on-100% model. This is the standard, cheapest fix.
+2. **Rank/logit-meta inputs** reduce (not remove) sharpness sensitivity.
+3. **Cross-fitted size matching** (train scratch fold models at the production fraction and re-generate meta-training rows) — expensive; only if a measured z-vs-u distribution shift is demonstrated (KS test on prediction marginals per arm).
 
-**The arithmetic that rules out "calibration" as the cause.** For a fixed score vector s and any strictly increasing h: AUC(y, h(s)) = AUC(y, s). sklearn computes ROC-AUC from prediction _scores_ (any monotone score works) and documents AUC/Gini as a summary of ranking ability ([sklearn roc_auc_score](https://scikit-learn.org/stable/modules/generated/sklearn.metrics.roc_auc_score.html), [sklearn model evaluation](https://scikit-learn.org/stable/modules/model_evaluation.html)). Therefore:
+**Deliverable A status:** architecture defined above; the honest prior from public evidence is that Track A yields ~0 to +1 bp over Track B, and must not be adopted unless the nested outer score beats the constrained blend under matched folds.
 
-- A global sigmoid recalibration of an unchanged test score vector: **AUC unchanged** [V].
-- Different probability _scales_ between train and test (e.g., mean predicted probability 0.56 in OOF vs. 0.48 in test): affects calibration plots, **not** the AUC of the same model [V].
-- The only ways AUC drops: (a) the _ordering_ changed (feature/pipeline defect, or genuine conditional-distribution difference), (b) ties were introduced (isotonic-style non-strict transforms), or (c) sampling variation.
-
-**How big should the gap be under pure noise?** Using the large-sample approximation SE(AUC) ≈ sqrt(AUC(1−AUC)·(1/n₊ + 1/n₋)) with n₊ ≈ 165k, n₋ ≈ 135k (300k test rows, ~55% satisfied [H]—measure the actual train prevalence), SE ≈ 0.0007. The observed 0.00151 gap is ≈ 2.1 SE — possible under noise, but the same teams' public reports show CV–LB gaps of ~0.0006 on this competition ([aditbytes](https://github.com/aditbytes/kaggle-s6e10-airline-satisfaction)). Conclusion: investigate a defect; do not assume either pure noise or pure calibration.
-
-#### 4.1.1 Cause A — categorical-code inversion (priority 1)
-
-The reported inversion is the only stated mechanism that plausibly changes test ranking while leaving OOF intact. Audit every categorical feature (Gender, Customer Type, Type of Travel, Class, and any engineered categorical such as route codes [H]) across all five consumption points: fold training, full refit, test inference, submission generation, and serialization boundaries.
-
-Failure modes to check, in order of observed frequency:
-
-1. **Ordering assumptions in code assignment.** `pd.factorize` assigns codes by order of appearance; `pd.Categorical` by declared category order. Train and test files with the same string categories can produce _different integer codes_ if mapping is fit independently per file. Use a single, persisted mapping.
-2. **Native-categorical ingestion differences.** CatBoost (`cat_features`), LightGBM (`categorical_feature`), and HistGradientBoosting (`categorical_features` with an ordinal encoder fit on training folds) all handle unseen categories and code semantics differently. An integer code that one model treats as categorical and another treats as numeric magnitude is a silent ranking killer.
-3. **Serialization drift.** Pickled preprocessors/joblib pipelines with a stale `categories_` list, or feature-column order differences after a `concat`/`reindex`.
-4. **Target-encoding boundaries.** If any target/label encoding was fit on full training data instead of per-fold, OOF is contaminated (optimistic) _and_ test uses full-data encodings — distorting the OOF/LB comparison in opposite directions.
-
-**Concrete assertions (implement; fail loudly):**
+## 4. Meta-learner configuration (Track A2)
 
 ```python
-# A1: category bijection
-assert set(train['Class'].unique()) == set(test['Class'].unique())
-# A2: persisted mapping is used everywhere (never re-fit on test)
-expected_map = {"Eco": 0, "Eco Plus": 1, "Business": 2}
-assert saved_encoder.categories_[j] == list(expected_map)
-# A3: schema and dtypes identical at inference
-assert list(X_test.columns) == list(X_train.columns)
-assert (X_test.dtypes == X_train.dtypes).all()
-# A4: train and test predictions come from the SAME fitted pipeline object
-assert inference_pipeline is fold_pipeline_registry[fold_id]  # or documented refit
-# A5: no unseen categories at inference (or explicit UNKNOWN policy)
-assert X_test[cat_cols].map(saved_encoder).isna().sum().sum() == 0
-# A6: submission id integrity
-assert (submission['id'] == test_ids).all() and len(submission) == len(test_ids)
-assert submission['satisfaction'].between(0, 1).all()
-assert submission['satisfaction'].isna().sum() == 0
+# LightGBM meta-learner — initial hypothesis, NOT a validated optimum.
+# Consistency: num_leaves=4 and max_depth=2 are mutually consistent because
+# 2^max_depth = 4 = num_leaves; LightGBM grows leaf-wise, so num_leaves is the
+# primary complexity control and max_depth=2 guarantees no leaf can sit deeper.
+# Native parameter name for feature subsampling is feature_fraction
+# (aliases: sub_feature, colsample_bytree) — use the native name in raw
+# param dicts: colsample_bytree has historically been silently ignored in
+# some LightGBM APIs (microsoft/LightGBM#1011).
+META_LGBM = {
+    "objective": "binary", "metric": "auc",
+    "learning_rate": 0.01, "max_depth": 2, "num_leaves": 4,
+    "min_child_samples": 500,          # ~0.07% of 700k rows per leaf
+    "feature_fraction": 0.6,           # native name; alias colsample_bytree
+    "lambda_l1": 1.0, "lambda_l2": 5.0,
+    "bagging_fraction": 0.8, "bagging_freq": 1,
+    "seed": 42, "verbosity": -1,
+}   # n_estimators chosen ONLY by early stopping on an inner-held-out fold
+
+# CatBoost meta-learner alternative (depth 2–3, regularized, with bagging)
+META_CAT = dict(
+    iterations=5000, learning_rate=0.02, depth=2,     # symmetric (oblivious) trees
+    l2_leaf_reg=10.0, loss_function="Logloss",
+    eval_metric="AUC", random_strength=1.0,
+    bagging_temperature=1.0, border_count=128,
+    random_seed=42, early_stopping_rounds=200, use_best_model=True,
+)
 ```
 
-**Diagnostic that discriminates "inversion changed ranking" from "distribution shift":** re-score the current submission against a locally reproduced test-prediction vector. If the two vectors' Spearman correlation < 0.999, the pipeline does not reproduce itself → implementation defect confirmed before any distributional argument [H → measure].
+Required ablations (each must win on **outer** folds to survive): fewer leaves (num_leaves 2, max_depth 1 — a stump ensemble is the honest floor); min_child_samples 2000/5000; lambda_l2 10/25; feature blocks: {p} vs {p, logit} vs {p, logit, mean/std/spread} vs +interactions; learning_rate 0.005; no early stopping vs early stopping (early stopping on inner-OOF rows that the meta-learner trains on is _itself_ mildly optimistic — hold out one inner fold for meta early stopping).
 
-#### 4.1.2 Cause B — OOF vs. inference training mismatch
+**Do not force weight on every base model.** If the meta-learner ignores an arm (feature importance ≈ 0 across outer folds), that is evidence the arm carries no incremental signal — investigate why (likely feature-set overlap), rather than engineering features to rescue it (rules 8–9).
 
-OOF predictions come from models trained on 4/5 of the data; test predictions from full-data refits (or fold ensembles). Legitimate differences: slightly sharper full-refit scores, different early-stopping iterations. Illegitimate differences: different feature-engineering versions between the OOF script and the submission script, different model versions, different fold-assignment handling, or OOF aligned by row _position_ rather than by `id` (alignment bug). Verify by joining, not concatenating: `oof = oof.set_index('id').loc[train_ids]` [V-procedure].
+Framework facts used above: `feature_fraction` aliases and defaults ([LightGBM docs](https://lightgbm.readthedocs.io/en/latest/Parameters.html)); cumulative `colsample_bytree/bylevel/bynode` semantics in XGBoost ([docs](https://xgboost.readthedocs.io/en/stable/parameter.html)); CatBoost `depth`, `l2_leaf_reg`, overfitting detector and `use_best_model` ([docs](https://catboost.ai/docs/en/concepts/parameter-tuning)).
 
-#### 4.1.3 Cause C — population/distribution differences
+## 5. Constrained blend optimization (Track B)
 
-Measure (train-legitimate information only): class prevalence in train; predicted-score distribution of OOF vs. test (histogram + KS statistic); per-feature train-vs-test drift (public S6E10 EDA reports every feature mean differing by <2% and no material train/test drift [aditbytes](https://github.com/aditbytes/kaggle-s6e10-airline-satisfaction)); missingness (only `Arrival Delay in Minutes`, ~0.04% [same source]). Do **not** estimate test label prevalence from unlabeled features — it is not identifiable, and prevalence shift does not change a fixed model's ranking anyway (it changes calibration).
+### 5.1 Three blend spaces on identical validation rows
 
-#### 4.1.4 Cause D — validation reliability
+- **Probability blend** s = Σ w_k p_k: dominated geometrically by mid-range predictions; arms that differ mainly in tails contribute little.
+- **Logit blend** s = Σ w_k logit_ε(p_k): the logit is strictly increasing, so each arm's _individual_ AUC is unchanged, but _relative_ arm magnitudes in the tails are amplified; blends of near-collinear arms get more tail resolution.
+- **Rank blend** s = Σ w_k r_k with r_k = normalized rank (average ranks for ties, divided by n−1): discards magnitude entirely; maximally robust to calibration/sharpness mismatch across arms; slightly lossy where inter-rank distances carry signal. Community practice on Kaggle is to rank-normalize before hill climbing for exactly this scale-free reason ([hillclimbers](https://github.com/Matt-OP/hillclimbers), [jtlocati blend writeup](https://github.com/jtlocati/Kaggle-Car-Prediction)).
+- Different spaces can and do give different AUCs because the _pairwise ordering of blended scores_ differs — AUC is a functional of orderings, and a convex combination is not order-preserving across representations.
 
-The 700k synthetic rows are generated from ~130k original rows ([Kaggle data page](https://www.kaggle.com/competitions/playground-series-s6e10/data); original dataset: [Airline Passenger Satisfaction](https://www.kaggle.com/datasets/teejmahal20/airline-passenger-satisfaction)). This creates a specific, measurable risk: **near-duplicate rows across folds inflate OOF AUC** relative to a test fold containing genuinely distinct generated rows. Measure: exact/near-duplicate rate (hash of the feature tuple) between each validation fold and its training complement, and between train and test. If cross-fold duplication is materially higher than train↔test duplication, the OOF score is structurally optimistic and part of the gap is explained _without_ any bug. This does not require changing folds — it requires knowing the bias direction [H → measure].
+### 5.2 Objective and optimizer
 
-#### 4.1.5 Prioritized diagnostic checklist
-
-| Prio | Check                                                        | Method                      | Red flag                                      |
-| ---- | ------------------------------------------------------------ | --------------------------- | --------------------------------------------- |
-| 1    | Category mapping bijection train↔test↔saved encoder          | Assertions A1–A2            | any mismatch                                  |
-| 2    | Submission reproduces local test predictions                 | Spearman ≥ 0.999 vs. re-run | < 0.999                                       |
-| 3    | OOF↔`id` alignment                                           | join-based audit            | row-count/NaN after join                      |
-| 4    | Feature schema/dtype parity OOF script vs. submission script | Assertions A3               | any diff                                      |
-| 5    | OOF fold-model vs. full-refit provenance                     | registry check              | undocumented refit                            |
-| 6    | Cross-fold near-duplicate rate                               | feature-tuple hashing       | dup rate ≫ train↔test dup rate                |
-| 7    | Score-distribution shift OOF vs. test                        | KS test on scores           | KS > 0.05 _and_ rank-invariant features shift |
-| 8    | Fold-level AUC variance                                      | mean ± sd across folds      | sd > 0.002                                    |
-
-**Gate:** do not proceed to Tier 2/3 until checks 1–5 pass and the resubmitted fixed pipeline's LB score lands within ~0.0007 (1 SE) of OOF, or the residual gap is explained by check 6.
-
----
-
-### 4.2 Part II — Rank preservation, calibration, and train–test consistency (Question Two)
-
-#### 4.2.1 The invariance result, stated correctly
-
-For a fixed score vector s and strictly increasing h: sᵢ > sⱼ ⟺ h(sᵢ) > h(sⱼ), hence AUC(y, h(s)) = AUC(y, s) [V — follows from the definition of AUC as a pairwise concordance probability; see [sklearn model evaluation](https://scikit-learn.org/stable/modules/model_evaluation.html)].
-
-Implications per transform:
-
-| Transform                   | Type                                    | Effect on AUC of a fixed vector                |
-| --------------------------- | --------------------------------------- | ---------------------------------------------- |
-| Sigmoid calibration (Platt) | strictly increasing                     | none                                           |
-| Logit (with clipping at ε)  | strictly increasing on [ε, 1−ε]         | none (ties only at clipped extremes)           |
-| Monotone rescaling          | strictly increasing                     | none                                           |
-| Empirical rank map          | strictly increasing (with average ties) | none up to tie handling                        |
-| **Isotonic regression**     | **nondecreasing only**                  | **can create ties → can reduce empirical AUC** |
-
-The isotonic row is not theoretical: scikit-learn issue [#16321](https://github.com/scikit-learn/scikit-learn/issues/16321) documents isotonic calibration changing rank-based test metrics. scikit-learn's calibration docs likewise treat calibration as a probability-quality objective, not a ranking objective ([sklearn calibration](https://scikit-learn.org/stable/modules/calibration.html)). **Therefore: do not recommend calibration to repair the LB gap.** Calibration is legitimate only if (a) a downstream operation genuinely needs probabilities (blend arithmetic in probability space does — see below), or (b) it is part of a _modeling_ change that legitimately reorders.
-
-#### 4.2.2 What "calibration shift" actually diagnoses
-
-| Shift type                                          | Changes AUC of fixed model?                                                    | Changes calibration? |
-| --------------------------------------------------- | ------------------------------------------------------------------------------ | -------------------- |
-| Probability calibration shift (score scale)         | No                                                                             | Yes                  |
-| Covariate shift (feature distribution)              | Yes, if conditional P(y                                                        | X) also shifts       | possibly |
-| Conditional shift P(y                               | X)                                                                             | **Yes**              | Yes      |
-| Label-prevalence shift                              | No (ranking invariant), but _blends_ of recalibrated probabilities can reorder | Yes                  |
-| Different training procedures (fold vs. full refit) | Score-scale differences; ranking usually preserved                             | Yes                  |
-| Implementation errors                               | Any effect                                                                     | Any effect           |
-
-Do not infer prevalence shift from mean-prediction differences alone; do not estimate test prevalence from unlabeled features (not identifiable).
-
-#### 4.2.3 Inference-time ranking protocols compared
-
-**Protocol A — raw probabilities (baseline).** Blend nothing; use the validated single-model pipeline. Always report it.
-
-**Protocol B — logit-space blending.** s = Σwₘ·logit(clip(pₘ)), with clip ε = 1e-6: `p̃ = min(1−ε, max(ε, p))`. Individual monotone transforms preserve each model's own ranking, but **change the blend** because the component scales change: logit stretches the mid-range and compresses the extremes, so logit blends weight confident-disagreement regions differently than probability blends. Clipping matters: extreme scores (p < 1e-6) would otherwise produce logits of magnitude > 13.8 that dominate any weighted sum. Compare B against A on the same OOF rows; neither dominates universally.
-
-**Protocol C — empirical rank blending.** rᵢₘ = (rank(pₘ(xᵢ)) − 1)/(n − 1), ties averaged; blend s = Σwₘ·rᵢₘ. Rank maps discard probability _spacing_ (all information about how far apart passengers are) and keep only order — this removes scale dependence between base models (useful when one model is systematically over/under-confident) but also discards genuine information when models are differently confident in informative regions. Choose the reference population deliberately:
-
-1. **Fixed training reference (recommended default).** Fit the empirical CDF of each model's _OOF scores_ once; at inference, map test scores through that CDF (interpolated inverse). Strictly monotone, label-free, deterministic, and identical between validation and submission runs. No test data needed.
-2. **Transductive reference (ranks over train+test combined).** Permitted by the competition setup — it uses only unlabeled test _scores_, never test labels, and S6E10 permits external/public data usage ([competition page](https://www.kaggle.com/competitions/playground-series-s6e10); community summary: external data allowed, 10 submissions/day, deadline 2026-10-31 [jamesidriss repo](https://github.com/jamesidriss/airline_S6E10)). Assumptions required: the unlabeled test file at validation time is the same file scored at submission time (true here), and you accept that the validation-time rank features (computed over train-only scores) are _not_ identical to inference-time ranks (computed over train+test). This train–test asymmetry must be replicated during validation or it is a silent mismatch.
-3. **Fold-specific ranks** — not recommended for blending: they inject fold-boundary noise into OOF scores.
-
-Given the current integrity concerns, adopt option 1 until the pipeline is verified; consider option 2 only as a measured A/B on the same folds.
-
-**Protocol D — monotone post-processing (sigmoid/isotonic).** Use only if probabilities are an actual deliverable or as a component of a justified downstream operation. Expect **no** LB-AUC repair from calibration alone [V].
-
-#### 4.2.4 Train–test consistency taxonomy for every preprocessing step
-
-| Step                                                       | Learned from                     | Cross-fitting needed? | Test-time behavior                        |
-| ---------------------------------------------------------- | -------------------------------- | --------------------- | ----------------------------------------- |
-| Category encoding                                          | training folds                   | yes, per fold         | apply saved mapping                       |
-| Target/label encoding                                      | training folds                   | **mandatory**         | apply fold-specific or averaged encodings |
-| Rank normalization                                         | OOF score distribution           | no (labels unused)    | fixed training reference CDF              |
-| Duplicate-row statistics (Flight-Distance group stats [H]) | train+test+original (label-free) | no                    | recompute identically                     |
-| Early stopping                                             | fold-internal validation         | no                    | fixed iteration count from CV             |
-| Original-data satisfaction rate per group [H]              | original labeled data            | no                    | apply as static feature                   |
-
-Fail loudly on any schema/category mismatch at inference (assertions A1–A6 in §4.1.1).
-
-#### 4.2.5 Submission-integrity checklist (automated, blocking)
-
-1. Row count == test row count; ids exactly equal test ids, same order; no duplicates.
-2. Column names/position match `sample_submission.csv` (`id,satisfaction`) ([Kaggle overview](https://www.kaggle.com/competitions/playground-series-s6e10)).
-3. All predictions finite, in [0,1], no NaN/inf.
-4. Reproducibility: re-running inference from saved models yields Spearman ≥ 0.9999 with the submitted vector.
-5. Schema/category assertions pass (A1–A5).
-6. Prediction distribution sanity: KS statistic between submission scores and OOF scores recorded in the run log (informational; not a blocker).
-7. File re-read from disk before submission (catches truncation/encoding).
-
----
-
-### 4.3 Part III — Constrained rank-weight optimization (Question Three)
-
-#### 4.3.1 The objective and why it is hard
-
-With R = (rᵢₘ) the normalized rank matrix and y the OOF labels:
-
-maximize w ↦ AUC(y, Rw) subject to w ≥ 0, Σwₘ = 1 (optionally wₘ ≤ w_max).
-
-For a finite sample, each pairwise comparison (i,j) flips only when w·(rᵢ − rⱼ) crosses 0 — a hyperplane in weight space. The objective is therefore **piecewise constant on cells of a hyperplane arrangement**: nonsmooth, with large flat regions when base-model rank vectors are highly correlated (small angular differences between rₘ columns ⇒ few flip hyperplanes ⇒ broad plateaus). Consequences: (i) many weight vectors are exactly tied at the optimum — weights are non-identifiable; (ii) gradient-based methods are meaningless; (iii) Nelder–Mead's convergence guarantees assume smoothness and do not apply; (iv) the optimizer's reported optimum is an arbitrary point of a plateau, highly sensitive to initialization.
-
-#### 4.3.2 Nelder–Mead specifically
-
-SciPy's Nelder–Mead supports **box bounds only** (via the `bounds` argument); the simplex constraint Σw = 1 must be handled by reparameterization (e.g., optimize w₁..w_{M−1} with w_M = 1 − Σ, or a softmax parameterization) ([SciPy NM docs](https://docs.scipy.org/doc/scipy/reference/optimize.minimize-neldermead.html)). Even then, on a piecewise-constant objective NM can stall in a plateau far from the best cell, and different restarts return different plateaus. **Verdict: NM is acceptable only as a final local polish; it must not be the primary search.** [V on capabilities; H on stall behavior → measure restart variance.]
-
-#### 4.3.3 Recommended search (cheapest first)
-
-1. **Predeclared coarse grid** over the simplex, step 0.05 (for M = 4: 84 points) + **Dirichlet(1) random sampling**, K = 200–1000 draws — all evaluated on pooled OOF AUC. Cost: one AUC evaluation per candidate ≈ O(n log n); trivially parallel.
-2. **Coordinate refinement:** from the grid optimum, cyclic coordinate search over wₘ in ±0.05, ±0.02 steps while renormalizing. Two sweeps suffice.
-3. Optional NM polish from the grid optimum, reparameterized to the simplex, with 10 restarts; keep the best; record the plateau spread.
-
-**Stopping criterion:** stop when (a) the top-10 candidates' pooled AUC spread < 1e-4 (below the ~7e-4 noise floor, i.e., statistically indistinguishable), and (b) the selected weights' N_eff is stable across restarts (variation < 10%). If (a) triggers, the objective is flat → fall back to the **most-uniform weight vector within 1e-4 of the optimum** (see regularization below).
-
-#### 4.3.4 Domination control: caps vs. penalties
-
-Hard cap: wₘ ≤ w_max (e.g., 0.5 for M = 4 ⇒ N_eff ≥ 2 in the worst case; 0.4 ⇒ N_eff ≥ ~2.9). Penalties (applied to the _validation objective only_, never to the final scoring):
-
-- Distance-from-uniform: Ω(w) = Σₘ(wₘ − 1/M)² (quadratic).
-- Concentration: Ω(w) = Σₘwₘ² ⇔ targeting max N_eff.
-- Baseline deviation: Ω(w) = Σₘ(wₘ − w⁰ₘ)² for a predeclared baseline w⁰ (e.g., uniform or AUC-proportional).
-- Effective-count floor: penalize max(0, K_min − 1/Σwₘ²)² with predeclared K_min (e.g., 2).
-
-Effective number of contributing models: N_eff(w) = 1/Σₘwₘ² — equals M for uniform weights (4 models → 4), 1.9 for (0.7, 0.15, 0.1, 0.05), 1 for a single model. Use it as a **diagnostic** and, only if instability is observed across restarts/fold-subsets, as the regularization target.
-
-**Do not impose caps without evidence.** Protocol: run unconstrained; if the optimum has N_eff ≥ 2.5 and is stable, no cap. If the optimum concentrates (N_eff < 2) _and_ the concentrated solution's advantage over uniform is < 1e-4 (within noise), adopt the regularized (near-uniform) solution — it is more robust to the OOF/LB distribution difference. **λ selection:** predeclare λ ∈ {0, 10⁻⁴, 10⁻³, 10⁻²} on a normalized penalty scale; select the smallest λ whose selected weights are stable under fold-subset jackknife (leave-one-fold-out re-optimization); do not tune λ by repeatedly maximizing pooled OOF AUC — that is selection overfitting.
-
-#### 4.3.5 Why optimal weights differ across blending spaces
-
-Probability, logit, and rank spaces reweight regions of the score scale differently: probabilities emphasize mid-range disagreement; logits stretch the mid-range, compress extremes; ranks discard spacing entirely. Hence argmax_w AUC(y, Σwₘ·T(pₘ)) depends on T. With near-identical GBDTs, rank-space optimization is usually the most stable (scale-free) but also the flattest; logit-space often gives the largest single-candidate improvement when calibration differs across models. Run all three on identical validation rows.
-
-#### 4.3.6 Validation-safe selection protocol (prevents ensemble-selection overfitting)
-
-1. **Selection stage:** optimize weights on pooled folds 1–3 only.
-2. **Confirmation stage:** evaluate the top-3 selected weight vectors, blind, on folds 4–5 (never used in selection). Record Δ = confirmation AUC − best single model AUC.
-3. **Retention rule:** adopt optimized weights only if confirmation Δ ≥ +0.0002 AND Δ > 0 on both confirmation folds. Otherwise ship equal weights (rank space).
-4. Log every candidate evaluated (count matters: with 1,000 candidates on ~560k OOF rows, the winner's-curse inflation is small — SE ≈ 7e-4 — but repeated rounds against the same labels compound it; the confirmation stage is what controls it).
-
----
-
-### 4.4 Part IV — Shallow GBDT meta-learner (Question One)
-
-#### 4.4.1 Formulation and the four combination methods
-
-Let z(x) = (p₁(x), …, p_M(x)) be base-model scores. A GBDT meta-learner learns ŝ(x) = g_θ(z(x)) with g a permitted GBDT.
-
-| Method               | Model         | Assumptions under which it helps                                                           |
-| -------------------- | ------------- | ------------------------------------------------------------------------------------------ |
-| Probability blending | Σwₘpₘ         | base scores comparable in scale; linear-in-probability diversity is enough                 |
-| Logit blending       | Σwₘ logit(pₘ) | score differences informative on the log-odds scale (mixing differently-calibrated models) |
-| Rank blending        | Σwₘ rₘ        | scale-free; optimal when calibration untrustworthy but order informative                   |
-| GBDT stacking        | g_θ(z)        | base models have **complementary conditional errors** (region-dependent reliability)       |
-
-Stacking strictly generalizes the linear blends; it earns its complexity only when the conditional-error structure exists. With four same-family GBDTs trained on one dataset, the prior is that it does not [H — measure via ablation].
-
-#### 4.4.2 Leakage-safe training protocol (the non-negotiable core)
-
-**Meta-training features must be cross-fitted:** every meta-training row's base prediction comes from a model that never saw that row's target. Standard references on stacking are unanimous that training the meta-model on in-sample base predictions is optimistic, because in-sample scores are systematically better than any test-time score will be ([Cross Validated: stacking with cross-validation](https://stats.stackexchange.com/questions/239445/how-to-properly-do-stacking-meta-ensembling-with-cross-validation)).
-
-Algorithm:
-
-```
-1. For m in 1..M: generate OOF predictions p_m^oof on the established K folds
-   (existing registry, unchanged folds, join by id).
-2. Assemble Z_oof[i, m] = p_m^oof(id_i); labels y_oof = train satisfaction.
-3. Split Z_oof into meta-train / meta-valid folds (meta-level StratifiedKFold,
-   e.g., 5 folds, seed fixed).
-4. For each meta-fold: fit g_θ (shallow LGBM/CatBoost) on meta-train folds;
-   early-stop on the meta-valid fold using AUC.
-   → cross-fitted meta-OOF predictions give an unbiased estimate of the
-     meta-learner's OOF AUC.
-5. Final g_θ: refit on all of Z_oof with iteration count = median of
-   fold-wise early-stopping iterations (no early stopping on full data).
-6. Test-time: apply g_θ to the test prediction vector Z_test[i, m] = p_m^test(id_i),
-   where p^test comes from the SAME base-model definitions and feature logic
-   as the OOF generation.
-```
-
-**Handling the fold-model vs. full-refit mismatch.** OOF scores come from 80%-data models; test scores from full refits (sharper, better calibrated). Three options, ranked:
-
-1. **Fold-ensemble inference (recommended):** average the K fold models' test predictions per base model. Test scores are then generated under conditions statistically matched to OOF scores (both are averages over 80%-data models). Cost: K× inference time. This also _reduces_ the OOF–test distribution difference flagged in the current campaign.
-2. Accept the mismatch with a **shallow meta-learner** (depth 3–4, few splits ⇒ learns near-monotone reweighting, robust to mild scale shift).
-3. Do **not** train the meta-learner on in-sample full-refit predictions to "match" — that is stacking leakage [V].
-
-**Hyperparameter/complexity selection for the meta-learner** must itself be cross-fitted (the meta-level folds in steps 3–4); if you then want an unbiased end-to-end score, the selection and the reporting must use disjoint meta-folds — nested CV is needed **only** to support the claim "this hyperparameter choice generalizes"; it is not needed to fit a predeclared shallow configuration.
-
-#### 4.4.3 Meta-feature blocks (ablation matrix)
-
-| Block           | Features                                                | Prior                                                | Keep if                    |
-| --------------- | ------------------------------------------------------- | ---------------------------------------------------- | -------------------------- |
-| B1 raw          | zₘ = pₘ                                                 | always start                                         | —                          |
-| B2 logits       | logit(clip(pₘ, 1e-6))                                   | helps with mixed calibration                         | +Δ confirmed               |
-| B3 ranks        | fixed-training-reference rank of pₘ                     | helps with scale mismatch                            | +Δ confirmed               |
-| B4 agreement    | mean, sd, min, max, max−min of p; pairwise diffs pₐ−p_b | only if disagreement correlates with errors          | +Δ confirmed               |
-| B5 interactions | (implicit in trees: splits on pairs)                    | shallow trees find them natively; no manual products | only if B1+B4 insufficient |
-
-Numerically stable logit: clip to [1e-6, 1−1e-6] before transforming. Rank features: use the §4.2.3 fixed training reference, never fold-specific ranks, never test labels.
-
-**Ablation plan (cumulative):** A0 = best constrained blend (reference); A1 = B1; A2 = B1+B2; A3 = B1+B3; A4 = B1+B4; A5 = B1+B2+B4; A6 = B1+B2+B3+B4. Each candidate: pooled meta-OOF AUC + per-fold AUCs; retain a block only if it adds ≥ +0.0002 pooled with ≥ 4/5 fold-level sign consistency. Block B4 should be tested, not added reflexively — with correlated GBDTs the sd/min/max features are usually near-degenerate.
-
-#### 4.4.4 Anti-overfitting configuration and why 700k rows do not protect you
-
-The meta-learner does not overfit because of sample scarcity; it overfits because the **effective feature dimension is tiny (M = 4 → ≤ 20 derived features)**, the features are highly collinear, and the signal beyond the monotone average is weak — so the trees chase OOF artifacts (fold-boundary noise, per-fold calibration differences). Shallow, heavily regularized configs:
+Empirical AUC is a U-statistic over positive/negative pairs: piecewise-constant in w ⇒ non-smooth, with flat plateaus. Consequences: gradient methods are inappropriate on the empirical objective; a smooth penalty λR(w) turns the objective into "piecewise-constant + smooth", whose minima sit at plateau edges — the penalty trades mean for variance but cannot create gradient signal where AUC is flat. Practical policy: derivative-free optimizers + explicit plateau handling + outer validation of the selected w.
 
 ```python
-# LightGBM meta-learner (start here)
-lgb.LGBMClassifier(
-    objective="binary", n_estimators=500, learning_rate=0.03,
-    num_leaves=8, max_depth=3, min_data_in_leaf=20000,
-    lambda_l2=50, feature_fraction=1.0, bagging_fraction=0.8,
-    bagging_freq=1, verbosity=-1)
-# early stopping on meta-valid fold with metric "auc", first_metric_only=True
+import numpy as np
+from scipy.optimize import minimize
+from sklearn.metrics import roc_auc_score
 
-# CatBoost meta-learner (only if LightGBM shows credible improvement)
-cb.CatBoostClassifier(
-    iterations=1000, learning_rate=0.03, depth=3, l2_leaf_reg=50,
-    random_seed=SEED, od_type="Iter", od_wait=100, eval_metric="AUC")
+EPS = 1e-6  # documented clipping constant for logit space
+
+def logit_eps(p):
+    q = np.clip(p, EPS, 1 - EPS); return np.log(q / (1 - q))
+
+def make_space(P, space):        # P: (n_rows, K) OOF predictions of K arms
+    if space == "prob":  return P.copy()
+    if space == "logit": return logit_eps(P)
+    if space == "rank":
+        R = np.empty_like(P)
+        for k in range(P.shape[1]):
+            R[:, k] = np.argsort(np.argsort(P[:, k], kind="mergesort")) / (len(P) - 1)
+        return R
+    raise ValueError(space)
+
+def auc_of_w(w, U, y):  # U: blend-space matrix
+    return roc_auc_score(y, U @ w)
+
+def concentration(w, K):          # R(w) = sum_k (w_k - 1/K)^2
+    return np.sum((w - 1.0 / K) ** 2)
+
+def fit_blend_slsqp(U, y, lam=0.0, max_weight=1.0):
+    """Constrained: w >= 0, sum w = 1, w <= max_weight, minimize -AUC + lam*R."""
+    K = U.shape[1]; w0 = np.full(K, 1.0 / K)
+    res = minimize(
+        lambda w: -auc_of_w(w, U, y) + lam * concentration(w, K),
+        w0, method="SLSQP",
+        bounds=[(0.0, max_weight)] * K,
+        constraints=[{"type": "eq", "fun": lambda w: w.sum() - 1.0}],
+        options={"maxiter": 200, "ftol": 1e-12},
+    )
+    return np.clip(res.x, 0, None) / np.clip(res.x, 0, None).sum()
+
+def fit_blend_nm_softmax(U, y, lam=0.0, restarts=4, seed=42):
+    """Nelder–Mead on unconstrained a in R^K with softmax weights —
+    simplex-feasible by construction (parameterization, not projection)."""
+    K = U.shape[1]; rng = np.random.default_rng(seed)
+    def obj(a):
+        z = np.exp(a - a.max()); w = z / z.sum()
+        return -auc_of_w(w, U, y) + lam * concentration(w, K)
+    best_w, best = None, np.inf
+    for r in range(restarts):
+        a0 = np.zeros(K) if r == 0 else rng.normal(0, 1.0, K)
+        res = minimize(obj, a0, method="Nelder-Mead",
+                       options={"maxiter": 400 * K, "xatol": 1e-4, "fatol": 1e-8})
+        if res.fun < best:
+            best = res.fun
+            z = np.exp(res.x - res.x.max()); best_w = z / z.sum()
+    return best_w
+
+def hill_climb_caruana(U, y, n_picks=40):
+    """Greedy ensemble selection with replacement (Caruana 2004):
+    start from the best single arm; each round add the arm (possibly a repeat)
+    that most improves blended AUC. Weight of arm k = picks_k / n_picks.
+    With-replacement = implicit weight cap 1/n_picks increments."""
+    K = U.shape[1]; scores = [roc_auc_score(y, U[:, k]) for k in range(K)]
+    counts = np.zeros(K, dtype=int); counts[int(np.argmax(scores))] = 1
+    for _ in range(n_picks - 1):
+        gains = []
+        for k in range(K):
+            counts[k] += 1
+            w = counts / counts.sum()
+            gains.append((auc_of_w(w, U, y), k))
+            counts[k] -= 1
+        _, k_best = max(gains); counts[k_best] += 1
+    return counts / counts.sum()
 ```
 
-Rationale from the documentation: LightGBM's leaf-wise growth requires `num_leaves` well below 2^max_depth and explicit `min_data_in_leaf` to avoid overfitting ([LightGBM tuning](https://lightgbm.readthedocs.io/en/latest/Parameters-Tuning.html), [LightGBM parameters](https://lightgbm.readthedocs.io/en/latest/Parameters.html)); CatBoost offers the overfitting detector and depth/l2 tuning for the same purpose ([CatBoost overfitting detector](https://catboost.ai/docs/en/features/overfitting-detector-desc), [CatBoost parameter tuning](https://catboost.ai/docs/en/concepts/parameter-tuning)).
+Protocol: all strategies are fit on **inner-OOF rows only**; the _selected_ strategy (including its λ and its blend space) is scored once on the untouched outer fold. Compare: equal weights; predeclared small grid (w in {0, .25, .5, .75, 1} simplex grid for K=4); Caruana hill-climb; SLSQP λ ∈ {0, 1e-4, 1e-3}; NM-softmax; max_weight ∈ {0.4, 0.5} variants. Public S6E10 evidence to calibrate expectations: nested hill-climb OOF 0.961643 was still below a nested LR stacker ([bansal1600 PR#4](https://github.com/bansal1600/kaggle-airline-prediction/pull/4)) — combiner choice moves bp, not tens of bp.
 
-#### 4.4.5 Objective choice
+### 5.3 Weight-stability diagnostics
 
-- **Binary log loss (default) as the training objective, AUC as the early-stopping/selection metric** is the pragmatic choice. [V on availability: LightGBM exposes `auc` as a metric and `binary` as objective; CatBoost exposes `eval_metric="AUC"`.]
-- **Pairwise ranking objectives** (LightGBM `lambdarank`) need query groups; a single 700k-row "group" makes the pairwise formulation O(n²) — computationally infeasible here, and the documented use case (learning-to-rank with relevance grades) does not map cleanly onto AUC maximization. [V on mechanics / H on futility]
-- Do not assume ranking objectives improve test AUC: most of the achievable gain lives in the base models, not the meta-objective. Decide empirically, once, via the ablation.
+- **Bootstrap**: resample inner-OOF rows (B ≥ 100), refit w, report weight quantiles; flag any arm whose weight crosses 0 in > 25% of resamples.
+- **Fold sensitivity**: refit on each inner fold separately; report per-fold w and the max coordinate range.
+- **Seed sensitivity**: rerun base arms with seeds {42, 43, 44} on one outer fold; measure Spearman correlation of the blended test scores across seeds; prefer configurations with rank correlation > 0.999.
+- **Concentration report**: always report R(w); a λ=0 optimum at a vertex (one arm weight ≈ 1) on correlated arms is an overfitting signature, not a discovery.
+- If evidence _consistently_ favors a subset (e.g., an arm with weight ≈ 0 across all outer folds and bootstraps), drop it (rule 9 permits; diversity is not a goal in itself).
 
-#### 4.4.6 Decision rule for the meta-learner
+## 6. Nested CV: 5-fold vs 10-fold (Track C)
 
-Retain the GBDT meta-learner **only if all hold**:
+**Design.** Outer: 5 stratified folds, seed 42, fixed for all experiments. Inner: generate OOF twice per outer-training partition — once with 5 inner folds, once with 10 — with matched preprocessing, matched model configs, and matched seeds. Score the complete procedure (base arms → meta-features → blend/meta fit → size-matched outer-val predictions) on each outer fold, for both inner fold counts.
 
-1. Cross-fitted meta-OOF AUC ≥ best constrained blend + 0.0002 (pooled), **and**
-2. ≥ 4/5 meta-folds show positive Δ, **and**
-3. The gain survives an independent confirmation stage (§4.3.6 step 2 analog at the meta level), **and**
-4. The learned function is sanity-checked: PDP/ICE plots of g vs. each zₘ should be monotone-ish; wild non-monotone swings on 700k rows indicate fitting OOF artifacts.
+Measured per configuration: mean outer AUC; per-outer-fold spread; wall-clock and peak memory of inner-OOF generation; base-model training-set size (0.80·0.8N vs 0.90·0.8N of full data); prediction stability (Spearman of blended scores across the two inner fold counts).
 
-Otherwise: reject, ship the constrained blend. This rule is deliberately conservative: a rejected meta-learner costs a few GPU-hours; an accepted-but-spurious one costs leaderboard position and weeks of confusion.
+**Statistics warning:** outer-fold scores are dependent (shared training rows across folds); a naive paired t-test over 5 folds is anti-conservative. Use the corrected resampled t-test (Nadeau–Bengio correction) or report effect size with an explicit "directional, n=5" caveat; never claim significance from 5 dependent numbers.
+
+**Expected outcome (hypothesis, not a promise):** 10-fold inner OOF shifts each fold-model up by ~1% more training data — a small, mostly _variance-free_ change to OOF realism; final test predictions come from fold models either way. Compute cost doubles. Adopt 10-fold only if it wins mean outer AUC by more than its fold-to-fold variability under matched seeds. wozhenshiliudada's 10-fold work explicitly flags non-nested blend validation as its weak point ([repo](https://github.com/wozhenshiliudada/kaggle-airline-satisfaction-s6e10)) — the design above closes exactly that hole.
+
+**Staged approximation if compute is tight:** run the full nested design on **one** outer fold first (cf. bansal1600's one-fold nested probe, [PR #7](https://github.com/bansal1600/kaggle-airline-prediction/pull/7)). This can establish: leakage-freedom mechanically, direction and rough size of stack-vs-blend deltas, and training-size-shift diagnostics. It **cannot** establish mean performance or variance across folds — say so explicitly in any writeup.
+
+## 7. Test-time ranking and postprocessing (Track D)
+
+**Mathematical invariants (guaranteed):**
+
+- For a single final score s, any strictly increasing transform T (logit, raw, monotone calibration, rank-normalization) leaves ROC-AUC exactly invariant up to tie-handling: AUC = P(s⁺ > s⁻) + ½P(s⁺ = s⁻), and strictly increasing maps preserve both the strict-order event and the tie event. Therefore: no clipping, quantile mapping, or calibration applied _to the one final score_ can raise theoretical AUC. Claiming otherwise is a mathematical error.
+- Transformations applied **per-model before blending** are a different object: they change the blend geometry and _can_ change ensemble AUC (Section 5.1). Rank-transforming each arm before blending is legitimate; monotone-transforming the final score is not useful.
+- Any transformation that creates ties where the ensemble score had none (e.g., coarse quantile bucketing, aggressive clipping at quantiles, float16 truncation) can only _lower_ AUC (the ½-tie term strictly loses against a strict ordering, in expectation under the U-statistic).
+
+**Numerical-safety policy (the only justified clipping):** clip only against pathology: probabilities outside [0,1] from float error; logits of p ∈ {0,1} exactly (use logit_ε, ε = 1e-6, before any logit-space averaging or meta-feature construction — documented, not tuned). Never clip as a "variance reduction" device: on a 300k-row test set, tail ranks carry real AUC mass, and clipping at e.g. the 1st/99th percentile merges tail rows into ties by construction.
+
+**Testable-only hypotheses (validate on outer folds, never on the LB):**
+
+- Rank-blend vs logit-blend of the same arms (changes ensemble ordering — Section 5).
+- Average-rank tie handling in the rank space (ties from different arms landing on the same rank).
+- Whether to blend fold-model test predictions by averaging probabilities vs averaging logits (an ensemble-ordering question, not postprocessing).
+
+**Leaderboard policy:** the public LB is a noisy diagnostic. Prefer the configuration that wins _mean outer AUC_ and shows stable weights across bootstraps/folds/seeds over any configuration chosen for +2 bp on one public-LB submission. Public notebooks' scores (0.96176–0.96184) are a calibration anchor for "what good looks like", not an optimization target ([code listing](https://www.kaggle.com/competitions/playground-series-s6e10/code)).
+
+## 8. Ablation matrix
+
+| Change                                                                          | Expected benefit (OOF/LB)                                                  | Evidence confidence                                                                    | Compute cost | Implementation risk               |
+| ------------------------------------------------------------------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- | ------------ | --------------------------------- |
+| Equal-weight rank blend of 4 arms                                               | +1–3 bp vs best single arm                                                 | High (math + community practice)                                                       | None         | None                              |
+| Rank vs logit vs prob blend space                                               | ±1 bp; rank most robust                                                    | Medium                                                                                 | None         | Low                               |
+| Constrained weight optimization (SLSQP/NM/hill-climb)                           | 0 to +2 bp vs equal weights                                                | Medium (nested hill-climb 0.961643 < LR stack, bansal1600 PR#4)                        | Low          | Medium (weight overfit)           |
+| Concentration penalty / max-weight cap                                          | Variance ↓, mean ≈ 0                                                       | Medium–high                                                                            | Low          | Low                               |
+| GBDT meta-learner (depth 2, minimal features)                                   | ~0 to +1 bp                                                                | Low (CatBoost added ~0 to ayman-43 stack)                                              | Medium       | High (leakage/size-shift bugs)    |
+| Extra meta-features (std, spread, pairwise, interactions)                       | ~0, likely redundant                                                       | Low–medium                                                                             | Low          | Medium (meta-overfit)             |
+| 10-fold vs 5-fold (matched seeds)                                               | ≤ +1 bp OOF realism; LB unclear                                            | Low (no public evidence)                                                               | 2× inner-OOF | Medium                            |
+| **Flight-Distance label-free group stats (+ original-data satisfaction rates)** | **+20 bp single-model (0.95874 → 0.96071, ChrisLegge)**                    | **High (community, reproduced in repo)**                                               | Medium       | Low (keep label-free & fold-safe) |
+| Original ~130k real dataset as training augmentation                            | Several bp (multiple repos adopt)                                          | Medium–high (check competition rules permit external data — Playground typically does) | Medium       | Low–medium (row-mix validation)   |
+| Aux "expected-rating" features                                                  | +0.9 bp per tree model (ayman-43); larger for NN members (excluded for us) | Medium                                                                                 | Medium       | Low                               |
+| Seed averaging per arm (3–5 seeds)                                              | +0.3 bp (ChrisLegge)                                                       | Medium                                                                                 | 3–5× per arm | None                              |
+| Any postprocessing of the final score (clip/quantile/smooth)                    | 0 by theorem; ≤ 0 with ties                                                | High (mathematical)                                                                    | Trivial      | Negative-only                     |
+| Repeated method selection on the same OOF (anti-pattern)                        | Inflates OOF, not LB                                                       | High (wozhenshiliudada validation-boundary notes)                                      | —            | High — forbid by protocol         |
+
+**Strategic read:** rows 1–4 and the last three cost almost nothing and should all be done. Row 8 (feature engineering) is the only row with a documented 10+ bp effect size and is where the 0.96243+ ambition must be pursued. Rows 5–7 are cheap-to-moderate hypotheses with near-zero public evidence of gain in _this_ competition; run them inside the nested harness and keep them only on outer-fold wins.
+
+## 9. Execution plan
+
+**Order of repository changes and experiments** (each step gated on the previous):
+
+1. **Instrument the existing pipeline** (before touching any model): persist fold indices (`folds.parquet` keyed by row id); assert OOF coverage and id alignment (Section 10 harness); recompute pairwise OOF Spearman/Pearson on identical rows; log per-arm OOF AUC and leave-one-out blend deltas. This reproduces the 0.96128 baseline in a checkable form (Phase 1/2).
+2. **Adversarial-validation re-audit** with the _current engineered features_, deep + shallow GBDT, id columns dropped; record AUC per feature set (Phase 2).
+3. **Blend baseline ladder** (Phase 3): equal-weight prob / logit / rank blends of the existing arms on the same OOF rows; table of per-arm AUC, blend AUC, and pairwise correlations.
+4. **Constrained optimization** (Phase 4): grid → hill-climb → SLSQP/NM-softmax with λ ∈ {0, 1e-4, 1e-3} and max_weight ∈ {0.4, 0.5}; bootstrap + fold weight stability; select on inner-OOF, score on one held-out outer fold before any LB submission.
+5. **Member-strength work** (highest ROI, run in parallel): Flight-Distance label-free group statistics + original-dataset satisfaction rates; original-data row augmentation; aux expected-rating features — each inside fold-safe, label-free-of-test construction, measured as single-arm OOF deltas first (Phase 3.5 — this is the +20 bp row).
+6. **GBDT stacking A/B** (Phase 5): meta-LGBM (Section 4 config) on {p}, {p, logit} blocks, nested outer validation, size-matched refits; adopt only if mean outer AUC beats the best blend by more than outer-fold spread.
+7. **5 vs 10-fold matched A/B** (Phase 6): on the winner of steps 4–6; adopt 10-fold only on a matched-seed outer win.
+8. **Postprocessing audit** (Phase 7): verify AUC invariance empirically (assert |ΔAUC| < 1e-12 under logit and rank maps of the final score); apply only the ε-clipping safety policy; no LB submissions for postprocessing.
+9. **Final refit & submission** (Phase 8): regenerate all arms under the chosen production architecture (fold models, matched training fraction), refit the combiner on full-OOF with the frozen hyperparameters/λ from step 4/6, validate schema, save artifacts, submit once; treat the LB delta as a diagnostic, not a tuning signal.
+
+## 10. Reproducibility checklist
+
+**Artifacts to persist for every experiment:** fold indices (by row id + seed + K); per-arm OOF prediction arrays (`.npy` + sha256); per-arm fold-model test predictions; meta-feature matrices; fitted blend weights (per outer fold + final); meta-model checkpoints; configs (exact dicts, incl. seeds and package versions: `lightgbm.__version__`, `xgboost.__version__`, `catboost.__version__`, sklearn, scipy); a JSON experiment log entry (name → {OOF AUC, per-fold AUCs, weights, wall-clock, peak RSS, commit hash}).
+
+**Leakage assertions (hard-fail, run in CI for every training job):**
+
+```python
+import numpy as np, pandas as pd
+
+def assert_oof_sanity(oof: np.ndarray, y: np.ndarray, fold_ids: pd.Series,
+                      train_ids: pd.Series, name: str):
+    assert oof.shape[0] == len(y) == len(fold_ids), f"{name}: row count mismatch"
+    assert np.isfinite(oof).all(), f"{name}: non-finite OOF values"
+    assert ((oof > 0) & (oof < 1)).all() or ((oof >= 0) & (oof <= 1)).all(), \
+        f"{name}: predictions outside [0,1]"
+    covered = pd.Series(np.arange(len(y))).groupby(fold_ids.values).size()
+    assert (covered > 0).all(), f"{name}: fold with zero OOF coverage"
+    assert fold_ids.index.equals(train_ids.index), f"{name}: id misalignment"
+    # in-sample substitution detector: OOF AUC dramatically above the same
+    # model's holdout AUC (> 0.02) indicates leaked in-sample predictions
+    return True
+
+def assert_submission(path, test_ids, n_expected):
+    sub = pd.read_csv(path)
+    assert list(sub.columns) == ["id", "satisfaction"], "schema"
+    assert len(sub) == n_expected, "row count"
+    assert sub["id"].equals(test_ids), "id order/content"
+    assert sub["satisfaction"].between(0, 1).all(), "probabilities in [0,1]"
+    assert sub["satisfaction"].nunique() > n_expected * 0.9, "tie explosion"
+    return True
+```
+
+**Submission discipline:** one submission per validated procedure; log every submission (message → LB score → which experiment it instantiates); never iterate weights against LB deltas (rule 6).
+
+**Package/version pinning:** record exact versions at run time; LightGBM `feature_fraction` vs `colsample_bytree` alias behavior differs across API paths ([LightGBM docs](https://lightgbm.readthedocs.io/en/latest/Parameters.html), [issue #1011](https://github.com/Microsoft/LightGBM/issues/1011)) — assert the chosen subsampling is actually active (inspect `model.feature_importances_` variance or LightGBM logs) in the first run of each config.
 
 ---
 
-### 4.5 Experiment matrix
+## Open questions
 
-| Priority | Experiment                                                    | Method                                      | Expected information gain                        | Cost             | Success criterion                                         |
-| -------- | ------------------------------------------------------------- | ------------------------------------------- | ------------------------------------------------ | ---------------- | --------------------------------------------------------- |
-| 1        | Category-mapping + schema audit; submission-integrity harness | Assertions A1–A6, blocking                  | Highest: directly tests the stated inversion     | ~1 day eng.      | all assertions pass; resubmitted LB within ~0.0007 of OOF |
-| 2        | Reproduce current OOF + test predictions end-to-end           | re-run from saved models                    | Confirms/denies reproducibility defect           | ~0.5 day compute | Spearman(re-run, submitted) ≥ 0.999                       |
-| 3        | Equal-weight baselines: probability, logit, rank              | pooled OOF AUC per candidate on same rows   | Establishes the blend ceiling vs. best single    | ~minutes         | recorded; rank-vs-prob Δ noted                            |
-| 4        | Cross-fold near-duplicate census                              | feature-tuple hashing train↔test, fold↔fold | Quantifies OOF optimism component                | ~1 day           | dup-rate table; gap explanation updated                   |
-| 5        | Constrained rank-weight search (grid + Dirichlet + polish)    | §4.3.3, selection folds 1–3, confirm 4–5    | Whether optimization beats equal weights, safely | ~hours           | confirmation Δ ≥ +0.0002, N_eff stable                    |
-| 6        | Probability & logit constrained search (same protocol)        | same as 5, different spaces                 | Space sensitivity of optimal weights             | ~hours           | same rule, compared on same rows                          |
-| 7        | Shallow LGBM meta-learner, ablation A1–A6                     | §4.4.2–4.4.4                                | Whether conditional-error structure exists       | ~1–2 days        | decision rule §4.4.6                                      |
-| 8        | CatBoost meta-learner                                         | only if 7 credible                          | Cross-family check of stacking gain              | ~1 day           | same rule                                                 |
-| 9        | Transductive rank reference A/B                               | §4.2.3 option 2                             | Whether combined-population ranks help           | ~hours           | confirmed Δ ≥ +0.0002; else keep fixed reference          |
-| 10       | Repeated cross-fitting / seed variance for OOF                | repeat 3 seeds                              | OOF variance estimate; noise floor               | ~days GPU        | only if Tier-1 gap persists unexplained                   |
+1. Does the current pipeline's OOF-to-LB gap (−5.2 bp) decompose into LB sampling noise vs selection bias? Run the decomposition: LB noise is estimable from the public-private split fraction and AUC variance formulas; residual = selection. Not yet done for our ensemble.
+2. Do the four GBDT arms differ enough _in features or hyperparameters_ to carry any incremental signal once Flight-Distance and route features are added? (Community evidence says nearly no; our own arms must be re-measured after step 5 of the plan.)
+3. Does the meta-learner input distribution shift (inner-OOF vs production fold-model predictions) measurably exist here? KS-test per arm on one outer fold; if D < 0.05, size-matching is unnecessary.
+4. Is 0.96243+ reachable GBDT-only at all on this dataset, or does it require the NN/TabPFN members that dominate the current public top? Public evidence currently bounds the GBDT-only frontier near ~0.9618–0.9620. Unknown; do not plan on it.
+5. Competition rules: confirm external use of the original ~130k "Airline Passenger Satisfaction" dataset is permitted this season before step 5 (Playground rules have historically allowed it, but verify on the rules page for S6E10).
 
-Add no candidate that does not answer a distinct research question.
+## Source notes
 
----
+| Source                                                                                                                                                                                                   | Credibility | Last updated            |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- | ----------------------- |
+| [Kaggle — Predicting Airline Satisfaction (official competition page)](https://www.kaggle.com/competitions/playground-series-s6e10)                                                                      | 5/5         | 2026 (live competition) |
+| [Kaggle — S6E10 public code listing (notebook LB scores, stack-experiment titles)](https://www.kaggle.com/competitions/playground-series-s6e10/code)                                                     | 4/5         | 2026-10-11              |
+| [ayman-43/-kaggle-s6e10-airline-satisfaction (LB 0.96140, CV 0.96175, LR stack on OOF logits, CatBoost-null ablation)](https://github.com/ayman-43/-kaggle-s6e10-airline-satisfaction)                   | 3/5         | 2026-10-10              |
+| [bansal1600/kaggle-airline-prediction PR #2, #4–#7 (nested-CV LR stacker, hill-climb 0.961643 < LR stack, member ablations, LB 0.96161)](https://github.com/bansal1600/kaggle-airline-prediction/pull/6) | 3/5         | 2026-10                 |
+| [ChrisLegge/kaggleAirlineSatisfaction (Flight-Distance stats 0.95874→0.96071, aux-feature and seed-averaging ablations)](https://github.com/ChrisLegge/kaggleAirlineSatisfaction)                        | 3/5         | 2026-10                 |
+| [aditbytes/kaggle-s6e10-airline-satisfaction (top-100 LB at 0.96150 on 2026-10-05; CV–LB within 0.0006; <2% feature-mean drift)](https://github.com/aditbytes/kaggle-s6e10-airline-satisfaction)         | 3/5         | 2026-10-05              |
+| [wozhenshiliudada/kaggle-airline-satisfaction-s6e10 (10-fold members, best 0.96132, explicit validation-boundary caveats)](https://github.com/wozhenshiliudada/kaggle-airline-satisfaction-s6e10)        | 3/5         | 2026-10                 |
+| [mrjohnsonsea/playground-series-s6e10 (untuned XGB 5-fold CV 0.9585 ± 0.0004 baseline)](https://github.com/mrjohnsonsea/playground-series-s6e10)                                                         | 3/5         | 2026-10                 |
+| [BSergey2000/kaggle-airline (OOF 0.9591 vs LB 0.9584 decay example)](https://github.com/BSergey2000/kaggle-airline)                                                                                      | 3/5         | 2026-10                 |
+| [ALPHAMAN-0/Prediction_Airline_Satisfaction (Caruana hill-climb + rank-average safe-submission pattern)](https://github.com/ALPHAMAN-0/Prediction_Airline_Satisfaction)                                  | 3/5         | 2026-10                 |
+| [LightGBM official parameter documentation (feature_fraction, aliases, num_leaves/max_depth)](https://lightgbm.readthedocs.io/en/latest/Parameters.html)                                                 | 5/5         | 2026                    |
+| [XGBoost official parameter documentation (colsample_* cumulative semantics)](https://xgboost.readthedocs.io/en/stable/parameter.html)                                                                   | 5/5         | 2026                    |
+| [CatBoost official parameter-tuning documentation (depth, l2_leaf_reg, overfitting detector)](https://catboost.ai/docs/en/concepts/parameter-tuning)                                                     | 5/5         | 2026                    |
+| [microsoft/LightGBM issue #1011 (colsample_bytree silently ignored in some API paths)](https://github.com/Microsoft/LightGBM/issues/1011)                                                                | 4/5         | -                       |
+| [Caruana et al. 2004 — Ensemble Selection from Libraries of Models](https://www.cs.cornell.edu/~alexn/papers/shotgun.icml04.revised.rev2.pdf)                                                            | 5/5         | 2004                    |
+| [Kaggle general/18793 — Cross-validation strategy when blending/stacking](https://www.kaggle.com/general/18793)                                                                                          | 4/5         | -                       |
+| [CrossValidated 239445 — How to properly do stacking with cross-validation](https://stats.stackexchange.com/questions/239445/how-to-properly-do-stacking-meta-ensembling-with-cross-validation)          | 4/5         | -                       |
+| [FastML — Adversarial validation, part one](https://fastml.com/adversarial-validation-part-one/)                                                                                                         | 4/5         | -                       |
+| [Matt-OP/hillclimbers (rank-based Caruana hill-climbing module)](https://github.com/Matt-OP/hillclimbers)                                                                                                | 3/5         | -                       |
 
-## 5. Source Notes
-
-| Source                                                                                                                                                                                                    | Credibility | Last updated       |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- | ------------------ |
-| [Kaggle Playground Series S6E10 — Predicting Airline Satisfaction (overview & evaluation)](https://www.kaggle.com/competitions/playground-series-s6e10)                                                   | 5/5         | 2026               |
-| [Kaggle S6E10 — Data page (synthetic data provenance)](https://www.kaggle.com/competitions/playground-series-s6e10/data)                                                                                  | 5/5         | 2026               |
-| [scikit-learn — roc_auc_score](https://scikit-learn.org/stable/modules/generated/sklearn.metrics.roc_auc_score.html)                                                                                      | 5/5         | 2026 (v1.9.1 docs) |
-| [scikit-learn — Metrics and scoring (AUC semantics)](https://scikit-learn.org/stable/modules/model_evaluation.html)                                                                                       | 5/5         | 2026 (v1.9.1 docs) |
-| [scikit-learn — Probability calibration](https://scikit-learn.org/stable/modules/calibration.html)                                                                                                        | 5/5         | 2026 (v1.9.1 docs) |
-| [scikit-learn GitHub issue #16321 — isotonic calibration changes rank-based metrics](https://github.com/scikit-learn/scikit-learn/issues/16321)                                                           | 4/5         | -                  |
-| [LightGBM — Parameters](https://lightgbm.readthedocs.io/en/latest/Parameters.html)                                                                                                                        | 5/5         | 2026 (v4.7 docs)   |
-| [LightGBM — Parameter Tuning (leaf-wise overfitting, num_leaves, min_data_in_leaf)](https://lightgbm.readthedocs.io/en/latest/Parameters-Tuning.html)                                                     | 5/5         | 2026 (v4.7 docs)   |
-| [CatBoost — Overfitting detector](https://catboost.ai/docs/en/features/overfitting-detector-desc)                                                                                                         | 5/5         | 2026               |
-| [CatBoost — Parameter tuning](https://catboost.ai/docs/en/concepts/parameter-tuning)                                                                                                                      | 5/5         | 2026               |
-| [SciPy — minimize(method='Nelder-Mead') (bounds support, no simplex constraint)](https://docs.scipy.org/doc/scipy/reference/optimize.minimize-neldermead.html)                                            | 5/5         | 2026 (v1.18 docs)  |
-| [Cross Validated — How to properly do stacking/meta-ensembling with cross-validation](https://stats.stackexchange.com/questions/239445/how-to-properly-do-stacking-meta-ensembling-with-cross-validation) | 3/5         | -                  |
-| [aditbytes/kaggle-s6e10-airline-satisfaction (CV–LB agreement ~0.0006; feature AUCs; no train/test drift)](https://github.com/aditbytes/kaggle-s6e10-airline-satisfaction)                                | 3/5         | 2026-10-05         |
-| [ChrisLegge/kaggleAirlineSatisfaction (LightGBM 0.95874→0.96071 with group statistics)](https://github.com/ChrisLegge/kaggleAirlineSatisfaction)                                                          | 3/5         | 2026               |
-| [jamesidriss/airline_S6E10 (rules summary: 10 subs/day, external data allowed, deadline 2026-10-31)](https://github.com/jamesidriss/airline_S6E10)                                                        | 3/5         | 2026-10            |
-| [Airline Passenger Satisfaction — original dataset](https://www.kaggle.com/datasets/teejmahal20/airline-passenger-satisfaction)                                                                           | 4/5         | -                  |
-
-**Conflicts and caveats.** (1) The claimed "public LB best 0.96243" and the reported "OOF 0.96126 / LB 0.95975" figures come from the campaign's own reports and could not be verified against the live leaderboard here. (2) Community repositories (3/5 credibility) are single-team evidence; the ~0.0006 CV–LB agreement claim is one team's observation, not a leaderboard statistic. (3) The AUC standard error used in §2/§4.1 is a large-sample (Hanley–McNeil–style) approximation; exact variance depends on the score distribution shape. (4) Class prevalence ~55% is taken from the original dataset lineage [H] and must be measured on the actual S6E10 train file. (5) The near-duplicate mechanism (§4.1.4) is a hypothesis grounded in the 700k-from-130k synthesis; the duplication rate is measurable but was not measured here.
-
----
-
-## 6. Open Questions
-
-1. **Which category was inverted, and did the inversion change the test ranking?** Requires the repo's saved encoders and the submitted vector; the Spearman(re-run, submitted) ≥ 0.999 test (§4.1.1) settles it.
-2. **What is the actual cross-fold vs. train↔test near-duplicate rate?** Determines how much of the 0.00151 gap is structural OOF optimism rather than a bug.
-3. **What are the base models' pairwise Pearson/Spearman correlations and per-fold AUCs?** The blending-gain ceiling (Executive Summary point 3) is an estimate until measured; if some pair has ρ < 0.97, blending upside is larger than assumed.
-4. **Were OOF predictions generated with fold-specific or full-data target encodings?** If full-data, OOF is contaminated and all pooled-OOF comparisons in this report are slightly optimistic.
-5. **Is fold-ensemble (fold-averaged) inference affordable at submission time?** Determines whether the meta-learner's OOF/test mismatch mitigation (§4.4.2 option 1) is available.
-6. **Does the test score-distribution shift persist after the inversion fix?** If yes with a verified-clean pipeline, a genuine conditional-distribution difference between synthetic train and test is implied — a much harder problem.
-
----
-
-## 7. Recommendations / Next Steps
-
-**Single best next experiment (Tier 1, one week):**
-Fix and verify the categorical pipeline, then resubmit _the same ensemble_ unchanged.
-
-- **Exact changes:** implement assertions A1–A6 as blocking checks in the submission path; persist one category mapping used by every fold, refit, and inference path; rebuild test predictions from saved fold models; regenerate the submission; log Spearman(old submission, new submission).
-- **Evidence to retain the "inversion explains the gap" hypothesis:** new LB score within ~0.0007 of OOF 0.96126, or Spearman(old, new) materially < 1 with the new vector scoring higher.
-- **Rejection condition:** new LB unchanged (±0.0002) → the inversion did not materially affect ranking; move to the duplicate census (experiment 4) and distribution diagnostics before any blending work.
-- **Next experiment either way:** Tier 2 — equal-weight rank/probability/logit baselines (experiment 3), then the constrained coarse simplex search with the fold-1–3 selection / fold-4–5 confirmation protocol (experiments 5–6). Adopt optimized weights only on confirmation Δ ≥ +0.0002 with stable N_eff; otherwise ship the equal-weight rank blend.
-- **Then, only if Tiers 1–2 leave budget:** the shallow LGBM meta-learner ablation (experiment 7) under the §4.4.6 decision rule; the CatBoost meta-learner (experiment 8) only if 7 is credible.
-
-**Standing principles for this campaign:** calibration is never the LB-AUC fix; equal weights are the null hypothesis any optimizer must beat out-of-sample; the meta-learner must beat the _blend_, not just the best single model; and no weight vector or meta-config is adopted on pooled-OOF evidence alone — it must survive a confirmation fold that never participated in selection.
+**Conflicts and caveats.** (1) Self-reported repo scores are not independently verified; treat all community bp figures as directional. (2) The Kaggle notebook titles "S6E10: 10 OOF members lose 0.000245 AUC" and "S6E10: Can the Leaderboard See a Stack Gain?" were confirmed via the code listing but not read in full; they are consistent with the stacking-skepticism above but should be opened and read during Phase 1. (3) Public top notebooks include RealMLP/TabPFN members; their scores are not evidence that GBDT-only can reach 0.96243+. (4) Adversarial-validation literature uniformly notes AUC ≈ 0.5 is necessary-but-not-sufficient evidence of distributional identity.

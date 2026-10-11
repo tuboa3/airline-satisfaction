@@ -10,7 +10,7 @@ Usage:
 import argparse
 import sys
 
-from src.config import FeatureConfig, PathConfig
+from src.config import FeatureConfig, PathConfig, TrainConfig
 from src.dataset import DatasetIngestion
 from src.ensemble import EnsembleOptimizer
 from src.postprocess import ExactMatchPostprocessor
@@ -52,8 +52,9 @@ def main():
 
     paths = PathConfig(raw_dir=args.data_dir, original_path=args.original_path) if (args.data_dir or args.original_path) else PathConfig()
     feature_cfg = FeatureConfig()
+    train_cfg = TrainConfig()
 
-    optimizer = EnsembleOptimizer(paths=paths, feature_cfg=feature_cfg)
+    optimizer = EnsembleOptimizer(paths=paths, feature_cfg=feature_cfg, train_cfg=train_cfg)
     champ_oof, best_auc, champ_test = optimizer.run_all(chosen_method=args.method)
 
     # Optional: Exact match test leakage mining if original dataset is available

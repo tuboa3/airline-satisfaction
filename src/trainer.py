@@ -387,6 +387,8 @@ class CrossValidationEngine:
 
         canonical_map = {
             "lgbm": "lightgbm",
+            "lgb_xt": "lightgbm_xt",
+            "extra_trees": "lightgbm_xt",
             "cb": "catboost",
             "cat": "catboost",
             "xgb": "xgboost",
