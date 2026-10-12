@@ -349,6 +349,11 @@ class DatasetIngestion:
                             "Raw rows will NOT be concatenated into training folds (purged per Topic #745098 & #745932)."
                         )
                         train_synth["sample_weight"] = 1.0
+
+                        if self.train_cfg.use_pseudo_labels:
+                            train_synth, sample_weights = self._ingest_pseudo_labels(train_synth)
+                            return train_synth, test_synth, sample_weights, orig_df_raw
+
                         sample_weights = np.ones(len(train_synth), dtype=np.float32)
                         return train_synth, test_synth, sample_weights, orig_df_raw
 
@@ -375,6 +380,10 @@ class DatasetIngestion:
                         [train_synth[common_cols], orig_df[common_cols]], axis=0
                     ).reset_index(drop=True)
 
+                    if self.train_cfg.use_pseudo_labels:
+                        unified_train, sample_weights = self._ingest_pseudo_labels(unified_train)
+                        return unified_train, test_synth, sample_weights, orig_df_raw
+
                     sample_weights = unified_train["sample_weight"].values.astype(
                         np.float32
                     )
@@ -390,5 +399,64 @@ class DatasetIngestion:
             self.logger.info(
                 f"Training with synthetic dataset only: {len(train_synth)} rows."
             )
+            train_synth["sample_weight"] = 1.0
+            if self.train_cfg.use_pseudo_labels:
+                train_synth, sample_weights = self._ingest_pseudo_labels(train_synth)
+                return train_synth, test_synth, sample_weights, None
+
             sample_weights = np.ones(len(train_synth), dtype=np.float32)
             return train_synth, test_synth, sample_weights, None
+
+    def _ingest_pseudo_labels(
+        self, train_df: pd.DataFrame
+    ) -> tuple[pd.DataFrame, np.ndarray]:
+        """
+        Ingests high-confidence consensus pseudo-labeled test rows,
+        marks provenance as 'is_original=2', and concatenates with training set.
+        """
+        pseudo_path = self.train_cfg.pseudo_labels_path
+        if not pseudo_path:
+            candidates = [
+                "data/pseudo_labeled_test.csv",
+                "/kaggle/input/pseudo_labeled_test.csv",
+                "/kaggle/working/data/pseudo_labeled_test.csv",
+                "../data/pseudo_labeled_test.csv",
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    pseudo_path = c
+                    break
+
+        if not pseudo_path or not os.path.exists(pseudo_path):
+            self.logger.warning(
+                f"Pseudo-labels requested but file not found at '{pseudo_path}'. Proceeding without pseudo-labels."
+            )
+            sample_weights = train_df["sample_weight"].values.astype(np.float32) if "sample_weight" in train_df.columns else np.ones(len(train_df), dtype=np.float32)
+            return train_df, sample_weights
+
+        self.logger.info(f"Ingesting consensus pseudo-labels from: '{pseudo_path}'...")
+        pseudo_df = pd.read_csv(pseudo_path)
+        pseudo_df = self._standardize_columns(pseudo_df, is_original=True)
+        if self.feature_cfg.id_col in pseudo_df.columns:
+            pseudo_df = pseudo_df.drop(columns=[self.feature_cfg.id_col])
+
+        pseudo_df["is_original"] = 2
+        if "sample_weight" not in pseudo_df.columns:
+            pseudo_df["sample_weight"] = self.train_cfg.pseudo_sample_weight
+
+        if "sample_weight" not in train_df.columns:
+            train_df["sample_weight"] = 1.0
+
+        common_cols = [c for c in train_df.columns if c in pseudo_df.columns]
+        augmented_train = pd.concat(
+            [train_df[common_cols], pseudo_df[common_cols]], axis=0
+        ).reset_index(drop=True)
+
+        sample_weights = augmented_train["sample_weight"].values.astype(np.float32)
+        augmented_train = augmented_train.drop(columns=["sample_weight"])
+
+        self.logger.info(
+            f"Consensus Pseudo-Labels successfully ingested: {len(pseudo_df):,} test rows. "
+            f"Augmented Training Set total: {len(augmented_train):,} rows."
+        )
+        return augmented_train, sample_weights

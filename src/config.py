@@ -225,6 +225,11 @@ class TrainConfig:
     density_ratio_clip_min: float = 0.05
     density_ratio_clip_max: float = 3.0
 
+    # Domain 2: Transductive Consensus Pseudo-Labeling Settings
+    use_pseudo_labels: bool = False
+    pseudo_labels_path: str = ""
+    pseudo_sample_weight: float = 0.60
+
     # GLM Margin Residual Boosting (Disabled for pure GBDT-only mandate)
     use_glm_margin: bool = False
     glm_params: dict[str, Any] = field(

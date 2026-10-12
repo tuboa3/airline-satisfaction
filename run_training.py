@@ -100,6 +100,24 @@ def parse_args():
         help="Concatenate raw original rows into training folds (default: False, purged due to covariate shift)"
     )
     parser.add_argument(
+        "--use_pseudo_labels",
+        action="store_true",
+        default=False,
+        help="Augment training folds with high-confidence consensus pseudo-labeled test rows"
+    )
+    parser.add_argument(
+        "--pseudo_path",
+        type=str,
+        default="",
+        help="Path to pseudo_labeled_test.csv (default: auto-detect)"
+    )
+    parser.add_argument(
+        "--pseudo_weight",
+        type=float,
+        default=0.60,
+        help="Sample weight for pseudo-labeled rows (default: 0.60)"
+    )
+    parser.add_argument(
         "--use_glm_margin",
         action="store_true",
         default=False,
@@ -120,6 +138,9 @@ def main():
         use_original_data=args.use_original_data,
         original_sample_weight=args.original_weight,
         use_density_ratio_weighting=args.density_ratio,
+        use_pseudo_labels=args.use_pseudo_labels,
+        pseudo_labels_path=args.pseudo_path,
+        pseudo_sample_weight=args.pseudo_weight,
         use_glm_margin=args.use_glm_margin,
     )
 
