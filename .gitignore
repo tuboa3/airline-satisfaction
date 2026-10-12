@@ -15,8 +15,12 @@ data/*
 !data/raw/
 data/raw/*
 !data/raw/airline_passenger_satisfaction.csv
+!data/pseudo_labeled_test.csv
 *.csv
 !data/raw/airline_passenger_satisfaction.csv
+!data/pseudo_labeled_test.csv
+!submission.csv
+!submissions/*.csv
 *.zip
 *.parquet
 *.feather
@@ -26,8 +30,8 @@ data/raw/*
 eda_figures/
 eda_outputs/
 models_checkpoints/
-submissions/
-outputs/
+!submissions/
+!outputs/
 catboost_info/
 scratch/
 *.pkl

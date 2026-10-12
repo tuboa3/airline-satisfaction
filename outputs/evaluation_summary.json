@@ -1,0 +1,63 @@
+{
+  "timestamp": "2026-10-12T07:10:51.661209",
+  "models_analyzed": {
+    "notebook_1_catboost": {
+      "notebook": "notebooks/airline-satisfaction.ipynb",
+      "archive": "notebooks/airline_satisfaction_outputs.zip",
+      "oof_auc": 0.9608259,
+      "features": 120,
+      "folds": 10
+    },
+    "notebook_2_rest_of_models": {
+      "notebook": "notebooks/airline-satisfaction (1).ipynb",
+      "archive": "notebooks/airline_satisfaction_outputs1.zip",
+      "models": {
+        "lightgbm": {
+          "oof_auc": 0.9611302,
+          "folds": 10
+        },
+        "lightgbm_xt": {
+          "oof_auc": 0.9608894,
+          "folds": 10
+        },
+        "xgboost": {
+          "oof_auc": 0.9609509,
+          "folds": 10
+        }
+      }
+    },
+    "scratch_koumei_models": {
+      "koumei_lightgbm": {
+        "oof_auc": 0.961103,
+        "folds": 5
+      },
+      "koumei_xgboost": {
+        "oof_auc": 0.96115,
+        "folds": 5
+      }
+    }
+  },
+  "standalone_auc": {
+    "catboost": 0.960826,
+    "lightgbm": 0.96113,
+    "lightgbm_xt": 0.960889,
+    "xgboost": 0.960951,
+    "koumei_lgb": 0.961103,
+    "koumei_xgb": 0.96115
+  },
+  "ensemble_benchmarks": {
+    "notebooks_4way_rank": 0.961305,
+    "champion_6way_rank": 0.96146,
+    "champion_6way_logit": 0.96146
+  },
+  "champion_weights": {
+    "catboost": 0.1231,
+    "lightgbm": 0.208,
+    "lightgbm_xt": 0.0828,
+    "xgboost": 0.1306,
+    "koumei_lgb": 0.2206,
+    "koumei_xgb": 0.2349
+  },
+  "exact_match_overrides": 4,
+  "final_submission": "submission.csv"
+}
