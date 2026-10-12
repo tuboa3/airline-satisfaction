@@ -60,7 +60,11 @@ class EnsembleOptimizer:
         test_df = pd.read_csv(self.paths.test_path)
         return test_df[self.feature_cfg.id_col].values
 
-    def discover_models(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    def discover_models(
+        self,
+        models: list[str] | None = None,
+        exclude_models: list[str] | None = None,
+    ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
         """Scans outputs directory dynamically for completed model OOF and test predictions."""
         available_models = {}
         canonical_map = {
@@ -92,6 +96,14 @@ class EnsembleOptimizer:
                         self.logger.info(
                             f"Discovered completed model outputs for: '{c_name}' (source file: '{fname}')"
                         )
+
+        # Apply filters
+        if models:
+            req_set = set(m.lower().strip() for m in models)
+            available_models = {k: v for k, v in available_models.items() if k in req_set}
+        if exclude_models:
+            exc_set = set(m.lower().strip() for m in exclude_models)
+            available_models = {k: v for k, v in available_models.items() if k not in exc_set}
 
         return available_models
 
@@ -708,12 +720,17 @@ class EnsembleOptimizer:
         auc = roc_auc_score(y_true, oof_meta_preds)
         return oof_meta_preds, auc, test_meta_preds
 
-    def run_all(self, chosen_method: str = "auto") -> tuple[np.ndarray, float, np.ndarray]:
+    def run_all(
+        self,
+        chosen_method: str = "auto",
+        models: list[str] | None = None,
+        exclude_models: list[str] | None = None,
+    ) -> tuple[np.ndarray, float, np.ndarray]:
         """
         Executes all ensembling paradigms, compares their out-of-fold performance,
         selects the optimal submission, and logs rigorous diagnostic metrics.
         """
-        models_dict = self.discover_models()
+        models_dict = self.discover_models(models=models, exclude_models=exclude_models)
         if not models_dict:
             raise FileNotFoundError(
                 f"No model predictions found in '{self.paths.output_dir}'. "

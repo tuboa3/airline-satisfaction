@@ -143,6 +143,24 @@ All 5 standalone models trained successfully on Kaggle Dual-T4:
 
 ---
 
+### Milestone 7: 3-GBDT Nelder-Mead Logit & Rank Ensembling (Excluding CatBoost)
+- **Architectural Scope:** Optimization across the 3 core GBDT models (LightGBM, LightGBM Extra-Trees, XGBoost), decoupling from CatBoost per user execution plan.
+- **Standalone 10-Fold OOF Baselines:**
+  - `lightgbm`: `0.961371`
+  - `lightgbm_xt`: `0.961163`
+  - `xgboost`: `0.961198`
+- **Nelder-Mead Logit Blend (Champion):** **`0.96162` OOF ROC-AUC**
+  - Optimal Weights: LightGBM = `50.15%`, LightGBM XT = `30.68%`, XGBoost = `19.17%`.
+- **Nelder-Mead Rank Blend:** **`0.96149` OOF ROC-AUC**
+  - Optimal Weights: LightGBM = `50.96%`, LightGBM XT = `30.35%`, XGBoost = `18.69%`.
+- **Direct Probability Simplex Blend:** **`0.96149` OOF ROC-AUC**
+  - Optimal Weights: LightGBM = `54.88%`, LightGBM XT = `25.90%`, XGBoost = `19.22%`.
+- **Shallow GBDT Meta-Learner:** `0.96145` OOF ROC-AUC.
+- **Post-Processing:** Applied 4 deterministic exact ground-truth matches from the original host dataset (IDs 777614, 844397, 869547 -> `0.9999`; ID 891259 -> `0.0001`).
+- **Pipeline Upgrades:** Added `--models` and `--exclude_models` flags to both `run_ensemble.py` and `generate_pseudo_labels.py` for flexible model subsets.
+
+---
+
 ### Milestone 7: Multi-View 3-GBDT Architecture for True Error Diversity (Target >0.96244)
 - **Root-Cause Analysis of Phase 4 Plateau (0.96108 OOF / 0.96043 LB):**
   - High collinearity ($r > 0.9988$) between CatBoost, LightGBM, and XGBoost when trained on an identical unified feature matrix caused near-zero ensemble variance reduction.

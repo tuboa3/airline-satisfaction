@@ -27,6 +27,18 @@ def parse_args():
         help="Ensemble strategy: 'auto' (selects highest GBDT OOF ROC-AUC), 'rank' (rank-averaging blend), 'prob' (direct probability blend), 'logit' (bounded Nelder-Mead logit blend), 'gbdt_meta' / 'gbdt_stack' (shallow LightGBM meta-learner)"
     )
     parser.add_argument(
+        "--models",
+        type=str,
+        default="",
+        help="Comma-separated list of models to include (e.g. 'lightgbm,lightgbm_xt,xgboost')"
+    )
+    parser.add_argument(
+        "--exclude_models",
+        type=str,
+        default="",
+        help="Comma-separated list of models to exclude from ensembling (e.g. 'catboost')"
+    )
+    parser.add_argument(
         "--data_dir",
         type=str,
         default="",
@@ -54,8 +66,15 @@ def main():
     feature_cfg = FeatureConfig()
     train_cfg = TrainConfig()
 
+    models_list = [m.strip() for m in args.models.split(",") if m.strip()] if args.models else None
+    exclude_list = [m.strip() for m in args.exclude_models.split(",") if m.strip()] if args.exclude_models else None
+
     optimizer = EnsembleOptimizer(paths=paths, feature_cfg=feature_cfg, train_cfg=train_cfg)
-    champ_oof, best_auc, champ_test = optimizer.run_all(chosen_method=args.method)
+    champ_oof, best_auc, champ_test = optimizer.run_all(
+        chosen_method=args.method,
+        models=models_list,
+        exclude_models=exclude_list,
+    )
 
     # Optional: Exact match test leakage mining if original dataset is available
     if not args.skip_leak_override:

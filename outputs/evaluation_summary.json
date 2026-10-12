@@ -1,63 +1,54 @@
 {
-  "timestamp": "2026-10-12T07:10:51.661209",
-  "models_analyzed": {
-    "notebook_1_catboost": {
-      "notebook": "notebooks/airline-satisfaction.ipynb",
-      "archive": "notebooks/airline_satisfaction_outputs.zip",
-      "oof_auc": 0.9608259,
-      "features": 120,
-      "folds": 10
+  "timestamp": "2026-10-12T09:59:54.378625",
+  "standalone_auc": {
+    "catboost": 0.9608259028394371,
+    "lightgbm": 0.9613713128252638,
+    "lightgbm_xt": 0.9611630418802306,
+    "xgboost": 0.9611981869953824
+  },
+  "ensemble_auc": {
+    "rank": 0.9614981863629773,
+    "logit": 0.9616256511331545
+  },
+  "champion": "rank",
+  "weights": {
+    "rank": {
+      "catboost": 0.12220705814542121,
+      "lightgbm": 0.45335789100182144,
+      "lightgbm_xt": 0.2607313224020911,
+      "xgboost": 0.16370372845066614
     },
-    "notebook_2_rest_of_models": {
-      "notebook": "notebooks/airline-satisfaction (1).ipynb",
-      "archive": "notebooks/airline_satisfaction_outputs1.zip",
-      "models": {
-        "lightgbm": {
-          "oof_auc": 0.9611302,
-          "folds": 10
-        },
-        "lightgbm_xt": {
-          "oof_auc": 0.9608894,
-          "folds": 10
-        },
-        "xgboost": {
-          "oof_auc": 0.9609509,
-          "folds": 10
-        }
-      }
-    },
-    "scratch_koumei_models": {
-      "koumei_lightgbm": {
-        "oof_auc": 0.961103,
-        "folds": 5
-      },
-      "koumei_xgboost": {
-        "oof_auc": 0.96115,
-        "folds": 5
-      }
+    "logit": {
+      "catboost": 0.15646206004159743,
+      "lightgbm": 0.4516061766249441,
+      "lightgbm_xt": 0.24301827592403338,
+      "xgboost": 0.1489134874094251
     }
   },
-  "standalone_auc": {
-    "catboost": 0.960826,
-    "lightgbm": 0.96113,
-    "lightgbm_xt": 0.960889,
-    "xgboost": 0.960951,
-    "koumei_lgb": 0.961103,
-    "koumei_xgb": 0.96115
-  },
-  "ensemble_benchmarks": {
-    "notebooks_4way_rank": 0.961305,
-    "champion_6way_rank": 0.96146,
-    "champion_6way_logit": 0.96146
-  },
-  "champion_weights": {
-    "catboost": 0.1231,
-    "lightgbm": 0.208,
-    "lightgbm_xt": 0.0828,
-    "xgboost": 0.1306,
-    "koumei_lgb": 0.2206,
-    "koumei_xgb": 0.2349
-  },
-  "exact_match_overrides": 4,
-  "final_submission": "submission.csv"
+  "correlation_matrix": {
+    "catboost": {
+      "catboost": 1.0,
+      "lightgbm": 0.9985489030566157,
+      "lightgbm_xt": 0.9983001702373581,
+      "xgboost": 0.998475456860915
+    },
+    "lightgbm": {
+      "catboost": 0.9985489030566157,
+      "lightgbm": 0.9999999999999999,
+      "lightgbm_xt": 0.9984595037576861,
+      "xgboost": 0.9991383880360465
+    },
+    "lightgbm_xt": {
+      "catboost": 0.9983001702373581,
+      "lightgbm": 0.998459503757686,
+      "lightgbm_xt": 1.0,
+      "xgboost": 0.9988465312962779
+    },
+    "xgboost": {
+      "catboost": 0.998475456860915,
+      "lightgbm": 0.9991383880360465,
+      "lightgbm_xt": 0.998846531296278,
+      "xgboost": 1.0
+    }
+  }
 }

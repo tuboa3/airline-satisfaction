@@ -15,6 +15,18 @@ from src.utils import get_logger, timer
 def parse_args():
     parser = argparse.ArgumentParser(description="Consensus Pseudo-Label Generator")
     parser.add_argument(
+        "--models",
+        type=str,
+        default="",
+        help="Comma-separated list of models to include for consensus (default: all available)"
+    )
+    parser.add_argument(
+        "--exclude_models",
+        type=str,
+        default="",
+        help="Comma-separated list of models to exclude from consensus (e.g., 'catboost')"
+    )
+    parser.add_argument(
         "--pos_threshold",
         type=float,
         default=0.96,
@@ -59,49 +71,49 @@ def main():
     logger.info(f"Loaded test dataset: {N_test:,} rows from '{paths.test_path}'.")
 
     # 2. Discover model prediction files
-    pred_files = {
-        "catboost": os.path.join(paths.submissions_dir, "submission_catboost.csv"),
-        "lightgbm": os.path.join(paths.submissions_dir, "submission_lightgbm.csv"),
-        "lightgbm_xt": os.path.join(paths.submissions_dir, "submission_lightgbm_xt.csv"),
-        "xgboost": os.path.join(paths.submissions_dir, "submission_xgboost.csv"),
-    }
+    all_candidate_models = ["catboost", "lightgbm", "lightgbm_xt", "xgboost"]
+    if args.models:
+        candidate_models = [m.strip() for m in args.models.split(",") if m.strip()]
+    else:
+        candidate_models = all_candidate_models
+
+    if args.exclude_models:
+        excluded = set(m.strip() for m in args.exclude_models.split(",") if m.strip())
+        candidate_models = [m for m in candidate_models if m not in excluded]
 
     preds = {}
-    for name, fpath in pred_files.items():
-        if not os.path.exists(fpath):
-            # Check outputs/test_preds_*.npy as fallback
-            npy_path = os.path.join(paths.output_dir, f"test_preds_{name}.npy")
-            if os.path.exists(npy_path):
-                preds[name] = np.load(npy_path)
-                logger.info(f"Loaded '{name}' predictions from npy: '{npy_path}'")
-            else:
-                raise FileNotFoundError(f"Missing predictions for '{name}': {fpath} and {npy_path} not found.")
-        else:
+    for name in candidate_models:
+        fpath = os.path.join(paths.submissions_dir, f"submission_{name}.csv")
+        npy_path = os.path.join(paths.output_dir, f"test_preds_{name}.npy")
+        if os.path.exists(fpath):
             df = pd.read_csv(fpath)
             preds[name] = df[feature_cfg.target_col].values
             logger.info(f"Loaded '{name}' predictions from CSV: '{fpath}'")
+        elif os.path.exists(npy_path):
+            preds[name] = np.load(npy_path)
+            logger.info(f"Loaded '{name}' predictions from npy: '{npy_path}'")
+        else:
+            if args.models:
+                raise FileNotFoundError(f"Missing predictions for explicitly requested model '{name}'.")
+            else:
+                logger.warning(f"Prediction file for '{name}' not found; skipping from consensus.")
+
+    if len(preds) < 2:
+        raise ValueError(f"Need at least 2 models for consensus pseudo-labeling, but found only {len(preds)}: {list(preds.keys())}")
+
+    logger.info(f"Active models for consensus pseudo-labeling ({len(preds)}): {list(preds.keys())}")
 
     # 3. Compute Unanimous Consensus Mask
-    p_cb = preds["catboost"]
-    p_lgb = preds["lightgbm"]
-    p_xt = preds["lightgbm_xt"]
-    p_xgb = preds["xgboost"]
+    pos_consensus = np.ones(N_test, dtype=bool)
+    neg_consensus = np.ones(N_test, dtype=bool)
+    all_preds_list = []
 
-    p_ensemble_mean = (p_cb + p_lgb + p_xt + p_xgb) / 4.0
+    for name, p in preds.items():
+        pos_consensus &= (p >= args.pos_threshold)
+        neg_consensus &= (p <= args.neg_threshold)
+        all_preds_list.append(p)
 
-    pos_consensus = (
-        (p_cb >= args.pos_threshold)
-        & (p_lgb >= args.pos_threshold)
-        & (p_xt >= args.pos_threshold)
-        & (p_xgb >= args.pos_threshold)
-    )
-
-    neg_consensus = (
-        (p_cb <= args.neg_threshold)
-        & (p_lgb <= args.neg_threshold)
-        & (p_xt <= args.neg_threshold)
-        & (p_xgb <= args.neg_threshold)
-    )
+    p_ensemble_mean = np.mean(all_preds_list, axis=0)
 
     selected_mask = pos_consensus | neg_consensus
     N_selected = selected_mask.sum()
