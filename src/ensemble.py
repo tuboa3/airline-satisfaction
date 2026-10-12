@@ -765,52 +765,55 @@ class EnsembleOptimizer:
                 self.logger.info(f"  {col:<18}: {corr_str}")
             self.logger.info("-" * 70)
 
-        # 3. Strategy 1: Rank Averaging (Pure GBDT direct rank blend)
-        oof_rank, auc_rank, test_rank, w_rank = self.blend_rank(
-            model_names, oof_list, test_list, y_true
-        )
-        self.logger.info(f"Strategy 1 (Rank-Averaged Blend)        : OOF ROC-AUC = {auc_rank:.5f}")
-        for m, w in w_rank.items():
-            self.logger.info(f"    - Rank Weight for {m:<15}: {w:.4f}")
+        # 3. Strategy Execution
+        candidates = {}
 
-        # 4. Calibration & Logit Conversion
-        cal_oof_logits, cal_test_logits = self.calibrate_and_logit(models_dict, y_true)
+        run_rank = chosen_method in ["auto", "rank", "direct_rank"]
+        run_logit = chosen_method in ["auto", "logit"]
+        run_prob = chosen_method in ["auto", "prob", "probability"]
+        run_gbdt = chosen_method in ["auto", "gbdt_meta", "gbdt_stack", "gbdt"]
 
-        # 5. Strategy 2: Bounded Logit Blending (Nelder-Mead with Dirichlet Shrinkage)
-        oof_slsqp, auc_slsqp, test_slsqp, w_slsqp = self.blend_logit_slsqp(
-            model_names, cal_oof_logits, cal_test_logits, y_true
-        )
-        self.logger.info(f"Strategy 2 (Nelder-Mead Logit Blend)    : OOF ROC-AUC = {auc_slsqp:.5f}")
-        for m, w in w_slsqp.items():
-            self.logger.info(f"    - Logit Weight for {m:<14}: {w:.4f}")
+        # Strategy 1: Rank Averaging
+        if run_rank:
+            oof_rank, auc_rank, test_rank, w_rank = self.blend_rank(
+                model_names, oof_list, test_list, y_true
+            )
+            self.logger.info(f"Strategy 1 (Rank-Averaged Blend)        : OOF ROC-AUC = {auc_rank:.5f}")
+            for m, w in w_rank.items():
+                self.logger.info(f"    - Rank Weight for {m:<15}: {w:.4f}")
+            candidates["rank"] = (oof_rank, auc_rank, test_rank)
 
-        # 6. Strategy 3: Direct Probability Simplex Blend (Direct GBDT Probability Average)
-        oof_prob, auc_prob, test_prob, w_prob = self.blend_probability(
-            model_names, oof_list, test_list, y_true
-        )
-        self.logger.info(f"Strategy 3 (Direct Probability Blend)   : OOF ROC-AUC = {auc_prob:.5f}")
-        for m, w in w_prob.items():
-            self.logger.info(f"    - Prob Weight for {m:<15}: {w:.4f}")
+        # Strategy 2: Bounded Logit Blending
+        if run_logit:
+            cal_oof_logits, cal_test_logits = self.calibrate_and_logit(models_dict, y_true)
+            oof_slsqp, auc_slsqp, test_slsqp, w_slsqp = self.blend_logit_slsqp(
+                model_names, cal_oof_logits, cal_test_logits, y_true
+            )
+            self.logger.info(f"Strategy 2 (Nelder-Mead Logit Blend)    : OOF ROC-AUC = {auc_slsqp:.5f}")
+            for m, w in w_slsqp.items():
+                self.logger.info(f"    - Logit Weight for {m:<14}: {w:.4f}")
+            candidates["logit"] = (oof_slsqp, auc_slsqp, test_slsqp)
 
-        # 7. Strategy 4: Pure GBDT Meta-Learner Stacking (Shallow Regularized LightGBM)
-        if len(model_names) > 1:
+        # Strategy 3: Direct Probability Simplex Blend
+        if run_prob:
+            oof_prob, auc_prob, test_prob, w_prob = self.blend_probability(
+                model_names, oof_list, test_list, y_true
+            )
+            self.logger.info(f"Strategy 3 (Direct Probability Blend)   : OOF ROC-AUC = {auc_prob:.5f}")
+            for m, w in w_prob.items():
+                self.logger.info(f"    - Prob Weight for {m:<15}: {w:.4f}")
+            candidates["prob"] = (oof_prob, auc_prob, test_prob)
+            candidates["probability"] = (oof_prob, auc_prob, test_prob)
+
+        # Strategy 4: Pure GBDT Meta-Learner Stacking
+        if run_gbdt and len(model_names) > 1:
             oof_gbdt, auc_gbdt, test_gbdt = self.blend_gbdt_meta_learner(
                 model_names, oof_list, test_list, y_true
             )
             self.logger.info(f"Strategy 4 (Shallow GBDT Meta-Learner) : OOF ROC-AUC = {auc_gbdt:.5f}")
-        else:
-            oof_gbdt, auc_gbdt, test_gbdt = oof_rank, auc_rank, test_rank
-
-        # 8. Selection (Pure GBDT-Only Candidates)
-        candidates = {
-            "rank": (oof_rank, auc_rank, test_rank),
-            "logit": (oof_slsqp, auc_slsqp, test_slsqp),
-            "prob": (oof_prob, auc_prob, test_prob),
-            "probability": (oof_prob, auc_prob, test_prob),
-            "gbdt_meta": (oof_gbdt, auc_gbdt, test_gbdt),
-            "gbdt_stack": (oof_gbdt, auc_gbdt, test_gbdt),
-            "gbdt": (oof_gbdt, auc_gbdt, test_gbdt),
-        }
+            candidates["gbdt_meta"] = (oof_gbdt, auc_gbdt, test_gbdt)
+            candidates["gbdt_stack"] = (oof_gbdt, auc_gbdt, test_gbdt)
+            candidates["gbdt"] = (oof_gbdt, auc_gbdt, test_gbdt)
 
         if chosen_method in candidates:
             champion_name = chosen_method

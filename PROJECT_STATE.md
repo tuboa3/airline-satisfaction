@@ -1,11 +1,13 @@
 # PROJECT_STATE: Airline Passenger Satisfaction Optimization
 
 **Target Metric:** ROC-AUC  
-**Current Best Leaderboard (LB):** `0.96008` (Phase 2 Blend, Rank 382/868)  
-**Target Top-1 Leaderboard:** `0.96177` (Deficit: ~169 bps)  
-**Phase 3 OOF Benchmarks:** CatBoost `0.96053`, XGBoost `0.96023`, LightGBM `0.96007`  
-**Phase 4 Architecture:** Grandmaster GBDT-Only Engine: 10 Folds, In-Fold Leak-Free TE, Shelton Wang 64 Features (4000 iter, lr 0.04), Purged Raw Original Rows, Pure GBDT Meta-Learner & Direct Rank Blending  
-**Timestamp:** October 8, 2026  
+**Current Best Leaderboard (LB):** `0.96100` (Phase 4 Single Model `lightgbm_xt`)  
+**Recent Submission (Logit Blend):** `0.96072` (Phase 5 3-GBDT Nelder-Mead Logit Blend)  
+**Target Top-1 Leaderboard:** `0.96243` (Current Rank 1) | **Target:** `>= 0.96300`  
+**Current Phase 5 OOF Benchmarks (3 GBDTs):** LightGBM `0.96137`, LightGBM XT `0.96116`, XGBoost `0.96120`  
+**Current Champion Ensemble:** Nelder-Mead Rank Blend (`0.96149` OOF) / Nelder-Mead Logit Blend (`0.96162` OOF)  
+**Active Strategy:** Phase 6 Transductive Consensus Pseudo-Labeling (109,656 high-confidence test rows) + Monotonic Rank Averaging  
+**Timestamp:** October 12, 2026  
 
 ---
 
@@ -149,15 +151,32 @@ All 5 standalone models trained successfully on Kaggle Dual-T4:
   - `lightgbm`: `0.961371`
   - `lightgbm_xt`: `0.961163`
   - `xgboost`: `0.961198`
-- **Nelder-Mead Logit Blend (Champion):** **`0.96162` OOF ROC-AUC**
-  - Optimal Weights: LightGBM = `50.15%`, LightGBM XT = `30.68%`, XGBoost = `19.17%`.
-- **Nelder-Mead Rank Blend:** **`0.96149` OOF ROC-AUC**
-  - Optimal Weights: LightGBM = `50.96%`, LightGBM XT = `30.35%`, XGBoost = `18.69%`.
-- **Direct Probability Simplex Blend:** **`0.96149` OOF ROC-AUC**
-  - Optimal Weights: LightGBM = `54.88%`, LightGBM XT = `25.90%`, XGBoost = `19.22%`.
+- **Nelder-Mead Logit Blend:** `0.96162` OOF ROC-AUC (Optimal Weights: LGB `50.15%`, LGB_XT `30.68%`, XGB `19.17%`).
+- **Nelder-Mead Rank Blend:** `0.96149` OOF ROC-AUC (Optimal Weights: LGB `50.96%`, LGB_XT `30.35%`, XGB `18.69%`).
+- **Direct Probability Simplex Blend:** `0.96149` OOF ROC-AUC (Optimal Weights: LGB `54.88%`, LGB_XT `25.90%`, XGB `19.22%`).
 - **Shallow GBDT Meta-Learner:** `0.96145` OOF ROC-AUC.
 - **Post-Processing:** Applied 4 deterministic exact ground-truth matches from the original host dataset (IDs 777614, 844397, 869547 -> `0.9999`; ID 891259 -> `0.0001`).
 - **Pipeline Upgrades:** Added `--models` and `--exclude_models` flags to both `run_ensemble.py` and `generate_pseudo_labels.py` for flexible model subsets.
+
+---
+
+### Milestone 8: Public Leaderboard Diagnostic (0.96072) & Phase 6 Transductive Pseudo-Labeling Roadmap
+- **Public LB Observation:**
+  - `submission.csv` (3-GBDT Nelder-Mead Logit Blend) scored **`0.96072`** on the Public Leaderboard (compared to `0.96100` from single-model `lightgbm_xt`).
+- **Diagnostic Root Cause:**
+  - **Isotonic Calibration Distortion:** In `blend_logit_slsqp`, fitting `IsotonicRegression` on OOF predictions created piecewise step functions (local plateaus). When mapped to test predictions, these step functions collapse distinct probabilities into identical tied values, degrading rank-order resolution under the ROC-AUC metric.
+  - **The Rank Combiner Advantage:** Monotonic Rank Averaging (`rankdata(p) / len(p)`) completely eliminates step-function plateaus and is immune to between-fold probability calibration shift.
+- **Current Active Strategy to Surpass `0.96243`:**
+  1. **Transductive Consensus Pseudo-Labeling (Phase 6):**
+     - Mined 109,656 ultra-high-confidence test rows (`data/pseudo_labeled_test.csv`, 36.57% of test set) with unanimous consensus ($\ge 96\%$ confidence) across model architectures.
+     - Assigned confidence-scaled sample weights in `[0.5525, 0.5999]`.
+     - Zero validation leakage: CV folds strictly evaluate on genuine synthetic ground truth (`is_original == 0`).
+  2. **10-Fold Kaggle Retraining:**
+     - Training `lightgbm`, `xgboost`, and `lightgbm_xt` with `--use_pseudo_labels` on Kaggle Dual-T4 GPUs.
+  3. **Strict Rank Ensembling Post-Training:**
+     - Enforce `--method rank` (`run_ensemble.py --method rank --exclude_models catboost`) to prevent isotonic tail flattening.
+  4. **Multi-View Decoupled Ensembling:**
+     - Re-incorporate CatBoost (120 CTR features, standalone OOF `0.96083`) and Koumei Maki route models (`0.96115` OOF) once available, lowering inter-model correlation from `0.998` to `0.972` to break the Bayes variance ceiling.
 
 ---
 
