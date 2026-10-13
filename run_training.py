@@ -33,6 +33,12 @@ def parse_args():
         help="Model architecture to train (default: lightgbm)"
     )
     parser.add_argument(
+        "--models",
+        type=str,
+        default="",
+        help="Comma-separated list of models to train sequentially (e.g. 'lightgbm,lightgbm_xt,xgboost')"
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -173,16 +179,28 @@ def main():
         train_cfg.resnet_params["lr"] = args.lr
         train_cfg.ft_params["lr"] = args.lr
 
-    engine = CrossValidationEngine(
-        paths=paths,
-        feature_cfg=feature_cfg,
-        train_cfg=train_cfg,
-        model_name=args.model,
-        device=args.device,
-    )
+    model_list = [m.strip() for m in args.models.split(",") if m.strip()] if args.models else [args.model]
+    overall_scores = {}
+    for model_name in model_list:
+        logger.info("=" * 70)
+        logger.info(f"STARTING CROSS-VALIDATION RUN FOR: '{model_name}'")
+        logger.info("=" * 70)
+        engine = CrossValidationEngine(
+            paths=paths,
+            feature_cfg=feature_cfg,
+            train_cfg=train_cfg,
+            model_name=model_name,
+            device=args.device,
+        )
+        oof_auc, _, _ = engine.run()
+        overall_scores[model_name] = oof_auc
+        logger.info(f"Model '{model_name}' completed. OOF ROC-AUC: {oof_auc:.5f}")
 
-    oof_auc, _, _ = engine.run()
-    logger.info(f"Execution finished successfully. Final OOF ROC-AUC: {oof_auc:.5f}")
+    logger.info("=" * 70)
+    logger.info("ALL REQUESTED MODEL RUNS COMPLETE:")
+    for m_name, score in overall_scores.items():
+        logger.info(f"  * {m_name:<20}: OOF ROC-AUC = {score:.5f}")
+    logger.info("=" * 70)
 
 
 if __name__ == "__main__":

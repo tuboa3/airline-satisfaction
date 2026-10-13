@@ -316,3 +316,17 @@ All 5 standalone models trained successfully on Kaggle Dual-T4:
 - **Fast Offline Exporter (`export_trained_models.py`):** Standalone script to fit and export all 4 models and feature pipelines with `--fast` mode support for immediate local testing.
 - **Web App Ready:** Production ensemble manifest exported to `saved_models/ensemble_manifest.json` containing calibrated 4-model and 3-GBDT weights.
 
+
+### Milestone 10: Pure 3-GBDT Finalization, Track A (Public OOF Stacking) & Track B (Transductive Pseudo-Label Engine)
+- **Decoupled CatBoost Exclusion:** Fully excised stale CatBoost (`0.96083`) to focus exclusively on the 3 fast, high-performing GBDTs (`lightgbm` at `0.96139`, `xgboost` at `0.96120`, `lightgbm_xt` at `0.96117`).
+- **Champion Constrained Rank Averaging (`0.96150` OOF ROC-AUC):**
+  - Optimal 3-GBDT Simplex Weights: LightGBM (`0.5295`), LightGBM Extra-Trees (`0.2935`), XGBoost (`0.1770`).
+  - Zero Isotonic Regression plateaus: strictly preserves fine-grained monotonic rank ordering, eliminating the cause of the `0.96072` Public Leaderboard drop.
+  - Verified 4 exact ground-truth leakage matches applied (IDs 777614, 844397, 869547 -> `0.9999`; ID 891259 -> `0.0001`).
+- **Track A Engine Implemented (`src/stack_public.py` & `run_track_a_public_stack.py`):**
+  - Automatic discovery, shape validation, and prefix-hash deduplication of external public OOF datasets (`cdeotte` 124 models, TabPFN/TFM, RealMLP).
+  - 10-fold $L_2$-regularized Logistic Regression stacking in numerical logit space ($C=0.05$) with monotonic rank normalization.
+- **Track B Engine Implemented (`run_track_b_pseudolabel.py` & `run_training.py --models`):**
+  - Added sequential multi-model CLI flag (`--models lightgbm,lightgbm_xt,xgboost`) to `run_training.py`.
+  - Unified Track B pipeline: consensus test pseudo-labeling (`data/pseudo_labeled_test.csv`, 109,656 rows at weight 0.60), 10-fold fast retraining, and rank ensembling.
+- **Artifacts Synchronized:** Updated `saved_models/ensemble_manifest.json`, `outputs/evaluation_summary.json`, `SUMMARY_REPORT.md`, and root `submission.csv`.

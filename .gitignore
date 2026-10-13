@@ -37,7 +37,8 @@ scratch/
 *.pkl
 *.joblib
 !saved_models/
-!saved_models/**
+saved_models/*
+!saved_models/ensemble_manifest.json
 
 # IDE & System
 .DS_Store

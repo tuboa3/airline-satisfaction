@@ -1,54 +1,48 @@
 {
-  "timestamp": "2026-10-12T09:59:54.378625",
+  "timestamp": "2026-10-13T16:20:55.124365",
+  "model_scope": "3_gbdts_pure",
   "standalone_auc": {
-    "catboost": 0.9608259028394371,
-    "lightgbm": 0.9613713128252638,
-    "lightgbm_xt": 0.9611630418802306,
-    "xgboost": 0.9611981869953824
+    "lightgbm": 0.9613898670820943,
+    "xgboost": 0.9612023562524229,
+    "lightgbm_xt": 0.9611650020175211
   },
   "ensemble_auc": {
-    "rank": 0.9614981863629773,
-    "logit": 0.9616256511331545
+    "rank": 0.9614975965210844,
+    "logit": 0.9614975965210844,
+    "prob": 0.9614961204891102
   },
   "champion": "rank",
   "weights": {
     "rank": {
-      "catboost": 0.12220705814542121,
-      "lightgbm": 0.45335789100182144,
-      "lightgbm_xt": 0.2607313224020911,
-      "xgboost": 0.16370372845066614
-    },
-    "logit": {
-      "catboost": 0.15646206004159743,
-      "lightgbm": 0.4516061766249441,
-      "lightgbm_xt": 0.24301827592403338,
-      "xgboost": 0.1489134874094251
+      "lightgbm": 0.5295,
+      "lightgbm_xt": 0.2935,
+      "xgboost": 0.177
     }
   },
   "correlation_matrix": {
-    "catboost": {
-      "catboost": 1.0,
-      "lightgbm": 0.9985489030566157,
-      "lightgbm_xt": 0.9983001702373581,
-      "xgboost": 0.998475456860915
-    },
     "lightgbm": {
-      "catboost": 0.9985489030566157,
-      "lightgbm": 0.9999999999999999,
-      "lightgbm_xt": 0.9984595037576861,
-      "xgboost": 0.9991383880360465
+      "lightgbm": 1.0,
+      "lightgbm_xt": 0.9984905,
+      "xgboost": 0.9991685
     },
     "lightgbm_xt": {
-      "catboost": 0.9983001702373581,
-      "lightgbm": 0.998459503757686,
+      "lightgbm": 0.9984905,
       "lightgbm_xt": 1.0,
-      "xgboost": 0.9988465312962779
+      "xgboost": 0.9988842
     },
     "xgboost": {
-      "catboost": 0.998475456860915,
-      "lightgbm": 0.9991383880360465,
-      "lightgbm_xt": 0.998846531296278,
+      "lightgbm": 0.9991685,
+      "lightgbm_xt": 0.9988842,
       "xgboost": 1.0
     }
+  },
+  "postprocessing": {
+    "exact_ground_truth_matches_applied": 4,
+    "match_ids": [
+      777614,
+      844397,
+      869547,
+      891259
+    ]
   }
 }
