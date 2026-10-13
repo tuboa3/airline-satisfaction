@@ -66,6 +66,24 @@ def parse_args():
         help="Directory containing submission CSV files (default: submissions)",
     )
     parser.add_argument(
+        "--models_dir",
+        type=str,
+        default="saved_models",
+        help="Directory containing trained model artifacts and pipelines (default: saved_models)",
+    )
+    parser.add_argument(
+        "--include_models",
+        action="store_true",
+        default=True,
+        help="Bundle saved_models/ folder into the output ZIP archive (default: True)",
+    )
+    parser.add_argument(
+        "--no_models",
+        dest="include_models",
+        action="store_false",
+        help="Exclude saved_models/ folder from output ZIP archive",
+    )
+    parser.add_argument(
         "--skip_ensemble_run",
         action="store_true",
         help="Skip re-running EnsembleOptimizer if champion submission already exists",
@@ -310,8 +328,11 @@ def main():
     # Priority Root Files
     for root_file in [
         "SUMMARY_REPORT.md",
+        "PROJECT_STATE.md",
         "submission.csv",
         "README.md",
+        "run_inference.py",
+        "export_trained_models.py",
         "another-friend.md",
         "friend.md",
         "another-friend-again.md",
@@ -333,6 +354,19 @@ def main():
             if os.path.isfile(sub_file):
                 rel_p = os.path.relpath(sub_file, PROJECT_ROOT)
                 files_to_pack.append((sub_file, rel_p))
+
+    # All files in saved_models/ (Model boosters, pipelines, and manifests for web app)
+    models_dir = args.models_dir or getattr(paths, "models_dir", "saved_models")
+    if not os.path.isabs(models_dir):
+        models_dir = os.path.join(PROJECT_ROOT, models_dir)
+
+    if args.include_models and os.path.exists(models_dir):
+        logger.info(f"Scanning saved models directory: '{models_dir}'...")
+        for root, _, files in os.walk(models_dir):
+            for fname in sorted(files):
+                full_p = os.path.join(root, fname)
+                rel_p = os.path.relpath(full_p, PROJECT_ROOT)
+                files_to_pack.append((full_p, rel_p))
 
     # Notebooks if present
     notebooks_dir = os.path.join(PROJECT_ROOT, "notebooks")

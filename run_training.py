@@ -121,6 +121,8 @@ def parse_args():
         "--use_glm_margin",
         action="store_true",
         default=False,
+        help="Enable Stage 1 GLM margin generation for tree models (default: False)"
+    )
     parser.add_argument(
         "--save_models",
         action="store_true",
