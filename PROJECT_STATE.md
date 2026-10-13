@@ -303,3 +303,16 @@ All 5 standalone models trained successfully on Kaggle Dual-T4:
    !python package_results.py --skip_ensemble_run
    ```
 
+---
+
+### Milestone 9: Model Artifact Extraction & Production Inference Engine for Web App Deployment
+- **Automated Booster & Pipeline Persistence:** Enabled `--save_models` by default in `TrainConfig` and `CrossValidationEngine`. Every 10-fold training run on Kaggle automatically serializes all 10 fold boosters:
+  - `saved_models/lightgbm/model_fold_*.txt` (native LightGBM format)
+  - `saved_models/lightgbm_xt/model_fold_*.txt` (native Extra-Trees format)
+  - `saved_models/xgboost/model_fold_*.json` (native XGBoost JSON format)
+  - `saved_models/catboost/model_fold_*.cbm` (native CatBoost binary format)
+  - `saved_models/pipeline_*.joblib` (fitted FeaturePipeline state)
+- **Standalone Production Inference Runner (`run_inference.py`):** Self-contained CLI and Python API for offline / future web application inference. Handles raw passenger CSVs, transforms features via the saved pipeline, computes 10-fold predictions across all available models, applies the champion logit/rank blend, and executes exact ground-truth leakage overrides.
+- **Fast Offline Exporter (`export_trained_models.py`):** Standalone script to fit and export all 4 models and feature pipelines with `--fast` mode support for immediate local testing.
+- **Web App Ready:** Production ensemble manifest exported to `saved_models/ensemble_manifest.json` containing calibrated 4-model and 3-GBDT weights.
+

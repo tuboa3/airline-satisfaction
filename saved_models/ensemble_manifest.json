@@ -1,0 +1,23 @@
+{
+  "ensemble_method": "nelder_mead_logit",
+  "weights_4_models": {
+    "catboost": 0.15646206004159743,
+    "lightgbm": 0.4516061766249441,
+    "lightgbm_xt": 0.24301827592403338,
+    "xgboost": 0.1489134874094251
+  },
+  "weights_3_gbdt": {
+    "lightgbm": 0.501512143255692,
+    "lightgbm_xt": 0.3068287193270979,
+    "xgboost": 0.1916591374172102
+  },
+  "epsilon": 1e-06,
+  "models_available": [
+    "lightgbm",
+    "lightgbm_xt",
+    "xgboost",
+    "catboost"
+  ],
+  "target_col": "satisfaction",
+  "id_col": "id"
+}

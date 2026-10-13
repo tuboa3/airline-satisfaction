@@ -20,6 +20,7 @@ class PathConfig:
     original_path: str = ""
     output_dir: str = "outputs"
     submissions_dir: str = "submissions"
+    models_dir: str = "saved_models"
 
     def __post_init__(self):
         if not self.raw_dir:
@@ -116,6 +117,7 @@ class PathConfig:
 
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.submissions_dir, exist_ok=True)
+        os.makedirs(self.models_dir, exist_ok=True)
 
 
 @dataclass
@@ -229,6 +231,7 @@ class TrainConfig:
     use_pseudo_labels: bool = False
     pseudo_labels_path: str = ""
     pseudo_sample_weight: float = 0.60
+    save_models: bool = True
 
     # GLM Margin Residual Boosting (Disabled for pure GBDT-only mandate)
     use_glm_margin: bool = False

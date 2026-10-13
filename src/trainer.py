@@ -356,6 +356,29 @@ class CrossValidationEngine:
                     / self.train_cfg.n_splits
                 )
 
+            # Save fold model artifact for future inference
+            if getattr(self.train_cfg, "save_models", False):
+                canonical_map = {
+                    "lgbm": "lightgbm",
+                    "lgb_xt": "lightgbm_xt",
+                    "extra_trees": "lightgbm_xt",
+                    "cb": "catboost",
+                    "cat": "catboost",
+                    "xgb": "xgboost",
+                }
+                c_name = canonical_map.get(self.model_name.lower(), self.model_name.lower())
+                model_dir = os.path.join(self.paths.models_dir, c_name)
+                os.makedirs(model_dir, exist_ok=True)
+                if hasattr(model, "model") and model.model is not None:
+                    if "lightgbm" in c_name:
+                        model.model.save_model(os.path.join(model_dir, f"model_fold_{fold}.txt"))
+                    elif "xgboost" in c_name:
+                        model.model.save_model(os.path.join(model_dir, f"model_fold_{fold}.json"))
+                    elif "catboost" in c_name:
+                        model.model.save_model(os.path.join(model_dir, f"model_fold_{fold}.cbm"))
+                elif hasattr(model, "save"):
+                    model.save(os.path.join(model_dir, f"model_fold_{fold}.pt"))
+
             # Memory garbage collection
             del X_tr, y_tr, sw_tr, X_va, y_va, model
             try:
@@ -400,6 +423,12 @@ class CrossValidationEngine:
             "tabular_resnet": "tabular_resnet",
         }
         canonical_name = canonical_map.get(self.model_name.lower(), self.model_name.lower())
+
+        if getattr(self.train_cfg, "save_models", False):
+            import joblib
+            pipeline_path = os.path.join(self.paths.models_dir, f"pipeline_{canonical_name}.joblib")
+            joblib.dump(self.pipeline, pipeline_path)
+            logging.info(f"Saved fitted feature pipeline to: '{pipeline_path}'")
         if canonical_name != self.model_name.lower():
             np.save(
                 os.path.join(self.paths.output_dir, f"oof_preds_{canonical_name}.npy"),

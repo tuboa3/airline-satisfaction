@@ -121,7 +121,17 @@ def parse_args():
         "--use_glm_margin",
         action="store_true",
         default=False,
-        help="Enable Stage 1 GLM margin generation for tree models (default: False)"
+    parser.add_argument(
+        "--save_models",
+        action="store_true",
+        default=True,
+        help="Save trained booster models and fitted feature pipelines for future inference (default: True)"
+    )
+    parser.add_argument(
+        "--no_save_models",
+        dest="save_models",
+        action="store_false",
+        help="Disable saving model boosters to disk"
     )
     return parser.parse_args()
 
@@ -142,6 +152,7 @@ def main():
         pseudo_labels_path=args.pseudo_path,
         pseudo_sample_weight=args.pseudo_weight,
         use_glm_margin=args.use_glm_margin,
+        save_models=args.save_models,
     )
 
     if args.epochs is not None:
