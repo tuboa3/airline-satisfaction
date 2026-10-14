@@ -2321,10 +2321,8 @@ class HybridDampedAUCLoss:
                     z_neg = z_clip[neg_mask]
 
                     q = torch.linspace(0.01, 0.99, self.n_anchors, device=dev)
-                    neg_sub = z_neg[::max(1, len(z_neg) // 25000)]
-                    pos_sub = z_pos[::max(1, len(z_pos) // 25000)]
-                    neg_anchors = torch.quantile(neg_sub, q)
-                    pos_anchors = torch.quantile(pos_sub, q)
+                    neg_anchors = torch.quantile(z_neg, q)
+                    pos_anchors = torch.quantile(z_pos, q)
 
                     diff_pos = torch.clamp((neg_anchors.unsqueeze(0) - z_pos.unsqueeze(1)) / self.tau_wmw, -25.0, 25.0)
                     sig_pos = torch.sigmoid(diff_pos)
