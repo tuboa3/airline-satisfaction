@@ -566,12 +566,27 @@ def main():
         "barrier_surpassed": bool(stacked_auc >= 0.96300),
     }
 
+    # Save raw logits and probabilities for offline forensic investigation
+    logits_path = os.path.join(paths.output_dir, "argon_cascade_logits.npz")
+    np.savez_compressed(
+        logits_path,
+        oof_logits_1=oof_logits_1,
+        oof_logits_2=oof_logits_2,
+        oof_logits_3=oof_logits_3,
+        test_logits_1=test_logits_1,
+        test_logits_2=test_logits_2,
+        test_logits_3=test_logits_3,
+        y_train=y_train,
+        champ_oof_probs=champ_oof_probs,
+        champ_test_probs=champ_test_probs,
+    )
+
     with open(os.path.join(paths.output_dir, "argon_evaluation_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
 
     logger.info("=" * 80)
     logger.info(f"ARGON CASCADE PIPELINE COMPLETE: Champion OOF ROC-AUC = {stacked_auc:.6f}")
-    logger.info(f"Outputs serialized to: 'submission.csv' and '{paths.output_dir}/argon_evaluation_summary.json'")
+    logger.info(f"Outputs serialized to: 'submission.csv', '{logits_path}', and '{paths.output_dir}/argon_evaluation_summary.json'")
     logger.info("=" * 80)
 
 
