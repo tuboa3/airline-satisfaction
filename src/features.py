@@ -2448,13 +2448,17 @@ class AsymmetricViewBuilder:
 
         df_cats = pd.DataFrame(index=df.index)
         for c in CAT_COLS:
-            df_cats[c] = pd.Categorical(df[c], categories=self.cat_categories_[c]).codes.astype(np.int32)
+            codes = pd.Categorical(df[c], categories=self.cat_categories_[c]).codes.astype(np.float32)
+            codes[codes < 0] = np.nan
+            df_cats[c] = codes
 
         df_high_card = pd.DataFrame(index=df.index)
         for k_col in ["k_fd", "k_fd10", "k_fd_cls", "k_age_cls", "k_onboard_wifi"]:
-            df_high_card[f"cat_{k_col}"] = pd.Categorical(
+            codes = pd.Categorical(
                 keys_df[k_col], categories=self.cat_categories_[k_col]
-            ).codes.astype(np.int32)
+            ).codes.astype(np.float32)
+            codes[codes < 0] = np.nan
+            df_high_card[f"cat_{k_col}"] = codes
 
         view_a = pd.concat(
             [

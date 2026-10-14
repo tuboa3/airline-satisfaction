@@ -2269,6 +2269,7 @@ class HybridDampedAUCLoss:
         noise_eps: float = 0.038,
         tau_wmw: float = 0.80,
         n_anchors: int = 48,
+        device: Optional[str] = None,
     ) -> None:
         self.lambda_auc = lambda_auc
         self.kappa_damp = kappa_damp
@@ -2277,6 +2278,7 @@ class HybridDampedAUCLoss:
         self.noise_eps = noise_eps
         self.tau_wmw = tau_wmw
         self.n_anchors = n_anchors
+        self.device = device
         self.anchor_quantiles = np.linspace(0.01, 0.99, n_anchors)
 
     def compute_grad_hess(
@@ -2285,6 +2287,75 @@ class HybridDampedAUCLoss:
         z_pred: np.ndarray,
         sample_weight: Optional[np.ndarray] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
+        # High-performance PyTorch GPU / Multi-thread CPU acceleration
+        try:
+            import torch
+
+            dev = torch.device(
+                self.device
+                if (self.device and self.device.startswith("cuda") and torch.cuda.is_available())
+                else "cpu"
+            )
+            z_t = torch.as_tensor(z_pred, dtype=torch.float32, device=dev)
+            y_t = torch.as_tensor(y_target, dtype=torch.float32, device=dev)
+
+            z_clip = torch.clamp(z_t, -25.0, 25.0)
+            p = torch.sigmoid(z_clip)
+            y_smooth = (1.0 - self.noise_eps) * y_t + self.noise_eps * 0.434
+            res = p - y_smooth
+            kr = self.kappa_damp * res
+            tanh_kr = torch.tanh(kr)
+            sech2_kr = 1.0 - (tanh_kr ** 2)
+
+            grad = tanh_kr / self.kappa_damp
+            hess = torch.clamp_min(
+                p * (1.0 - p) * sech2_kr + self.eta_quad_damp * (res ** 2),
+                self.hess_floor,
+            )
+
+            if self.lambda_auc > 0.0 and len(z_pred) > 20:
+                pos_mask = y_t >= 0.5
+                neg_mask = ~pos_mask
+                if torch.any(pos_mask) and torch.any(neg_mask):
+                    z_pos = z_clip[pos_mask]
+                    z_neg = z_clip[neg_mask]
+
+                    q = torch.linspace(0.01, 0.99, self.n_anchors, device=dev)
+                    neg_sub = z_neg[::max(1, len(z_neg) // 25000)]
+                    pos_sub = z_pos[::max(1, len(z_pos) // 25000)]
+                    neg_anchors = torch.quantile(neg_sub, q)
+                    pos_anchors = torch.quantile(pos_sub, q)
+
+                    diff_pos = torch.clamp((neg_anchors.unsqueeze(0) - z_pos.unsqueeze(1)) / self.tau_wmw, -25.0, 25.0)
+                    sig_pos = torch.sigmoid(diff_pos)
+                    g_wmw_pos = -torch.mean(sig_pos, dim=1) / self.tau_wmw
+                    h_wmw_pos = torch.mean(sig_pos * (1.0 - sig_pos), dim=1) / (self.tau_wmw ** 2)
+
+                    diff_neg = torch.clamp((z_neg.unsqueeze(1) - pos_anchors.unsqueeze(0)) / self.tau_wmw, -25.0, 25.0)
+                    sig_neg = torch.sigmoid(diff_neg)
+                    g_wmw_neg = torch.mean(sig_neg, dim=1) / self.tau_wmw
+                    h_wmw_neg = torch.mean(sig_neg * (1.0 - sig_neg), dim=1) / (self.tau_wmw ** 2)
+
+                    grad_wmw = torch.zeros_like(grad)
+                    hess_wmw = torch.zeros_like(hess)
+                    grad_wmw[pos_mask] = g_wmw_pos
+                    hess_wmw[pos_mask] = h_wmw_pos
+                    grad_wmw[neg_mask] = g_wmw_neg
+                    hess_wmw[neg_mask] = h_wmw_neg
+
+                    hess_wmw = torch.clamp_min(hess_wmw, 1e-3)
+                    grad = (1.0 - self.lambda_auc) * grad + self.lambda_auc * grad_wmw
+                    hess = (1.0 - self.lambda_auc) * hess + self.lambda_auc * hess_wmw
+
+            if sample_weight is not None:
+                w_t = torch.as_tensor(sample_weight, dtype=torch.float32, device=dev)
+                grad = grad * w_t
+                hess = hess * w_t
+
+            return grad.cpu().numpy().astype(np.float32), hess.cpu().numpy().astype(np.float32)
+        except Exception:
+            pass  # Fallback to NumPy reference implementation
+
         z_clip = np.clip(z_pred, -25.0, 25.0)
         p = 1.0 / (1.0 + np.exp(-z_clip))
 
@@ -2409,7 +2480,7 @@ class HierarchicalResidualGBDTCascade:
         self.seed = seed
         self.num_threads = num_threads if num_threads > 0 else (os.cpu_count() or 4)
         self.gpu_device = gpu_device
-        self.loss_engine = HybridDampedAUCLoss()
+        self.loss_engine = HybridDampedAUCLoss(device=self.gpu_device)
 
     @staticmethod
     def _build_lgbm_feature_contri(columns: list[str]) -> list[float]:
