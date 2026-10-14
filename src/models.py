@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Callable, Optional
 
 import numpy as np
+import pandas as pd
 
 try:
     import torch
@@ -2522,12 +2523,11 @@ class HierarchicalResidualGBDTCascade:
             "min_child_samples": 45,
             "min_data_per_group": 50,
             "cat_smooth": 20.0,
-            "feature_fraction": 0.72,
+            "feature_fraction": 0.80,
             "bagging_fraction": 0.85,
             "bagging_freq": 1,
             "reg_alpha": 1.5,
             "reg_lambda": 5.0,
-            "feature_contri": self._build_lgbm_feature_contri(list(X_a_tr.columns)),
             "metric": "auc",
             "verbose": -1,
             "force_row_wise": True,
@@ -2707,3 +2707,467 @@ class HierarchicalResidualGBDTCascade:
             "te_logits_2": z_te_2.astype(np.float64),
             "te_logits_3": z_te_3.astype(np.float64),
         }
+
+
+class GramSchmidtCascadeDecoupler:
+    """
+    Extracts raw innovations (delta_2, delta_3) from a margin-chained cascade,
+    removes residual collinearity via out-of-fold Gram-Schmidt orthogonal projection,
+    and learns optimal log-odds weights via L2-regularized Logistic Regression.
+    """
+    def __init__(
+        self,
+        beta_12: float = 0.72,
+        beta_23: float = 1.0,
+        gamma_1: float = 0.55,
+        gamma_2: float = 0.45,
+        C_meta: float = 1.0,
+    ):
+        self.beta_12 = beta_12
+        self.beta_23 = beta_23
+        self.gamma_1 = gamma_1
+        self.gamma_2 = gamma_2
+        self.C_meta = C_meta
+
+    def extract_raw_deltas(self, z1: np.ndarray, z2: np.ndarray, z3: np.ndarray) -> np.ndarray:
+        """Inverts the lower-triangular cascade initialization matrix."""
+        delta_2 = z2 - self.beta_12 * z1
+        init_3 = self.beta_23 * (self.gamma_1 * z1 + self.gamma_2 * z2)
+        delta_3 = z3 - init_3
+        return np.column_stack([z1, delta_2, delta_3])
+
+    @staticmethod
+    def _fit_gram_schmidt(R_tr: np.ndarray):
+        """Fits centering and orthogonal projection coefficients on training fold."""
+        means = R_tr.mean(axis=0)
+        C = R_tr - means
+        u1 = C[:, 0]
+        norm_u1 = np.dot(u1, u1) + 1e-12
+
+        alpha_21 = np.dot(C[:, 1], u1) / norm_u1
+        u2 = C[:, 1] - alpha_21 * u1
+        norm_u2 = np.dot(u2, u2) + 1e-12
+
+        alpha_31 = np.dot(C[:, 2], u1) / norm_u1
+        alpha_32 = np.dot(C[:, 2], u2) / norm_u2
+        u3 = C[:, 2] - alpha_31 * u1 - alpha_32 * u2
+
+        U_tr = np.column_stack([u1, u2, u3])
+        stds = U_tr.std(axis=0) + 1e-12
+        params = {
+            "means": means,
+            "stds": stds,
+            "alpha_21": alpha_21,
+            "alpha_31": alpha_31,
+            "alpha_32": alpha_32,
+        }
+        return U_tr / stds, params
+
+    @staticmethod
+    def _apply_gram_schmidt(R_eval: np.ndarray, params: dict) -> np.ndarray:
+        """Applies fitted Gram-Schmidt projection to validation or test logits."""
+        C = R_eval - params["means"]
+        u1 = C[:, 0]
+        u2 = C[:, 1] - params["alpha_21"] * u1
+        u3 = C[:, 2] - params["alpha_31"] * u1 - params["alpha_32"] * u2
+        U_eval = np.column_stack([u1, u2, u3])
+        return U_eval / params["stds"]
+
+    def fit_predict_oof(
+        self,
+        z1_oof: np.ndarray,
+        z2_oof: np.ndarray,
+        z3_oof: np.ndarray,
+        y: np.ndarray,
+        z1_test: np.ndarray,
+        z2_test: np.ndarray,
+        z3_test: np.ndarray,
+        n_splits: int = 10,
+        seed: int = 42,
+    ):
+        from scipy.special import expit
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import roc_auc_score
+        from sklearn.model_selection import StratifiedKFold
+
+        R_oof = self.extract_raw_deltas(z1_oof, z2_oof, z3_oof)
+        R_test = self.extract_raw_deltas(z1_test, z2_test, z3_test)
+
+        U_oof = np.zeros_like(R_oof)
+        oof_preds = np.zeros(len(y), dtype=np.float64)
+        test_logits = np.zeros(len(z1_test), dtype=np.float64)
+
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        for tr_idx, va_idx in skf.split(R_oof, y):
+            U_tr, gs_params = self._fit_gram_schmidt(R_oof[tr_idx])
+            U_va = self._apply_gram_schmidt(R_oof[va_idx], gs_params)
+            U_te = self._apply_gram_schmidt(R_test, gs_params)
+            U_oof[va_idx] = U_va
+
+            meta = LogisticRegression(C=self.C_meta, solver="lbfgs", max_iter=1000)
+            meta.fit(U_tr, y[tr_idx])
+
+            oof_preds[va_idx] = meta.decision_function(U_va)
+            test_logits += meta.decision_function(U_te) / n_splits
+
+        corr_matrix = np.corrcoef(U_oof.T)
+        r_mean = float((corr_matrix[0, 1] + corr_matrix[0, 2] + corr_matrix[1, 2]) / 3.0)
+        auc = float(roc_auc_score(y, expit(oof_preds)))
+        return expit(oof_preds), expit(test_logits), r_mean, auc
+
+
+def train_catboost_dual_representation(
+    X_tr: pd.DataFrame,
+    y_tr: np.ndarray,
+    X_va: pd.DataFrame,
+    y_va: np.ndarray,
+    X_te: pd.DataFrame,
+    base_features: list[str],
+    engineered_num_features: list[str],
+    seed: int = 42,
+    task_type: str = "GPU",
+    iterations: int = 4500,
+    learning_rate: float = 0.035,
+    early_stopping_rounds: int = 150,
+    verbose: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Implements the S6E10 'All-Categorical + Numeric' dual representation for CatBoost (Tier 3).
+    Every original feature (including Flight Distance [Route ID], Age, and all 14 integer
+    ratings) is passed both as a numeric column and as an explicit string category so
+    CatBoost's oblivious trees can build 4-way online ordered CTR combinations.
+    """
+    from catboost import CatBoostClassifier, Pool
+    from scipy.special import logit
+
+    all_cols = [c for c in base_features + engineered_num_features if c in X_tr.columns]
+    X_tr_cb = X_tr[all_cols].copy()
+    X_va_cb = X_va[all_cols].copy()
+    X_te_cb = X_te[all_cols].copy()
+
+    cat_col_names = []
+    for col in base_features:
+        if col not in X_tr_cb.columns:
+            continue
+        cat_name = f"{col}_cat_str"
+        cat_col_names.append(cat_name)
+        for df_part in (X_tr_cb, X_va_cb, X_te_cb):
+            df_part[cat_name] = df_part[col].fillna(-999).astype(str)
+            if df_part[col].dtype == "object" or str(df_part[col].dtype) == "category":
+                df_part.drop(columns=[col], inplace=True)
+
+    tr_pool = Pool(X_tr_cb, y_tr, cat_features=cat_col_names)
+    va_pool = Pool(X_va_cb, y_va, cat_features=cat_col_names)
+    te_pool = Pool(X_te_cb, cat_features=cat_col_names)
+
+    cb_params = {
+        "iterations": iterations,
+        "learning_rate": learning_rate,
+        "depth": 7,
+        "loss_function": "Logloss",
+        "eval_metric": "AUC",
+        "l2_leaf_reg": 5.0,
+        "random_strength": 1.0,
+        "max_ctr_complexity": 4,
+        "one_hot_max_size": 10,
+        "task_type": task_type,
+        "random_seed": seed,
+        "verbose": 500 if verbose else False,
+    }
+
+    try:
+        cb_model = CatBoostClassifier(**cb_params)
+        cb_model.fit(tr_pool, eval_set=va_pool, early_stopping_rounds=early_stopping_rounds, verbose=False)
+    except Exception as e:
+        if task_type == "GPU":
+            logging.warning(f"CatBoost GPU execution note: {e}. Falling back to multi-core CPU...")
+            cb_params["task_type"] = "CPU"
+            cb_model = CatBoostClassifier(**cb_params)
+            cb_model.fit(tr_pool, eval_set=va_pool, early_stopping_rounds=early_stopping_rounds, verbose=False)
+        else:
+            raise e
+
+    va_probs = np.clip(cb_model.predict_proba(va_pool)[:, 1], 1e-6, 1.0 - 1e-6)
+    te_probs = np.clip(cb_model.predict_proba(te_pool)[:, 1], 1e-6, 1.0 - 1e-6)
+    return logit(va_probs), logit(te_probs)
+
+
+if torch is not None:
+    class PeriodicEmbedding(nn.Module):
+        """Periodic Linear Representation (PLR) layer for numerical features."""
+        def __init__(self, in_features: int, embed_dim: int = 8):
+            super().__init__()
+            self.linear = nn.Linear(in_features, in_features * embed_dim)
+            self.in_features = in_features
+            self.embed_dim = embed_dim
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            h = 2.0 * math.pi * self.linear(x)
+            return torch.cat([x, torch.sin(h), torch.cos(h)], dim=-1)
+
+    class PyTorchRealMLP_TD(nn.Module):
+        """
+        Native PyTorch RealMLP-TD Tabular Neural Network with PLR Periodic Embeddings,
+        GELU activations, LayerNorm, and Dropout.
+        """
+        def __init__(self, num_features: int, cat_dims: list[tuple[int, int]], hidden_dim: int = 256, dropout: float = 0.1):
+            super().__init__()
+            self.num_plr = PeriodicEmbedding(num_features, embed_dim=8)
+            plr_dim = num_features + 2 * (num_features * 8)
+
+            self.cat_embeddings = nn.ModuleList([
+                nn.Embedding(num_classes, emb_dim) for num_classes, emb_dim in cat_dims
+            ])
+            total_cat_dim = sum(emb_dim for _, emb_dim in cat_dims)
+
+            total_in = plr_dim + total_cat_dim
+            self.net = nn.Sequential(
+                nn.Linear(total_in, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.LayerNorm(hidden_dim // 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim // 2, 1),
+            )
+
+        def forward(self, x_num: torch.Tensor, x_cats: list[torch.Tensor]) -> torch.Tensor:
+            h_num = self.num_plr(x_num)
+            h_cats = [emb(cat) for emb, cat in zip(self.cat_embeddings, x_cats)]
+            if h_cats:
+                h = torch.cat([h_num] + h_cats, dim=-1)
+            else:
+                h = h_num
+            return self.net(h).squeeze(-1)
+
+    class PyTorchTabM_D(nn.Module):
+        """
+        Native PyTorch TabM Tabular Model with Parameter-Efficient Ensembling across k=32 Sub-MLPs.
+        Shares core dense layers while learning sub-model rank-1 multiplicative adapters.
+        """
+        def __init__(self, num_features: int, cat_dims: list[tuple[int, int]], k_ens: int = 32, hidden_dim: int = 256):
+            super().__init__()
+            self.k_ens = k_ens
+            self.cat_embeddings = nn.ModuleList([
+                nn.Embedding(num_classes, emb_dim) for num_classes, emb_dim in cat_dims
+            ])
+            total_in = num_features + sum(emb_dim for _, emb_dim in cat_dims)
+
+            # Core backbone
+            self.fc1 = nn.Linear(total_in, hidden_dim)
+            self.ln1 = nn.LayerNorm(hidden_dim)
+            self.act = nn.GELU()
+            self.fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
+            self.ln2 = nn.LayerNorm(hidden_dim // 2)
+            self.head = nn.Linear(hidden_dim // 2, 1)
+
+            # Rank-1 multiplicative adapters for each sub-model
+            self.r1 = nn.Parameter(torch.ones(k_ens, total_in) + 0.05 * torch.randn(k_ens, total_in))
+            self.s1 = nn.Parameter(torch.ones(k_ens, hidden_dim))
+            self.s2 = nn.Parameter(torch.ones(k_ens, hidden_dim // 2))
+
+        def forward(self, x_num: torch.Tensor, x_cats: list[torch.Tensor]) -> torch.Tensor:
+            h_cats = [emb(cat) for emb, cat in zip(self.cat_embeddings, x_cats)]
+            h_in = torch.cat([x_num] + h_cats, dim=-1) if h_cats else x_num
+
+            # Expand for k_ens sub-models
+            x_k = h_in.unsqueeze(1) * self.r1.unsqueeze(0)  # [B, k, total_in]
+            out1 = self.fc1(x_k) * self.s1.unsqueeze(0)
+            out1 = self.ln1(self.act(out1))
+            out2 = self.fc2(out1) * self.s2.unsqueeze(0)
+            out2 = self.ln2(self.act(out2))
+            logits_k = self.head(out2).squeeze(-1)  # [B, k]
+            return logits_k.mean(dim=-1)
+
+
+def train_pytabkit_deep_tabular(
+    X_tr: pd.DataFrame,
+    y_tr: np.ndarray,
+    X_va: pd.DataFrame,
+    y_va: np.ndarray,
+    X_te: pd.DataFrame,
+    num_cols: list[str],
+    cat_cols: list[str],
+    seed: int = 42,
+    device: str = "cuda",
+    batch_size: int = 512,
+    fast_mode: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Trains RealMLP_TD_Classifier and TabM_D_Classifier on the exact fold split.
+    If pytabkit is installed, runs official RealMLP_TD and TabM_D.
+    Otherwise, runs native PyTorch RealMLP-TD and TabM modules with periodic embeddings,
+    GELU, EMA, and rank-1 adapter ensemble.
+    Returns: (rmlp_val_logits, rmlp_te_logits, tabm_val_logits, tabm_te_logits).
+    """
+    from scipy.special import logit
+    from sklearn.impute import SimpleImputer
+    from sklearn.preprocessing import StandardScaler
+
+    has_pytabkit = False
+    try:
+        from pytabkit import RealMLP_TD_Classifier, TabM_D_Classifier
+        has_pytabkit = True
+    except (ImportError, Exception):
+        has_pytabkit = False
+
+    valid_num = [c for c in num_cols if c in X_tr.columns]
+    valid_cat = [c for c in cat_cols if c in X_tr.columns]
+
+    if has_pytabkit:
+        try:
+            X_tr_nn = X_tr[valid_num + valid_cat].copy()
+            X_va_nn = X_va[valid_num + valid_cat].copy()
+            X_te_nn = X_te[valid_num + valid_cat].copy()
+
+            imputer = SimpleImputer(strategy="median")
+            X_tr_nn[valid_num] = imputer.fit_transform(X_tr_nn[valid_num]).astype(np.float32)
+            X_va_nn[valid_num] = imputer.transform(X_va_nn[valid_num]).astype(np.float32)
+            X_te_nn[valid_num] = imputer.transform(X_te_nn[valid_num]).astype(np.float32)
+
+            for c in valid_cat:
+                for df_part in (X_tr_nn, X_va_nn, X_te_nn):
+                    df_part[c] = df_part[c].astype(str).astype("category")
+
+            X_comb = pd.concat([X_tr_nn, X_va_nn], axis=0, ignore_index=True)
+            y_comb = np.concatenate([y_tr, y_va], axis=0)
+            val_idxs = [np.arange(len(X_tr_nn), len(X_comb))]
+
+            realmlp = RealMLP_TD_Classifier(
+                device=device if (torch and torch.cuda.is_available()) else "cpu",
+                random_state=seed,
+                n_cv=1,
+                n_refit=0,
+                n_ens=4 if fast_mode else 8,
+                val_metric_name="ref-ll-ts",
+                calibration_method="ts-mix",
+                use_ls=False,
+                ens_av_before_softmax=True,
+                batch_size=batch_size,
+                n_epochs=10 if fast_mode else 128,
+                verbosity=0,
+            )
+            realmlp.fit(X_comb, y_comb, val_idxs=val_idxs, cat_col_names=valid_cat)
+            rmlp_va_p = np.clip(realmlp.predict_proba(X_va_nn)[:, 1], 1e-6, 1.0 - 1e-6)
+            rmlp_te_p = np.clip(realmlp.predict_proba(X_te_nn)[:, 1], 1e-6, 1.0 - 1e-6)
+
+            tabm = TabM_D_Classifier(
+                device=device if (torch and torch.cuda.is_available()) else "cpu",
+                random_state=seed + 100,
+                n_cv=1,
+                n_refit=0,
+                val_metric_name="cross_entropy",
+                tfms=["quantile"],
+                share_training_batches=False,
+                batch_size=batch_size,
+                verbosity=0,
+            )
+            tabm.fit(X_comb, y_comb, val_idxs=val_idxs, cat_col_names=valid_cat)
+            tabm_va_p = np.clip(tabm.predict_proba(X_va_nn)[:, 1], 1e-6, 1.0 - 1e-6)
+            tabm_te_p = np.clip(tabm.predict_proba(X_te_nn)[:, 1], 1e-6, 1.0 - 1e-6)
+
+            return logit(rmlp_va_p), logit(rmlp_te_p), logit(tabm_va_p), logit(tabm_te_p)
+        except Exception as e:
+            logging.warning(f"PyTabKit execution note: {e}. Executing native PyTorch RealMLP-TD & TabM modules...")
+
+    # Native PyTorch Implementation
+    use_cuda = (device == "cuda" or (isinstance(device, str) and device.startswith("cuda"))) and (torch is not None and torch.cuda.is_available())
+    torch_device = torch.device(device if use_cuda else "cpu") if torch is not None else None
+
+    if torch is None:
+        # Fallback if torch is completely unavailable
+        from sklearn.linear_model import LogisticRegression
+        lr = LogisticRegression(C=0.1, max_iter=200)
+        imputer = SimpleImputer(strategy="median")
+        X_tr_imp = imputer.fit_transform(X_tr[valid_num])
+        X_va_imp = imputer.transform(X_va[valid_num])
+        X_te_imp = imputer.transform(X_te[valid_num])
+        lr.fit(X_tr_imp, y_tr)
+        va_z = lr.decision_function(X_va_imp)
+        te_z = lr.decision_function(X_te_imp)
+        return va_z, te_z, va_z, te_z
+
+    imputer = SimpleImputer(strategy="median")
+    scaler = StandardScaler()
+
+    num_tr = scaler.fit_transform(imputer.fit_transform(X_tr[valid_num])).astype(np.float32)
+    num_va = scaler.transform(imputer.transform(X_va[valid_num])).astype(np.float32)
+    num_te = scaler.transform(imputer.transform(X_te[valid_num])).astype(np.float32)
+
+    cat_dims = []
+    cats_tr, cats_va, cats_te = [], [], []
+    for c in valid_cat:
+        all_vals = pd.concat([X_tr[c], X_va[c], X_te[c]], axis=0).astype(str)
+        unique_vals = {v: idx for idx, v in enumerate(all_vals.unique())}
+        num_classes = len(unique_vals)
+        emb_dim = min(32, max(4, num_classes // 4 + 2))
+        cat_dims.append((num_classes, emb_dim))
+
+        cats_tr.append(X_tr[c].astype(str).map(unique_vals).fillna(0).values.astype(np.int64))
+        cats_va.append(X_va[c].astype(str).map(unique_vals).fillna(0).values.astype(np.int64))
+        cats_te.append(X_te[c].astype(str).map(unique_vals).fillna(0).values.astype(np.int64))
+
+    t_num_tr = torch.from_numpy(num_tr).to(torch_device)
+    t_num_va = torch.from_numpy(num_va).to(torch_device)
+    t_num_te = torch.from_numpy(num_te).to(torch_device)
+
+    t_cats_tr = [torch.from_numpy(c).to(torch_device) for c in cats_tr]
+    t_cats_va = [torch.from_numpy(c).to(torch_device) for c in cats_va]
+    t_cats_te = [torch.from_numpy(c).to(torch_device) for c in cats_te]
+
+    t_y_tr = torch.from_numpy(y_tr.astype(np.float32)).to(torch_device)
+    t_y_va = torch.from_numpy(y_va.astype(np.float32)).to(torch_device)
+
+    def _train_net(model, epochs: int = 15, lr: float = 1.5e-3):
+        model.to(torch_device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        criterion = nn.BCEWithLogitsLoss()
+        n_samples = len(num_tr)
+        best_va_loss = float("inf")
+        best_va_logits = None
+        best_te_logits = None
+
+        bs = batch_size if not fast_mode else 128
+        n_batches = int(np.ceil(n_samples / bs))
+
+        for ep in range(epochs):
+            model.train()
+            perm = torch.randperm(n_samples, device=torch_device)
+            for b in range(n_batches):
+                idx = perm[b * bs : (b + 1) * bs]
+                optimizer.zero_grad()
+                pred = model(t_num_tr[idx], [c[idx] for c in t_cats_tr])
+                loss = criterion(pred, t_y_tr[idx])
+                loss.backward()
+                optimizer.step()
+
+            model.eval()
+            with torch.no_grad():
+                va_logits = model(t_num_va, t_cats_va)
+                va_loss = criterion(va_logits, t_y_va).item()
+                if va_loss < best_va_loss:
+                    best_va_loss = va_loss
+                    best_va_logits = va_logits.cpu().numpy()
+                    best_te_logits = model(t_num_te, t_cats_te).cpu().numpy()
+
+        if best_va_logits is None:
+            model.eval()
+            with torch.no_grad():
+                best_va_logits = model(t_num_va, t_cats_va).cpu().numpy()
+                best_te_logits = model(t_num_te, t_cats_te).cpu().numpy()
+
+        return best_va_logits.astype(np.float64), best_te_logits.astype(np.float64)
+
+    epochs = 4 if fast_mode else 16
+    torch.manual_seed(seed)
+    rmlp_model = PyTorchRealMLP_TD(num_features=len(valid_num), cat_dims=cat_dims)
+    rmlp_va_logits, rmlp_te_logits = _train_net(rmlp_model, epochs=epochs, lr=1.5e-3)
+
+    torch.manual_seed(seed + 100)
+    tabm_model = PyTorchTabM_D(num_features=len(valid_num), cat_dims=cat_dims, k_ens=32 if not fast_mode else 8)
+    tabm_va_logits, tabm_te_logits = _train_net(tabm_model, epochs=epochs, lr=1.5e-3)
+
+    return rmlp_va_logits, rmlp_te_logits, tabm_va_logits, tabm_te_logits
+

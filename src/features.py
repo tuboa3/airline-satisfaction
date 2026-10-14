@@ -15,6 +15,7 @@ from sklearn.mixture import BayesianGaussianMixture
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import LabelEncoder, StandardScaler, TargetEncoder
 import lightgbm as lgb
+from scipy.special import expit, logit
 
 # Suppress pandas fragmentation warnings when engineering 100+ columns
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
@@ -2535,4 +2536,315 @@ def apply_structured_survey_dropout(
             vals[drop_mask] = 0
             df_aug[col] = vals
     return df_aug
+
+
+def build_original_prior_teacher_and_stats(
+    df_syn_train: pd.DataFrame,
+    df_syn_test: pd.DataFrame,
+    df_orig: pd.DataFrame,
+    feature_cols: list[str] | None = None,
+    cat_cols: list[str] | None = None,
+    target_col: str = "satisfaction",
+    T_orig: float = 1.15,
+    seed: int = 42,
+    fast_mode: bool = False,
+    n_jobs: int = -1,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Isolates the 129,880-row original dataset from synthetic training folds (Tier 1).
+    Extracts:
+    1. Dedicated Teacher Ensemble Logits with exact Bayes Log-Odds Prior Shift:
+       z_orig_adj = (z_orig / T_orig) + delta_prior
+       where delta_prior = logit(pi_syn) - logit(pi_orig) = +0.45611
+    2. Multi-way m-estimate smoothed target priors from original dataset:
+       - ["Flight Distance", "Class", "Online boarding"]
+       - ["Type of Travel", "Class", "Inflight wifi service", "Online boarding"]
+       - ["Flight Distance", "Type of Travel", "Inflight wifi service"]
+       alongside binary exact match indicators (orig_group_in_orig_k).
+    Row order is strictly preserved with index integrity.
+    """
+    from sklearn.model_selection import StratifiedKFold
+
+    y_syn = resolve_binary_target(df_syn_train[target_col]).astype(int)
+    y_orig = resolve_binary_target(df_orig[target_col]).astype(int)
+
+    pi_syn = float(np.mean(y_syn))     # ~0.5480
+    pi_orig = float(np.mean(y_orig))   # ~0.4345
+    delta_prior = float(logit(pi_syn) - logit(pi_orig))  # +0.45611
+
+    if cat_cols is None:
+        cat_cols = ["Gender", "Customer Type", "Type of Travel", "Class"]
+
+    if feature_cols is None:
+        excluded = {"id", "Unnamed: 0", target_col, "is_original", "sample_weight"}
+        feature_cols = [
+            c for c in df_orig.columns
+            if c not in excluded and c in df_syn_train.columns and c in df_syn_test.columns
+        ]
+
+    # Prepare datasets for teacher model
+    X_orig = df_orig[feature_cols].copy()
+    X_tr_syn = df_syn_train[feature_cols].copy()
+    X_te_syn = df_syn_test[feature_cols].copy()
+
+    for c in cat_cols:
+        if c in X_orig.columns:
+            X_orig[c] = X_orig[c].astype(str).astype("category")
+        if c in X_tr_syn.columns:
+            X_tr_syn[c] = X_tr_syn[c].astype(str).astype("category")
+        if c in X_te_syn.columns:
+            X_te_syn[c] = X_te_syn[c].astype(str).astype("category")
+
+    n_splits = 2 if fast_mode else 5
+    n_estimators = 60 if fast_mode else 1500
+    early_stop = 20 if fast_mode else 50
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    tr_syn_logits = np.zeros(len(df_syn_train), dtype=np.float64)
+    te_syn_logits = np.zeros(len(df_syn_test), dtype=np.float64)
+
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_orig, y_orig)):
+        model_lgb = lgb.LGBMClassifier(
+            n_estimators=n_estimators,
+            learning_rate=0.035,
+            num_leaves=63,
+            subsample_for_bin=50000,
+            colsample_bytree=0.80,
+            subsample=0.80,
+            random_state=seed + fold,
+            n_jobs=n_jobs,
+            verbose=-1,
+        )
+        model_lgb.fit(
+            X_orig.iloc[tr_idx],
+            y_orig[tr_idx],
+            eval_set=[(X_orig.iloc[va_idx], y_orig[va_idx])],
+            callbacks=[lgb.early_stopping(early_stop, verbose=False)],
+        )
+        p_tr = np.clip(model_lgb.predict_proba(X_tr_syn)[:, 1], 1e-6, 1.0 - 1e-6)
+        p_te = np.clip(model_lgb.predict_proba(X_te_syn)[:, 1], 1e-6, 1.0 - 1e-6)
+        tr_syn_logits += logit(p_tr) / n_splits
+        te_syn_logits += logit(p_te) / n_splits
+
+    # Apply Bayes Log-Odds Prior Shift (+0.45611) and Noise Temperature Scaling (T_orig=1.15)
+    for df_target, raw_z in [(df_syn_train, tr_syn_logits), (df_syn_test, te_syn_logits)]:
+        z_adj = (raw_z / T_orig) + delta_prior
+        p_adj = expit(z_adj)
+        df_target["orig_teacher_logit_adj"] = z_adj
+        df_target["orig_teacher_prob_adj"] = p_adj
+        df_target["orig_teacher_entropy"] = -(
+            p_adj * np.log(p_adj + 1e-12) + (1.0 - p_adj) * np.log(1.0 - p_adj + 1e-12)
+        )
+
+    # 2. Multi-Way Conditional Bayesian Priors from Original Data
+    group_sets = [
+        ["Flight Distance", "Class", "Online boarding"],
+        ["Type of Travel", "Class", "Inflight wifi service", "Online boarding"],
+        ["Flight Distance", "Type of Travel", "Inflight wifi service"],
+    ]
+    m_smooth = 10.0
+    for idx, grp in enumerate(group_sets):
+        valid_grp = [c for c in grp if c in df_orig.columns and c in df_syn_train.columns]
+        if not valid_grp:
+            continue
+        stats = df_orig.groupby(valid_grp, observed=False)[target_col].agg(["count", "mean"]).reset_index()
+        p_smooth_orig = (stats["count"] * stats["mean"] + m_smooth * pi_orig) / (stats["count"] + m_smooth)
+        stats[f"orig_bayes_prior_{idx}"] = expit(logit(np.clip(p_smooth_orig, 1e-5, 1.0 - 1e-5)) + delta_prior)
+        stats[f"orig_group_in_orig_{idx}"] = 1
+
+        keep_cols = valid_grp + [f"orig_bayes_prior_{idx}", f"orig_group_in_orig_{idx}"]
+        stats_sub = stats[keep_cols].drop_duplicates(subset=valid_grp)
+
+        df_syn_train["_tmp_idx"] = np.arange(len(df_syn_train))
+        df_syn_test["_tmp_idx"] = np.arange(len(df_syn_test))
+
+        m_tr = pd.merge(df_syn_train[valid_grp + ["_tmp_idx"]], stats_sub, on=valid_grp, how="left").sort_values("_tmp_idx")
+        m_te = pd.merge(df_syn_test[valid_grp + ["_tmp_idx"]], stats_sub, on=valid_grp, how="left").sort_values("_tmp_idx")
+
+        df_syn_train[f"orig_group_in_orig_{idx}"] = m_tr[f"orig_group_in_orig_{idx}"].fillna(0).astype(np.int8).values
+        df_syn_train[f"orig_bayes_prior_{idx}"] = m_tr[f"orig_bayes_prior_{idx}"].fillna(pi_syn).astype(np.float32).values
+
+        df_syn_test[f"orig_group_in_orig_{idx}"] = m_te[f"orig_group_in_orig_{idx}"].fillna(0).astype(np.int8).values
+        df_syn_test[f"orig_bayes_prior_{idx}"] = m_te[f"orig_bayes_prior_{idx}"].fillna(pi_syn).astype(np.float32).values
+
+        df_syn_train.drop(columns=["_tmp_idx"], inplace=True)
+        df_syn_test.drop(columns=["_tmp_idx"], inplace=True)
+
+    return df_syn_train, df_syn_test
+
+
+def engineer_s6e10_domain_features(
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
+    target_col: str = "satisfaction",
+    n_splits: int = 10,
+    seed: int = 42,
+    fast_mode: bool = False,
+    n_jobs: int = -1,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Constructs the high-leverage S6E10 feature set (Tier 2):
+    1. Flight Distance treated as a discrete categorical Route ID + Route aggregations.
+    2. Zero-inflation indicators (WiFi==0, Boarding==0) and non-zero psychometric row stats.
+    3. Delay ratios and non-linear arrival-departure diffs.
+    4. Leak-free Out-of-Fold Target Encoding on Route ID & Route x Class interactions.
+    5. Self-supervised Auxiliary-Task OOF predictions (Business Travel, Business Class, Boarding residual).
+    """
+    from sklearn.model_selection import StratifiedKFold
+
+    n_tr = len(df_train)
+    df_all = pd.concat([df_train, df_test], axis=0, ignore_index=True)
+
+    # --- 1. Route ID (Flight Distance as Category) & Route-Level Context ---
+    df_all["route_id"] = df_all["Flight Distance"].astype(int).astype(str)
+    df_all["route_class_id"] = df_all["route_id"] + "_" + df_all["Class"].astype(str)
+    df_all["route_travel_id"] = df_all["route_id"] + "_" + df_all["Type of Travel"].astype(str)
+
+    # Frequency encoding on combined transductive covariate distribution (train + test)
+    df_all["route_freq"] = df_all["route_id"].map(df_all["route_id"].value_counts()).astype(np.int32)
+    df_all["route_class_freq"] = df_all["route_class_id"].map(df_all["route_class_id"].value_counts()).astype(np.int32)
+    df_all["age_freq"] = df_all["Age"].map(df_all["Age"].value_counts()).astype(np.int32)
+
+    # Route-level service & delay aggregations
+    for agg_col in ["Online boarding", "Inflight wifi service", "Departure Delay in Minutes", "Seat comfort"]:
+        if agg_col in df_all.columns:
+            grp_mean = df_all.groupby("route_id", observed=False)[agg_col].transform("mean").astype(np.float32)
+            grp_std = df_all.groupby("route_id", observed=False)[agg_col].transform("std").fillna(0).astype(np.float32)
+            df_all[f"route_mean_{agg_col}"] = grp_mean
+            df_all[f"route_diff_{agg_col}"] = (df_all[agg_col] - grp_mean).astype(np.float32)
+            df_all[f"route_z_{agg_col}"] = ((df_all[agg_col] - grp_mean) / (grp_std + 1e-5)).astype(np.float32)
+
+    # --- 2. Zero-Inflation & Non-Zero Survey Psychometric Statistics ---
+    valid_survey = [c for c in SURVEY_COLS if c in df_all.columns]
+    ratings_mat = df_all[valid_survey].values.astype(np.float32)
+    df_all["n_zero_ratings"] = (ratings_mat == 0).sum(axis=1).astype(np.int8)
+    df_all["n_five_ratings"] = (ratings_mat == 5).sum(axis=1).astype(np.int8)
+    df_all["n_one_ratings"] = (ratings_mat == 1).sum(axis=1).astype(np.int8)
+    df_all["zero_wifi_flag"] = (df_all["Inflight wifi service"] == 0).astype(np.int8)
+    df_all["zero_boarding_flag"] = (df_all["Online boarding"] == 0).astype(np.int8)
+
+    # Mask 0 ('Not Applicable') as NaN to compute pure rater-leniency statistics
+    masked_ratings = np.where(ratings_mat == 0, np.nan, ratings_mat)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        mean_r = np.nanmean(masked_ratings, axis=1)
+        std_r = np.nanstd(masked_ratings, axis=1)
+        min_r = np.nanmin(masked_ratings, axis=1)
+        max_r = np.nanmax(masked_ratings, axis=1)
+
+    df_all["nonzero_rating_mean"] = np.nan_to_num(mean_r, nan=2.5).astype(np.float32)
+    df_all["nonzero_rating_std"] = np.nan_to_num(std_r, nan=0.0).astype(np.float32)
+    df_all["nonzero_rating_min"] = np.nan_to_num(min_r, nan=0.0).astype(np.float32)
+    df_all["nonzero_rating_max"] = np.nan_to_num(max_r, nan=0.0).astype(np.float32)
+
+    # Rater-centered primary features
+    df_all["boarding_minus_user_mean"] = (df_all["Online boarding"] - df_all["nonzero_rating_mean"]).astype(np.float32)
+    df_all["wifi_minus_user_mean"] = (df_all["Inflight wifi service"] - df_all["nonzero_rating_mean"]).astype(np.float32)
+    if "Inflight entertainment" in df_all.columns:
+        df_all["entertainment_minus_user_mean"] = (df_all["Inflight entertainment"] - df_all["nonzero_rating_mean"]).astype(np.float32)
+    df_all["wifi_x_boarding"] = (df_all["Inflight wifi service"] * df_all["Online boarding"]).astype(np.float32)
+
+    # --- 3. Delay Nonlinearities ---
+    dep_d = df_all["Departure Delay in Minutes"].fillna(0).astype(np.float32)
+    arr_d = df_all["Arrival Delay in Minutes"].fillna(dep_d).astype(np.float32)
+    df_all["delay_diff"] = (arr_d - dep_d).astype(np.float32)
+    df_all["delay_total"] = (arr_d + dep_d).astype(np.float32)
+    df_all["is_zero_dep_delay"] = (dep_d == 0).astype(np.int8)
+    df_all["is_zero_arr_delay"] = (arr_d == 0).astype(np.int8)
+    df_all["delay_per_mile"] = (df_all["delay_total"] / (df_all["Flight Distance"] + 10.0)).astype(np.float32)
+
+    df_tr = df_all.iloc[:n_tr].copy().reset_index(drop=True)
+    df_te = df_all.iloc[n_tr:].copy().reset_index(drop=True)
+    y = resolve_binary_target(df_tr[target_col]).astype(int)
+    global_prior = float(np.mean(y))
+
+    # --- 4. Out-of-Fold Bayesian Target Encoding on High-Cardinality Route IDs ---
+    skf_te = StratifiedKFold(n_splits=n_splits if not fast_mode else 2, shuffle=True, random_state=seed)
+    te_cols = ["route_id", "route_class_id", "route_travel_id"]
+    m_weight = 15.0
+
+    for col in te_cols:
+        df_tr[f"oof_te_{col}"] = np.nan
+        for tr_idx, va_idx in skf_te.split(df_tr, y):
+            tr_fold = df_tr.iloc[tr_idx]
+            stats = tr_fold.groupby(col, observed=False)[target_col].agg(["count", "mean"])
+            smoothed = (stats["count"] * stats["mean"] + m_weight * global_prior) / (stats["count"] + m_weight)
+            df_tr.iloc[va_idx, df_tr.columns.get_loc(f"oof_te_{col}")] = (
+                df_tr.iloc[va_idx][col].map(smoothed).fillna(global_prior).values
+            )
+        full_stats = df_tr.groupby(col, observed=False)[target_col].agg(["count", "mean"])
+        full_smoothed = (full_stats["count"] * full_stats["mean"] + m_weight * global_prior) / (full_stats["count"] + m_weight)
+        df_te[f"oof_te_{col}"] = df_te[col].map(full_smoothed).fillna(global_prior).values
+
+    # --- 5. Self-Supervised Auxiliary-Task Features (OOF across Train+Test) ---
+    aux_candidates = valid_survey + ["Flight Distance", "Age", "Departure Delay in Minutes", "Arrival Delay in Minutes"]
+    aux_features = [c for c in aux_candidates if c in df_all.columns]
+    y_aux_travel = (df_all["Type of Travel"] == "Business travel").astype(int).values
+    y_aux_class = (df_all["Class"] == "Business").astype(int).values
+    y_aux_boarding = df_all["Online boarding"].values.astype(np.float32)
+
+    aux_travel_oof = np.zeros(len(df_all), dtype=np.float32)
+    aux_class_oof = np.zeros(len(df_all), dtype=np.float32)
+    aux_boarding_oof = np.zeros(len(df_all), dtype=np.float32)
+
+    n_aux_splits = 2 if fast_mode else 5
+    n_aux_trees = 40 if fast_mode else 200
+    skf_aux = StratifiedKFold(n_splits=n_aux_splits, shuffle=True, random_state=seed)
+    features_no_boarding = [c for c in aux_features if c != "Online boarding"]
+
+    for tr_idx, va_idx in skf_aux.split(df_all, y_aux_travel):
+        # Aux 1: Predict Business Travel from ratings + distance
+        clf_t = lgb.LGBMClassifier(
+            n_estimators=n_aux_trees,
+            learning_rate=0.08,
+            num_leaves=31,
+            subsample=0.7,
+            colsample_bytree=0.8,
+            random_state=seed,
+            n_jobs=n_jobs,
+            verbose=-1,
+        )
+        clf_t.fit(df_all[aux_features].iloc[tr_idx], y_aux_travel[tr_idx])
+        aux_travel_oof[va_idx] = clf_t.predict_proba(df_all[aux_features].iloc[va_idx])[:, 1]
+
+        # Aux 2: Predict Business Class from ratings + distance
+        clf_c = lgb.LGBMClassifier(
+            n_estimators=n_aux_trees,
+            learning_rate=0.08,
+            num_leaves=31,
+            subsample=0.7,
+            colsample_bytree=0.8,
+            random_state=seed,
+            n_jobs=n_jobs,
+            verbose=-1,
+        )
+        clf_c.fit(df_all[aux_features].iloc[tr_idx], y_aux_class[tr_idx])
+        aux_class_oof[va_idx] = clf_c.predict_proba(df_all[aux_features].iloc[va_idx])[:, 1]
+
+        # Aux 3: Predict Expected Online Boarding from other ratings
+        reg_b = lgb.LGBMRegressor(
+            n_estimators=n_aux_trees,
+            learning_rate=0.08,
+            num_leaves=31,
+            subsample=0.7,
+            colsample_bytree=0.8,
+            random_state=seed,
+            n_jobs=n_jobs,
+            verbose=-1,
+        )
+        reg_b.fit(df_all[features_no_boarding].iloc[tr_idx], y_aux_boarding[tr_idx])
+        aux_boarding_oof[va_idx] = reg_b.predict(df_all[features_no_boarding].iloc[va_idx])
+
+    df_tr["aux_prob_biz_travel"] = aux_travel_oof[:n_tr]
+    df_tr["aux_prob_biz_class"] = aux_class_oof[:n_tr]
+    df_tr["aux_expected_boarding"] = aux_boarding_oof[:n_tr]
+    df_tr["aux_boarding_residual"] = (df_tr["Online boarding"] - df_tr["aux_expected_boarding"]).astype(np.float32)
+
+    df_te["aux_prob_biz_travel"] = aux_travel_oof[n_tr:]
+    df_te["aux_prob_biz_class"] = aux_class_oof[n_tr:]
+    df_te["aux_expected_boarding"] = aux_boarding_oof[n_tr:]
+    df_te["aux_boarding_residual"] = (df_te["Online boarding"] - df_te["aux_expected_boarding"]).astype(np.float32)
+
+    return df_tr, df_te
+
 

@@ -34,21 +34,29 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import scipy.special as sp
+import lightgbm as lgb
+import xgboost as xgb
 
 from src.config import FeatureConfig, PathConfig
 from src.dataset import DatasetIngestion
 from src.ensemble import (
     StrictlyMonotonicPowerLogitStacker,
     apply_transductive_knn_laplacian_smoothing,
+    meta_stack_parallel_families,
 )
 from src.features import (
     AsymmetricViewBuilder,
     HurdleGradedResponseModel,
     TransductiveManifoldAndDGPInverter,
     apply_structured_survey_dropout,
+    build_original_prior_teacher_and_stats,
+    engineer_s6e10_domain_features,
 )
 from src.models import (
     HierarchicalResidualGBDTCascade,
+    GramSchmidtCascadeDecoupler,
+    train_catboost_dual_representation,
+    train_pytabkit_deep_tabular,
     select_certainty_masked_pseudo_labels,
 )
 from src.postprocess import ExactMatchPostprocessor
@@ -56,11 +64,42 @@ from src.utils import detect_hardware, get_logger, resolve_binary_target, timer
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Argon 3-GBDT Hierarchical Cascade Engine")
+    parser = argparse.ArgumentParser(description="Argon Research: Remediated Parallel 5-Family & Cascade Engine")
+    parser.add_argument(
+        "--architecture",
+        type=str,
+        default="parallel_5family",
+        choices=["parallel_5family", "cascade"],
+        help="Architecture: 'parallel_5family' (5-family remediated champion) or 'cascade' (3-stage residual cascade)",
+    )
+    parser.add_argument(
+        "--enable_lgb",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable Leaf-Wise LightGBM family",
+    )
+    parser.add_argument(
+        "--enable_xgb",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable Depth-Wise XGBoost family",
+    )
+    parser.add_argument(
+        "--enable_catboost",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable All-Categorical Oblivious Tree CatBoost family",
+    )
+    parser.add_argument(
+        "--enable_neural",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable Deep Tabular Neural families (RealMLP-TD & TabM)",
+    )
     parser.add_argument("--folds", type=int, default=10, help="Number of cross-validation folds")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--beta_12", type=float, default=0.72, help="Stage 1 -> Stage 2 margin handoff")
-    parser.add_argument("--beta_23", type=float, default=0.75, help="Stage 2 -> Stage 3 init_score handoff")
+    parser.add_argument("--beta_12", type=float, default=0.72, help="Stage 1 -> Stage 2 margin handoff (cascade mode)")
+    parser.add_argument("--beta_23", type=float, default=0.75, help="Stage 2 -> Stage 3 init_score handoff (cascade mode)")
     parser.add_argument("--n_jobs", type=int, default=-1, help="Number of CPU cores/threads (-1 to use all cores)")
     parser.add_argument(
         "--gpu",
@@ -72,20 +111,20 @@ def parse_args():
         "--use_orig_data",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Concatenate adversarial density-weighted original data (Vector 4, +24 bps)",
+        help="Concatenate adversarial density-weighted original data (cascade mode)",
     )
     parser.add_argument(
         "--use_distillation",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Cross-fitted two-teacher logit distillation (Vector 1, +28 bps)",
+        help="Cross-fitted two-teacher logit distillation (cascade mode)",
     )
     parser.add_argument(
         "--use_pseudo_labels",
         action="store_true",
-        help="Enable Bayesian certainty-masked pseudo-labeling with survey dropout (Vector 3)",
+        help="Enable Bayesian certainty-masked pseudo-labeling with survey dropout",
     )
-    parser.add_argument("--two_pass", action="store_true", help="Two-pass outer margin handoff to prevent in-sample residual starvation (Vector 5)")
+    parser.add_argument("--two_pass", action="store_true", help="Two-pass outer margin handoff (cascade mode)")
     parser.add_argument(
         "--fold_workers",
         type=int,
@@ -95,6 +134,337 @@ def parse_args():
     parser.add_argument("--use_laplacian", action="store_true", help="Apply Graph Laplacian test manifold smoothing")
     parser.add_argument("--fast", action="store_true", help="Fast smoke-test mode on a lightweight sample")
     return parser.parse_args()
+
+
+def run_parallel_5family_pipeline(
+    args,
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    orig_df: pd.DataFrame | None,
+    orig_files: list[str],
+    ingestion: DatasetIngestion,
+    paths: PathConfig,
+    feature_cfg: FeatureConfig,
+    logger: logging.Logger,
+    n_cpus: int,
+    use_gpu: bool,
+    num_gpus: int,
+    gpu_devs: list[str],
+):
+    """
+    Executes the Remediated Parallel Five-Family Architecture with Isolated Original-Prior Teacher
+    per forensic specifications in argon-research.md (Kaggle S6E10 Rank 1 Frontier).
+    """
+    logger.info("=" * 80)
+    logger.info("STARTING REMEDIATED PARALLEL FIVE-FAMILY ARCHITECTURE (S6E10)")
+    logger.info(f"Folds: {args.folds} | Seed: {args.seed} | Fast Mode: {args.fast}")
+    logger.info(f"Hardware Allocation: Active CPU Cores={n_cpus} | GPU Acceleration={use_gpu} (Total GPUs={num_gpus}: {gpu_devs})")
+    logger.info("=" * 80)
+
+    if args.fast:
+        logger.info("[FAST MODE] Subsampling train to 1,200 rows and test to 600 rows for smoke test.")
+        train_df = train_df.iloc[:1200].copy().reset_index(drop=True)
+        test_df = test_df.iloc[:600].copy().reset_index(drop=True)
+        if orig_df is not None:
+            orig_df = orig_df.iloc[:600].copy().reset_index(drop=True)
+        args.folds = 2
+
+    # Tier 1: Dedicated Teacher on Original Dataset + Bayes Prior Shift (+0.45611)
+    if orig_df is not None:
+        logger.info("=" * 80)
+        logger.info("TIER 1: ISOLATING ORIGINAL PRIOR TEACHER & MULTI-WAY BAYESIAN PRIORS")
+        logger.info("=" * 80)
+        train_df, test_df = build_original_prior_teacher_and_stats(
+            df_syn_train=train_df,
+            df_syn_test=test_df,
+            df_orig=orig_df,
+            target_col=feature_cfg.target_col,
+            T_orig=1.15,
+            seed=args.seed,
+            fast_mode=args.fast,
+            n_jobs=n_cpus,
+        )
+        logger.info("Tier 1 features generated: orig_teacher_logit_adj, orig_teacher_prob_adj, orig_bayes_prior_*")
+
+    # Tier 2: High-Leverage Domain Features (Route ID, Psychometrics, Aux Tasks)
+    logger.info("=" * 80)
+    logger.info("TIER 2: ENGINEERING S6E10 DOMAIN FEATURES (ROUTE ID, PSYCHOMETRICS, AUX TASKS)")
+    logger.info("=" * 80)
+    train_df, test_df = engineer_s6e10_domain_features(
+        df_train=train_df,
+        df_test=test_df,
+        target_col=feature_cfg.target_col,
+        n_splits=args.folds,
+        seed=args.seed,
+        fast_mode=args.fast,
+        n_jobs=n_cpus,
+    )
+    logger.info(f"Tier 2 complete. Train feature shape: {train_df.shape}, Test feature shape: {test_df.shape}")
+
+    y_train = resolve_binary_target(train_df[feature_cfg.target_col]).astype(int)
+    test_ids = test_df[feature_cfg.id_col].to_numpy()
+
+    # Column separation
+    cat_candidates = ["Gender", "Customer Type", "Type of Travel", "Class", "route_id", "route_class_id", "route_travel_id"]
+    cat_cols = [c for c in cat_candidates if c in train_df.columns]
+    excluded_cols = {"id", "Unnamed: 0", feature_cfg.target_col, "is_original", "sample_weight"}
+    feature_cols = [c for c in train_df.columns if c not in excluded_cols]
+    num_cols = [c for c in feature_cols if c not in cat_cols]
+
+    base_features = [
+        c for c in [
+            "Gender", "Customer Type", "Age", "Type of Travel", "Class",
+            "Flight Distance", "Inflight wifi service", "Departure/Arrival time convenient",
+            "Ease of Online booking", "Gate location", "Food and drink", "Online boarding",
+            "Seat comfort", "Inflight entertainment", "On-board service", "Leg room service",
+            "Baggage handling", "Checkin service", "Inflight service", "Cleanliness",
+            "Departure Delay in Minutes", "Arrival Delay in Minutes"
+        ] if c in train_df.columns
+    ]
+    eng_num = [c for c in num_cols if c not in base_features]
+
+    # Convert categoricals to unified CategoricalDtype for LightGBM/XGBoost
+    for c in cat_cols:
+        cats = pd.concat([train_df[c].astype(str), test_df[c].astype(str)], axis=0).unique()
+        cat_type = pd.CategoricalDtype(categories=cats)
+        train_df[c] = train_df[c].astype(str).astype(cat_type)
+        test_df[c] = test_df[c].astype(str).astype(cat_type)
+
+    # Active model families
+    active_families = []
+    if args.enable_lgb:
+        active_families.append("LightGBM")
+    if args.enable_xgb:
+        active_families.append("XGBoost")
+    if args.enable_catboost:
+        active_families.append("CatBoost")
+    if args.enable_neural:
+        active_families.append("RealMLP-TD")
+        active_families.append("TabM")
+
+    oof_logits = {fam: np.zeros(len(train_df), dtype=np.float64) for fam in active_families}
+    test_logits = {fam: np.zeros(len(test_df), dtype=np.float64) for fam in active_families}
+
+    # Device allocation
+    xgb_dev = "cuda:0" if use_gpu else "cpu"
+    cb_task_type = "GPU" if use_gpu else "CPU"
+    neural_dev = "cuda:1" if (use_gpu and num_gpus > 1) else ("cuda:0" if use_gpu else "cpu")
+
+    skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
+    logger.info("=" * 80)
+    logger.info(f"COMMENCING {args.folds}-FOLD CROSS-FITTING OF PARALLEL 5-FAMILY ENSEMBLE")
+    logger.info(f"Active Families: {active_families}")
+    logger.info(f"Hardware Mapping: LGBM (4 CPU cores), XGB ({xgb_dev}), CatBoost ({cb_task_type}), Neural ({neural_dev})")
+    logger.info("=" * 80)
+
+    for fold, (trn_idx, val_idx) in enumerate(skf.split(train_df, y_train)):
+        logger.info(f"--- Processing Fold {fold + 1}/{args.folds} ---")
+        X_tr_f = train_df[feature_cols].iloc[trn_idx]
+        y_tr_f = y_train[trn_idx]
+        X_va_f = train_df[feature_cols].iloc[val_idx]
+        y_va_f = y_train[val_idx]
+        X_te_f = test_df[feature_cols]
+
+        # 1. Leaf-Wise LightGBM
+        if args.enable_lgb:
+            model_lgb = lgb.LGBMClassifier(
+                n_estimators=3000 if not args.fast else 40,
+                learning_rate=0.035 if not args.fast else 0.1,
+                num_leaves=95 if not args.fast else 31,
+                colsample_bytree=0.80,
+                subsample=0.80,
+                subsample_freq=1,
+                min_child_samples=45,
+                reg_alpha=1.5,
+                reg_lambda=5.0,
+                force_row_wise=True,
+                n_jobs=n_cpus,
+                random_state=args.seed + fold,
+                verbose=-1,
+            )
+            model_lgb.fit(
+                X_tr_f, y_tr_f,
+                eval_set=[(X_va_f, y_va_f)],
+                callbacks=[lgb.early_stopping(100 if not args.fast else 15, verbose=False)],
+            )
+            p_va = np.clip(model_lgb.predict_proba(X_va_f)[:, 1], 1e-6, 1.0 - 1e-6)
+            p_te = np.clip(model_lgb.predict_proba(X_te_f)[:, 1], 1e-6, 1.0 - 1e-6)
+            oof_logits["LightGBM"][val_idx] = sp.logit(p_va)
+            test_logits["LightGBM"] += sp.logit(p_te) / args.folds
+            auc_lgb = roc_auc_score(y_va_f, p_va)
+            logger.info(f"Fold {fold+1} LightGBM: AUC = {auc_lgb:.5f}")
+
+        # 2. Depth-Wise XGBoost
+        if args.enable_xgb:
+            model_xgb = xgb.XGBClassifier(
+                n_estimators=3000 if not args.fast else 40,
+                learning_rate=0.035 if not args.fast else 0.1,
+                max_depth=7 if not args.fast else 4,
+                tree_method="hist",
+                device=xgb_dev,
+                subsample=0.80,
+                colsample_bytree=0.80,
+                min_child_weight=25.0,
+                reg_alpha=2.0,
+                reg_lambda=8.0,
+                eval_metric="auc",
+                enable_categorical=True,
+                random_state=args.seed + fold,
+                n_jobs=n_cpus,
+            )
+            try:
+                model_xgb.fit(
+                    X_tr_f, y_tr_f,
+                    eval_set=[(X_va_f, y_va_f)],
+                    verbose=False,
+                )
+            except Exception as e:
+                if xgb_dev != "cpu":
+                    logger.warning(f"XGBoost GPU note ({e}). Falling back to multi-core CPU...")
+                    model_xgb.set_params(device="cpu")
+                    model_xgb.fit(X_tr_f, y_tr_f, eval_set=[(X_va_f, y_va_f)], verbose=False)
+                else:
+                    raise e
+            p_va = np.clip(model_xgb.predict_proba(X_va_f)[:, 1], 1e-6, 1.0 - 1e-6)
+            p_te = np.clip(model_xgb.predict_proba(X_te_f)[:, 1], 1e-6, 1.0 - 1e-6)
+            oof_logits["XGBoost"][val_idx] = sp.logit(p_va)
+            test_logits["XGBoost"] += sp.logit(p_te) / args.folds
+            auc_xgb = roc_auc_score(y_va_f, p_va)
+            logger.info(f"Fold {fold+1} XGBoost:  AUC = {auc_xgb:.5f}")
+
+        # 3. All-Categorical Oblivious Tree CatBoost
+        if args.enable_catboost:
+            cb_va_z, cb_te_z = train_catboost_dual_representation(
+                X_tr=X_tr_f,
+                y_tr=y_tr_f,
+                X_va=X_va_f,
+                y_va=y_va_f,
+                X_te=X_te_f,
+                base_features=base_features,
+                engineered_num_features=eng_num,
+                seed=args.seed + fold,
+                task_type=cb_task_type,
+                iterations=3500 if not args.fast else 40,
+                learning_rate=0.035 if not args.fast else 0.1,
+                early_stopping_rounds=150 if not args.fast else 15,
+            )
+            oof_logits["CatBoost"][val_idx] = cb_va_z
+            test_logits["CatBoost"] += cb_te_z / args.folds
+            auc_cb = roc_auc_score(y_va_f, sp.expit(cb_va_z))
+            logger.info(f"Fold {fold+1} CatBoost: AUC = {auc_cb:.5f}")
+
+        # 4 & 5. Deep Tabular Neural Models (RealMLP-TD & TabM)
+        if args.enable_neural:
+            rmlp_va_z, rmlp_te_z, tabm_va_z, tabm_te_z = train_pytabkit_deep_tabular(
+                X_tr=X_tr_f,
+                y_tr=y_tr_f,
+                X_va=X_va_f,
+                y_va=y_va_f,
+                X_te=X_te_f,
+                num_cols=num_cols,
+                cat_cols=cat_cols,
+                seed=args.seed + fold,
+                device=neural_dev,
+                fast_mode=args.fast,
+            )
+            oof_logits["RealMLP-TD"][val_idx] = rmlp_va_z
+            test_logits["RealMLP-TD"] += rmlp_te_z / args.folds
+            oof_logits["TabM"][val_idx] = tabm_va_z
+            test_logits["TabM"] += tabm_te_z / args.folds
+            auc_rmlp = roc_auc_score(y_va_f, sp.expit(rmlp_va_z))
+            auc_tabm = roc_auc_score(y_va_f, sp.expit(tabm_va_z))
+            logger.info(f"Fold {fold+1} RealMLP:  AUC = {auc_rmlp:.5f} | TabM: AUC = {auc_tabm:.5f}")
+
+    # Standalone model evaluation
+    logger.info("=" * 80)
+    logger.info("PARALLEL 5-FAMILY STANDALONE OOF PERFORMANCE")
+    auc_per_model = {}
+    for fam in active_families:
+        auc_f = float(roc_auc_score(y_train, sp.expit(oof_logits[fam])))
+        auc_per_model[fam] = auc_f
+        logger.info(f"  {fam:<15}: OOF ROC-AUC = {auc_f:.6f}")
+
+    # Tier 4: Temperature-Calibrated L2 Meta-Stacker
+    logger.info("=" * 80)
+    logger.info("TIER 4: TEMPERATURE-CALIBRATED L2 META-STACKER ON LOG-ODDS")
+    logger.info("=" * 80)
+    champ_oof_probs, champ_test_probs, stacked_auc, r_mean, n_eff, corr_mat = meta_stack_parallel_families(
+        oof_logits_dict=oof_logits,
+        test_logits_dict=test_logits,
+        y=y_train,
+        C_reg=0.25,
+        n_splits=args.folds,
+        seed=args.seed,
+    )
+    logger.info(f"Pairwise Off-Diagonal Mean Correlation: r_mean = {r_mean:.5f}")
+    logger.info(f"Effective Ensemble Size (N_eff): {n_eff:.4f}")
+    logger.info(f"CHAMPION STACKED OOF ROC-AUC: {stacked_auc:.6f}")
+    logger.info(f"Target Barrier: 0.962430 | Target Gate: 0.963000")
+
+    # Exact-Match Deterministic Ground-Truth Overrides
+    try:
+        if orig_files:
+            orig_ref = ingestion._standardize_columns(pd.read_csv(orig_files[0]), is_original=True)
+            postproc = ExactMatchPostprocessor(paths=paths, feature_cfg=feature_cfg)
+            matches = postproc.find_exact_matches(test_df, orig_ref)
+            if len(matches) > 0:
+                logger.info(f"Applying {len(matches)} exact ground-truth test matches.")
+                test_sub_df = pd.DataFrame({feature_cfg.id_col: test_ids, feature_cfg.target_col: champ_test_probs})
+                for row_id, match_target in matches.items():
+                    test_sub_df.loc[test_sub_df[feature_cfg.id_col] == row_id, feature_cfg.target_col] = match_target
+                champ_test_probs = test_sub_df[feature_cfg.target_col].to_numpy()
+    except Exception as e:
+        logger.warning(f"Notice on exact-match overrides: {e}")
+
+    # Submission Export & Integrity Verification
+    os.makedirs(paths.submissions_dir, exist_ok=True)
+    os.makedirs(paths.output_dir, exist_ok=True)
+
+    sub_df = pd.DataFrame({
+        feature_cfg.id_col: test_ids,
+        feature_cfg.target_col: champ_test_probs,
+    })
+    sub_path = os.path.join(paths.submissions_dir, "submission_parallel_5family.csv")
+    sub_df.to_csv(sub_path, index=False)
+    sub_df.to_csv("submission.csv", index=False)
+
+    verify_df = pd.read_csv("submission.csv")
+    assert len(verify_df) == len(test_ids), "Submission integrity check: row count mismatch!"
+    assert not verify_df[feature_cfg.target_col].isna().any(), "Submission integrity check: NaNs detected!"
+    assert (verify_df[feature_cfg.target_col] >= 0.0).all() and (verify_df[feature_cfg.target_col] <= 1.0).all(), "Bounds violation!"
+
+    # Save summary report
+    summary = {
+        "architecture": "Remediated_Parallel_Five_Family",
+        "timestamp": pd.Timestamp.now().isoformat(),
+        "folds": args.folds,
+        "fast_mode": args.fast,
+        "oof_roc_auc_per_family": auc_per_model,
+        "champion_stacked_auc": float(stacked_auc),
+        "collinearity_metrics": {
+            "r_mean": float(r_mean),
+            "effective_ensemble_size_n_eff": float(n_eff),
+        },
+        "target_barrier_rank1": 0.962430,
+        "target_gate": 0.963000,
+        "barrier_surpassed": bool(stacked_auc >= 0.962430),
+    }
+
+    logits_path = os.path.join(paths.output_dir, "argon_5family_logits.npz")
+    save_dict = {f"oof_logits_{k}": v for k, v in oof_logits.items()}
+    save_dict.update({f"test_logits_{k}": v for k, v in test_logits.items()})
+    save_dict["y_train"] = y_train
+    save_dict["champ_oof_probs"] = champ_oof_probs
+    save_dict["champ_test_probs"] = champ_test_probs
+    np.savez_compressed(logits_path, **save_dict)
+
+    with open(os.path.join(paths.output_dir, "argon_evaluation_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+
+    logger.info("=" * 80)
+    logger.info(f"PARALLEL 5-FAMILY PIPELINE COMPLETE: Champion OOF ROC-AUC = {stacked_auc:.6f}")
+    logger.info(f"Outputs serialized to: 'submission.csv', '{logits_path}', and '{paths.output_dir}/argon_evaluation_summary.json'")
+    logger.info("=" * 80)
 
 
 def main():
@@ -108,7 +478,7 @@ def main():
     use_gpu = args.gpu and (num_gpus > 0)
 
     logger.info("=" * 80)
-    logger.info("STARTING ARGON RESEARCH DEEP CASCADE PIPELINE (KAGGLE S6E10)")
+    logger.info(f"STARTING ARGON RESEARCH ENGINE: ARCHITECTURE = {args.architecture.upper()} (KAGGLE S6E10)")
     logger.info(f"Folds: {args.folds} | Seed: {args.seed} | Fast Mode: {args.fast}")
     logger.info(f"Hardware Allocation: Active CPU Cores={n_cpus} | GPU Acceleration={use_gpu} (Total GPUs={num_gpus}: {gpu_devs})")
     logger.info(f"Handoff beta_12: {args.beta_12} | beta_23: {args.beta_23} | Two-Pass Mode: {args.two_pass}")
@@ -128,6 +498,24 @@ def main():
     if orig_df is None and orig_files:
         orig_df = ingestion._standardize_columns(pd.read_csv(orig_files[0]), is_original=True)
         logger.info(f"Ingested original dataset: {len(orig_df)} rows")
+
+    if args.architecture == "parallel_5family":
+        run_parallel_5family_pipeline(
+            args=args,
+            train_df=train_df,
+            test_df=test_df,
+            orig_df=orig_df,
+            orig_files=orig_files,
+            ingestion=ingestion,
+            paths=paths,
+            feature_cfg=feature_cfg,
+            logger=logger,
+            n_cpus=n_cpus,
+            use_gpu=use_gpu,
+            num_gpus=num_gpus,
+            gpu_devs=gpu_devs,
+        )
+        return
 
     if args.fast:
         logger.info("[FAST MODE] Subsampling train to 1,200 rows and test to 600 rows for smoke test.")
@@ -484,7 +872,28 @@ def main():
     logger.info(f"  Effective Ensemble Size (N_eff): {n_eff:.3f} (vs Baseline 1.002)")
     logger.info("=" * 80)
 
-    # 5. Non-Linear Monotonic Rank Stacking (Vector 5)
+    # 5. Collinearity Decoupling Stacking (Gram-Schmidt & Power Logit)
+    logger.info("Decoupling Cascade with GramSchmidtCascadeDecoupler (L2 Logistic Regression on Orthogonal Deltas)...")
+    gs_decoupler = GramSchmidtCascadeDecoupler(
+        beta_12=args.beta_12,
+        beta_23=args.beta_23,
+        gamma_1=0.55,
+        gamma_2=0.45,
+        C_meta=1.0,
+    )
+    gs_oof_probs, gs_test_probs, gs_r_mean, gs_auc = gs_decoupler.fit_predict_oof(
+        z1_oof=oof_logits_1,
+        z2_oof=oof_logits_2,
+        z3_oof=oof_logits_3,
+        y=y_train.astype(int),
+        z1_test=test_logits_1,
+        z2_test=test_logits_2,
+        z3_test=test_logits_3,
+        n_splits=args.folds,
+        seed=args.seed,
+    )
+    logger.info(f"Gram-Schmidt Decoupled OOF ROC-AUC: {gs_auc:.6f} (r_mean = {gs_r_mean:.5f})")
+
     logger.info("Fitting Strictly Monotonic Power-Logit Stacker...")
     stacker = StrictlyMonotonicPowerLogitStacker(n_models=3)
     stacker.fit_oof([oof_logits_1, oof_logits_2, oof_logits_3], y_train)
@@ -492,7 +901,15 @@ def main():
     champ_oof_probs = stacker.predict_score([oof_logits_1, oof_logits_2, oof_logits_3])
     champ_test_probs = stacker.predict_score([test_logits_1, test_logits_2, test_logits_3])
     stacked_auc = roc_auc_score(y_train, champ_oof_probs)
-    logger.info(f"CHAMPION STACKED OOF ROC-AUC: {stacked_auc:.6f} (+{(stacked_auc - 0.96150)*10000:.1f} bps vs Baseline 0.96150)")
+    logger.info(f"Power-Logit Stacked OOF ROC-AUC: {stacked_auc:.6f}")
+
+    if gs_auc > stacked_auc:
+        logger.info(f"Selecting superior Gram-Schmidt Decoupler: {gs_auc:.6f} vs {stacked_auc:.6f} (+{(gs_auc - stacked_auc)*10000:.1f} bps)")
+        champ_oof_probs = gs_oof_probs
+        champ_test_probs = gs_test_probs
+        stacked_auc = gs_auc
+    else:
+        logger.info(f"Selecting Power-Logit Stacker: {stacked_auc:.6f}")
 
     # 6. Optional Transductive kNN Laplacian Smoothing
     if args.use_laplacian:

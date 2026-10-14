@@ -1025,3 +1025,53 @@ def apply_transductive_knn_laplacian_smoothing(
     smoothed_logits[active_mask] = smoothed_active
 
     return smoothed_logits[:n_train], smoothed_logits[n_train:]
+
+
+def meta_stack_parallel_families(
+    oof_logits_dict: dict[str, np.ndarray],
+    test_logits_dict: dict[str, np.ndarray],
+    y: np.ndarray,
+    C_reg: float = 0.25,
+    n_splits: int = 10,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray, float, float, float, np.ndarray]:
+    """
+    Combines the parallel 5-family out-of-fold logits (LightGBM, XGBoost,
+    CatBoost All-Cat, RealMLP-TD, TabM) via temperature-calibrated L2 Logistic Regression.
+    Returns:
+    - final_oof_probs: expit(stacked OOF logits)
+    - final_test_probs: expit(stacked test logits)
+    - final_auc: OOF ROC-AUC
+    - off_diag_mean: mean pairwise off-diagonal Pearson correlation
+    - n_eff: effective ensemble size M / (1 + (M-1)*off_diag_mean)
+    - corr_mat: pairwise correlation matrix
+    """
+    from sklearn.linear_model import LogisticRegression
+
+    model_names = list(oof_logits_dict.keys())
+    Z_oof = np.column_stack([oof_logits_dict[m] for m in model_names])
+    Z_test = np.column_stack([test_logits_dict[m] for m in model_names])
+
+    # Compute inter-model correlation matrix and Effective Ensemble Size (N_eff)
+    corr_mat = np.corrcoef(Z_oof.T)
+    M = len(model_names)
+    if M > 1:
+        off_diag_mean = float((corr_mat.sum() - M) / (M * (M - 1)))
+        n_eff = float(M / (1.0 + (M - 1) * off_diag_mean))
+    else:
+        off_diag_mean = 1.0
+        n_eff = 1.0
+
+    final_oof_logits = np.zeros(len(y), dtype=np.float64)
+    final_test_logits = np.zeros(len(Z_test), dtype=np.float64)
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    for tr_idx, va_idx in skf.split(Z_oof, y):
+        stacker = LogisticRegression(C=C_reg, solver="lbfgs", max_iter=1000)
+        stacker.fit(Z_oof[tr_idx], y[tr_idx])
+        final_oof_logits[va_idx] = stacker.decision_function(Z_oof[va_idx])
+        final_test_logits += stacker.decision_function(Z_test) / n_splits
+
+    final_auc = float(roc_auc_score(y, expit(final_oof_logits)))
+    return expit(final_oof_logits), expit(final_test_logits), final_auc, off_diag_mean, n_eff, corr_mat
+
