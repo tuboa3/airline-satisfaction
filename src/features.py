@@ -10,8 +10,11 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.decomposition import TruncatedSVD
+from sklearn.linear_model import Ridge
+from sklearn.mixture import BayesianGaussianMixture
 from sklearn.model_selection import KFold
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler, TargetEncoder
+import lightgbm as lgb
 
 # Suppress pandas fragmentation warnings when engineering 100+ columns
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
@@ -1789,3 +1792,687 @@ class FeaturePipeline:
 
         else:
             return df.copy()
+
+
+
+# ==============================================================================
+# ARGON RESEARCH VECTOR 4 & 6: ADVANCED MANIFOLD & ASYMMETRIC TOPOLOGIES
+# ==============================================================================
+
+from typing import Optional
+
+SURVEY_COLS: list[str] = [
+    "Inflight wifi service",
+    "Departure/Arrival time convenient",
+    "Ease of Online booking",
+    "Gate location",
+    "Food and drink",
+    "Online boarding",
+    "Seat comfort",
+    "Inflight entertainment",
+    "On-board service",
+    "Leg room service",
+    "Baggage handling",
+    "Checkin service",
+    "Cleanliness",
+]
+
+ZERO_CAPABLE_SURVEY_COLS: list[str] = [
+    c for c in SURVEY_COLS if c != "Baggage handling"
+]
+
+DIGITAL_ITEMS: list[str] = [
+    "Inflight wifi service",
+    "Online boarding",
+    "Ease of Online booking",
+]
+CABIN_ITEMS: list[str] = [
+    "Seat comfort",
+    "Leg room service",
+    "Cleanliness",
+    "Inflight entertainment",
+    "Food and drink",
+    "On-board service",
+]
+GROUND_ITEMS: list[str] = [
+    "Gate location",
+    "Checkin service",
+    "Baggage handling",
+    "Departure/Arrival time convenient",
+]
+
+CAT_COLS: list[str] = ["Gender", "Customer Type", "Type of Travel", "Class"]
+NUM_COLS: list[str] = [
+    "Age",
+    "Flight Distance",
+    "Departure Delay in Minutes",
+    "Arrival Delay in Minutes",
+]
+
+
+class HurdleGradedResponseModel:
+    """
+    Two-Part Hurdle Polytomous Graded Response Model (ZI-GRM).
+    Treats 0-ratings in the zero-capable survey columns as structural
+    missingness (hurdle gate) and estimates Samejima's polytomous GRM
+    parameters (discrimination alpha_j and ordered thresholds beta_j,k)
+    strictly on observed ratings in {1, 2, 3, 4, 5}.
+    """
+
+    def __init__(self, theta_grid_size: int = 81) -> None:
+        self.theta_grid: np.ndarray = np.linspace(-4.0, 4.0, theta_grid_size)
+        self.alphas_: np.ndarray = np.ones(len(SURVEY_COLS), dtype=np.float64)
+        self.betas_: np.ndarray = np.zeros((len(SURVEY_COLS), 4), dtype=np.float64)
+        self.zero_log_odds_: np.ndarray = np.zeros(len(ZERO_CAPABLE_SURVEY_COLS))
+        self.non_zero_log_odds_: np.ndarray = np.zeros(len(ZERO_CAPABLE_SURVEY_COLS))
+
+    def fit(self, df_survey: pd.DataFrame, y: np.ndarray) -> "HurdleGradedResponseModel":
+        X = df_survey[SURVEY_COLS].to_numpy(dtype=np.int32)
+        y_bin = y.astype(np.int32)
+        pos_mask = y_bin == 1
+        neg_mask = y_bin == 0
+
+        # 1. Fit Structural Zero Hurdle Log-Odds Ratios on the zero-capable columns
+        X_zero = (df_survey[ZERO_CAPABLE_SURVEY_COLS].to_numpy(dtype=np.int32) == 0)
+        p_z_pos = (X_zero[pos_mask].sum(axis=0) + 10.0) / (pos_mask.sum() + 20.0)
+        p_z_neg = (X_zero[neg_mask].sum(axis=0) + 10.0) / (neg_mask.sum() + 20.0)
+        self.zero_log_odds_ = np.log(p_z_pos / p_z_neg)
+        self.non_zero_log_odds_ = np.log((1.0 - p_z_pos) / (1.0 - p_z_neg))
+
+        # 2. Calibrate Samejima Polytomous GRM Item Parameters on observed ratings {1..5}
+        X_obs = X.astype(np.float64)
+        X_obs[X == 0] = np.nan
+        col_means = np.nanmean(X_obs, axis=0)
+        col_stds = np.nanstd(X_obs, axis=0) + 1e-6
+        Z_norm = (X_obs - col_means) / col_stds
+
+        theta_init = np.nanmean(Z_norm, axis=1)
+        theta_init = (theta_init - np.mean(theta_init)) / (np.std(theta_init) + 1e-6)
+
+        for j in range(len(SURVEY_COLS)):
+            valid = X[:, j] > 0
+            r_valid = X[valid, j]
+            t_valid = theta_init[valid]
+
+            if len(r_valid) > 10:
+                r_corr = np.corrcoef(r_valid, t_valid)[0, 1]
+                y_corr = np.corrcoef(r_valid, y_bin[valid])[0, 1]
+            else:
+                r_corr, y_corr = 0.5, 0.5
+
+            comb_corr = np.clip(0.65 * abs(r_corr) + 0.35 * abs(y_corr), 0.15, 0.92)
+            self.alphas_[j] = 1.702 * comb_corr / np.sqrt(1.0 - comb_corr ** 2)
+
+            cum_props = [np.mean(r_valid >= k) if len(r_valid) > 0 else 0.5 for k in (2, 3, 4, 5)]
+            cum_props = [np.clip(p, 1e-4, 1.0 - 1e-4) for p in cum_props]
+            raw_betas = [-np.log(p / (1.0 - p)) / self.alphas_[j] for p in cum_props]
+            self.betas_[j, :] = np.maximum.accumulate(raw_betas)
+
+        return self
+
+    def _score_subset(
+        self, X: np.ndarray, item_indices: list[int]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Vectorized MAP/EAP person scoring, Fisher Test Information I(theta),
+        and Drasgow-Levine-Williams Z_h aberrant person-fit statistic.
+        """
+        N = X.shape[0]
+        G = len(self.theta_grid)
+        log_prior = -0.5 * (self.theta_grid ** 2)
+
+        n_sub = len(item_indices)
+        log_p = np.zeros((n_sub, 6, G), dtype=np.float64)
+        item_info = np.zeros((n_sub, G), dtype=np.float64)
+        expected_ll = np.zeros((n_sub, G), dtype=np.float64)
+        var_ll = np.zeros((n_sub, G), dtype=np.float64)
+
+        for idx, j in enumerate(item_indices):
+            a_j = self.alphas_[j]
+            b_j = self.betas_[j]
+            cum_p = np.zeros((6, G), dtype=np.float64)
+            cum_p[0] = 1.0
+            for k in range(4):
+                cum_p[k + 1] = 1.0 / (1.0 + np.exp(-a_j * (self.theta_grid - b_j[k])))
+            cum_p[5] = 0.0
+
+            d_cum_p = a_j * cum_p * (1.0 - cum_p)
+
+            for k in range(1, 6):
+                p_k = np.clip(cum_p[k - 1] - cum_p[k], 1e-12, 1.0)
+                dp_k = d_cum_p[k - 1] - d_cum_p[k]
+                lp_k = np.log(p_k)
+                log_p[idx, k] = lp_k
+                item_info[idx] += (dp_k ** 2) / p_k
+                expected_ll[idx] += p_k * lp_k
+                var_ll[idx] += p_k * (lp_k ** 2)
+
+            var_ll[idx] = np.maximum(var_ll[idx] - (expected_ll[idx] ** 2), 1e-8)
+
+        total_log_post = np.broadcast_to(log_prior[None, :], (N, G)).copy()
+        for idx, j in enumerate(item_indices):
+            r_j = X[:, j]
+            valid = r_j > 0
+            total_log_post[valid] += log_p[idx, r_j[valid]]
+
+        max_lp = np.max(total_log_post, axis=1, keepdims=True)
+        weights = np.exp(total_log_post - max_lp)
+        weights /= np.sum(weights, axis=1, keepdims=True)
+        theta_eap = weights @ self.theta_grid
+        best_g = np.argmax(total_log_post, axis=1)
+
+        obs_ll = np.zeros(N, dtype=np.float64)
+        exp_ll_sum = np.zeros(N, dtype=np.float64)
+        var_ll_sum = np.zeros(N, dtype=np.float64)
+        fisher_info = np.ones(N, dtype=np.float64)
+
+        for idx, j in enumerate(item_indices):
+            r_j = X[:, j]
+            valid = r_j > 0
+            g_v = best_g[valid]
+            obs_ll[valid] += log_p[idx, r_j[valid], g_v]
+            exp_ll_sum[valid] += expected_ll[idx, g_v]
+            var_ll_sum[valid] += var_ll[idx, g_v]
+            fisher_info[valid] += item_info[idx, g_v]
+
+        zh_stat = (obs_ll - exp_ll_sum) / np.sqrt(np.maximum(var_ll_sum, 1e-6))
+        return theta_eap, fisher_info, zh_stat
+
+    def transform(self, df_survey: pd.DataFrame) -> pd.DataFrame:
+        X = df_survey[SURVEY_COLS].to_numpy(dtype=np.int32)
+        X_zero = (df_survey[ZERO_CAPABLE_SURVEY_COLS].to_numpy(dtype=np.int32) == 0)
+
+        out = pd.DataFrame(index=df_survey.index)
+        out["irt_zero_cnt"] = X_zero.sum(axis=1).astype(np.float32)
+        out["irt_zero_llr"] = (
+            X_zero @ self.zero_log_odds_ + (~X_zero) @ self.non_zero_log_odds_
+        ).astype(np.float32)
+
+        all_idx = list(range(len(SURVEY_COLS)))
+        dig_idx = [SURVEY_COLS.index(c) for c in DIGITAL_ITEMS if c in SURVEY_COLS]
+        cab_idx = [SURVEY_COLS.index(c) for c in CABIN_ITEMS if c in SURVEY_COLS]
+        gnd_idx = [SURVEY_COLS.index(c) for c in GROUND_ITEMS if c in SURVEY_COLS]
+
+        theta_g, info_g, zh_g = self._score_subset(X, all_idx)
+        theta_dig, _, zh_dig = self._score_subset(X, dig_idx)
+        theta_cab, _, zh_cab = self._score_subset(X, cab_idx)
+        theta_gnd, _, _ = self._score_subset(X, gnd_idx)
+
+        out["irt_theta_global"] = theta_g.astype(np.float32)
+        out["irt_fisher_info"] = np.log1p(np.maximum(0.0, info_g)).astype(np.float32)
+        out["irt_person_fit_zh"] = np.clip(zh_g, -5.0, 5.0).astype(np.float32)
+        out["irt_theta_digital"] = theta_dig.astype(np.float32)
+        out["irt_theta_cabin"] = theta_cab.astype(np.float32)
+        out["irt_theta_ground"] = theta_gnd.astype(np.float32)
+        out["irt_zh_digital"] = np.clip(zh_dig, -5.0, 5.0).astype(np.float32)
+        out["irt_zh_cabin"] = np.clip(zh_cab, -5.0, 5.0).astype(np.float32)
+
+        out["irt_diff_dig_cab"] = (theta_dig - theta_cab).astype(np.float32)
+        out["irt_diff_cab_gnd"] = (theta_cab - theta_gnd).astype(np.float32)
+        out["irt_diff_dig_gnd"] = (theta_dig - theta_gnd).astype(np.float32)
+        return out
+
+
+class TransductiveManifoldAndDGPInverter:
+    """
+    1. Reconstructs the exact Original-Dataset Flight Distance Lattice & snaps jittered synthetic distances.
+    2. Extracts full-manifold transductive density counts & Spectral Route Graph Embeddings.
+    3. Fits Variational Gaussian Mixture (VGM) mode-specific normalization inversions.
+    4. Computes Adversarial Density Ratio weights w_orig(x) for Original-Dataset alignment.
+    """
+
+    def __init__(self, n_vgm_modes: int = 10, n_route_svd: int = 6, seed: int = 42) -> None:
+        self.n_vgm_modes = n_vgm_modes
+        self.n_route_svd = n_route_svd
+        self.seed = seed
+        self.orig_fd_support_: np.ndarray = np.array([])
+        self.full_counts_: dict[str, pd.Series] = {}
+        self.route_svd_map_: pd.DataFrame = pd.DataFrame()
+        self.vgm_fd_: Optional[BayesianGaussianMixture] = None
+        self.orig_means_: dict[str, pd.Series] = {}
+        self.orig_global_mean_: float = 0.434
+        self.orig_oracle_model_: Optional[lgb.Booster] = None
+        self.ecdf_full_df_: pd.DataFrame = pd.DataFrame()
+        self.n_train_full_: int = 0
+        self.n_test_full_: int = 0
+
+    def fit_full_manifold(
+        self, df_train: pd.DataFrame, df_test: pd.DataFrame, df_orig: pd.DataFrame
+    ) -> "TransductiveManifoldAndDGPInverter":
+        raw_cols = CAT_COLS + NUM_COLS + SURVEY_COLS
+        df_full = pd.concat([df_train[raw_cols], df_test[raw_cols]], ignore_index=True)
+
+        self.orig_fd_support_ = np.sort(df_orig["Flight Distance"].dropna().unique())
+
+        for c in NUM_COLS:
+            self.full_counts_[c] = df_full[c].fillna(-1).value_counts()
+
+        fd_snapped = self._snap_flight_distance(df_full["Flight Distance"].to_numpy())
+        df_full_temp = df_full.copy()
+        df_full_temp["fd_snap"] = fd_snapped
+        df_full_temp["delay_delta"] = (
+            df_full_temp["Arrival Delay in Minutes"].fillna(0.0)
+            - df_full_temp["Departure Delay in Minutes"].fillna(0.0)
+        )
+
+        agg_spec = df_full_temp.groupby("fd_snap").agg(
+            route_vol=("Age", "count"),
+            mean_age=("Age", "mean"),
+            mean_dep_delay=("Departure Delay in Minutes", "mean"),
+            mean_delay_delta=("delay_delta", "mean"),
+            std_delay_delta=("delay_delta", "std"),
+            wifi_mean=("Inflight wifi service", "mean"),
+            wifi_zero_rate=("Inflight wifi service", lambda x: np.mean(x == 0)),
+            seat_mean=("Seat comfort", "mean"),
+            baggage_mean=("Baggage handling", "mean"),
+            gate_mean=("Gate location", "mean"),
+            biz_share=("Class", lambda x: np.mean(x == "Business")),
+            eco_share=("Class", lambda x: np.mean(x == "Eco")),
+        ).fillna(0.0)
+
+        # Section 4.1: Empirical Cumulative Distribution Function (ECDF) Route Ranks
+        self.ecdf_full_df_ = pd.DataFrame(index=df_full.index)
+        for c in ["Age", "Departure Delay in Minutes", "Arrival Delay in Minutes"]:
+            clean_name = "arr_delay" if "Arrival" in c else ("dep_delay" if "Departure" in c else "age")
+            self.ecdf_full_df_[f"ecdf_{clean_name}_route"] = (
+                df_full_temp.groupby("fd_snap")[c].rank(pct=True).astype(np.float32)
+            )
+        self.n_train_full_ = len(df_train)
+        self.n_test_full_ = len(df_test)
+
+        scaler = StandardScaler()
+        M_scaled = scaler.fit_transform(agg_spec.to_numpy(dtype=np.float64))
+        n_comp = min(self.n_route_svd, M_scaled.shape[1], M_scaled.shape[0] - 1)
+        svd = TruncatedSVD(n_components=n_comp, random_state=self.seed)
+        U_route = svd.fit_transform(M_scaled)
+
+        svd_cols = [f"route_svd_{k}" for k in range(n_comp)]
+        self.route_svd_map_ = pd.DataFrame(
+            U_route.astype(np.float32), index=agg_spec.index, columns=svd_cols
+        )
+        self.route_svd_map_["route_log_vol"] = np.log1p(agg_spec["route_vol"]).astype(np.float32)
+        self.route_svd_map_["route_mean_delay_delta"] = agg_spec["mean_delay_delta"].astype(np.float32)
+        self.route_svd_map_["route_biz_share"] = agg_spec["biz_share"].astype(np.float32)
+
+        rng = np.random.RandomState(self.seed)
+        sub_size = min(120000, len(df_full))
+        sub_idx = rng.choice(len(df_full), size=sub_size, replace=False)
+        fd_sample = df_full["Flight Distance"].iloc[sub_idx].to_numpy(dtype=np.float64).reshape(-1, 1)
+        self.vgm_fd_ = BayesianGaussianMixture(
+            n_components=self.n_vgm_modes,
+            covariance_type="spherical",
+            max_iter=150,
+            random_state=self.seed,
+        )
+        self.vgm_fd_.fit(fd_sample)
+
+        self.orig_global_mean_ = float(df_orig["satisfaction"].mean())
+        for c in raw_cols:
+            if c in df_orig.columns:
+                self.orig_means_[c] = df_orig.groupby(c)["satisfaction"].mean()
+
+        avail_raw = [c for c in raw_cols if c in df_orig.columns]
+        X_orig_enc = self._encode_for_oracle(df_orig[avail_raw])
+        dtrain_orig = lgb.Dataset(X_orig_enc, label=df_orig["satisfaction"].to_numpy(dtype=np.float32))
+        oracle_params = {
+            "objective": "binary",
+            "learning_rate": 0.04,
+            "num_leaves": 63,
+            "min_child_samples": 30,
+            "feature_fraction": 0.8,
+            "bagging_fraction": 0.8,
+            "bagging_freq": 1,
+            "verbose": -1,
+            "random_state": self.seed,
+        }
+        self.orig_oracle_model_ = lgb.train(oracle_params, dtrain_orig, num_boost_round=600)
+        return self
+
+    def _snap_flight_distance(self, fd_arr: np.ndarray) -> np.ndarray:
+        if len(self.orig_fd_support_) == 0:
+            return fd_arr
+        idx = np.searchsorted(self.orig_fd_support_, fd_arr)
+        idx_left = np.clip(idx - 1, 0, len(self.orig_fd_support_) - 1)
+        idx_right = np.clip(idx, 0, len(self.orig_fd_support_) - 1)
+        left_val = self.orig_fd_support_[idx_left]
+        right_val = self.orig_fd_support_[idx_right]
+        choose_left = np.abs(fd_arr - left_val) <= np.abs(fd_arr - right_val)
+        snapped = np.where(choose_left, left_val, right_val)
+        jitter = np.abs(fd_arr - snapped)
+        return np.where(jitter <= 2, snapped, fd_arr)
+
+    @staticmethod
+    def _encode_for_oracle(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        for c in CAT_COLS:
+            if c in out.columns:
+                out[c] = out[c].astype("category")
+        return out
+
+    def compute_adversarial_orig_weights(
+        self, df_syn_train: pd.DataFrame, df_orig: pd.DataFrame
+    ) -> np.ndarray:
+        """
+        Computes Radon-Nikodym density ratio weights w_orig(x) = P(syn|x)/P(orig|x) * (N_orig/N_syn)
+        to eliminate the 0.21 TV covariate shift on Flight Distance when appending Original rows.
+        """
+        raw_cols = [c for c in (CAT_COLS + NUM_COLS + SURVEY_COLS) if c in df_orig.columns and c in df_syn_train.columns]
+        X_adv = pd.concat(
+            [df_syn_train[raw_cols], df_orig[raw_cols]], ignore_index=True
+        )
+        for c in CAT_COLS:
+            if c in X_adv.columns:
+                X_adv[c] = X_adv[c].astype("category")
+        y_adv = np.concatenate(
+            [np.ones(len(df_syn_train), dtype=np.float32), np.zeros(len(df_orig), dtype=np.float32)]
+        )
+        dadv = lgb.Dataset(X_adv, label=y_adv)
+        adv_model = lgb.train(
+            {
+                "objective": "binary",
+                "learning_rate": 0.05,
+                "num_leaves": 31,
+                "verbose": -1,
+                "random_state": self.seed,
+            },
+            dadv,
+            num_boost_round=250,
+        )
+        p_syn_on_orig = adv_model.predict(X_adv.iloc[len(df_syn_train):])
+        p_syn_on_orig = np.clip(p_syn_on_orig, 0.02, 0.98)
+        prior_ratio = len(df_orig) / float(len(df_syn_train))
+        w_orig = (p_syn_on_orig / (1.0 - p_syn_on_orig)) * prior_ratio
+        return np.clip(w_orig, 0.05, 5.0).astype(np.float32)
+
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        raw_cols = CAT_COLS + NUM_COLS + SURVEY_COLS
+        out = pd.DataFrame(index=df.index)
+
+        fd_raw = df["Flight Distance"].to_numpy(dtype=np.float64)
+        fd_snap = self._snap_flight_distance(fd_raw)
+        out["fd_snapped"] = fd_snap.astype(np.int32)
+        out["fd_ctgan_jitter"] = (fd_raw - fd_snap).astype(np.float32)
+
+        out["fd_div10"] = (fd_raw // 10).astype(np.int32)
+        out["fd_mod10"] = (fd_raw % 10).astype(np.float32)
+        out["fd_mod50"] = (fd_raw % 50).astype(np.float32)
+        out["fd_mod100"] = (fd_raw % 100).astype(np.float32)
+        out["fd_mod250"] = (fd_raw % 250).astype(np.float32)
+        out["fd_mod1000"] = (fd_raw % 1000).astype(np.int32)
+        out["age_mod10"] = (df["Age"] % 10).astype(np.float32)
+
+        dep_d = df["Departure Delay in Minutes"].fillna(0.0).to_numpy(dtype=np.float32)
+        arr_d = df["Arrival Delay in Minutes"].fillna(0.0).to_numpy(dtype=np.float32)
+        out["delay_delta"] = arr_d - dep_d
+        out["delay_ratio"] = (arr_d + 1.0) / (dep_d + 1.0)
+        out["is_dep_zero"] = (dep_d == 0).astype(np.float32)
+        out["is_arr_zero"] = (arr_d == 0).astype(np.float32)
+        out["is_faa_delayed_15"] = (arr_d >= 15.0).astype(np.float32)
+        out["is_severe_delayed_45"] = (arr_d >= 45.0).astype(np.float32)
+        out["is_airborne_recovery"] = (arr_d < dep_d).astype(np.float32)
+        out["is_arrival_missing"] = df["Arrival Delay in Minutes"].isna().astype(np.float32)
+
+        for c in NUM_COLS:
+            if c in self.full_counts_:
+                out[f"{c}_full_cnt"] = (
+                    df[c].fillna(-1).map(self.full_counts_[c]).fillna(1).astype(np.float32)
+                )
+
+        for c in raw_cols:
+            if c in self.orig_means_:
+                out[f"{c}_orig_mean"] = (
+                    df[c].map(self.orig_means_[c]).fillna(self.orig_global_mean_).astype(np.float32)
+                )
+
+        if self.orig_oracle_model_ is not None:
+            avail_raw = [c for c in raw_cols if c in df.columns]
+            out["orig_oracle_logit"] = self.orig_oracle_model_.predict(
+                self._encode_for_oracle(df[avail_raw]), raw_score=True
+            ).astype(np.float32)
+
+        if len(self.route_svd_map_) > 0:
+            route_feats = self.route_svd_map_.reindex(fd_snap).fillna(0.0)
+            route_feats.index = df.index
+            out = pd.concat([out, route_feats], axis=1)
+
+        if self.vgm_fd_ is not None:
+            vgm_probs = self.vgm_fd_.predict_proba(fd_raw.reshape(-1, 1))
+            best_mode = np.argmax(vgm_probs, axis=1)
+            mode_means = self.vgm_fd_.means_.ravel()[best_mode]
+            mode_stds = np.sqrt(self.vgm_fd_.covariances_.ravel()[best_mode]) + 1e-6
+            out["vgm_fd_mode_id"] = best_mode.astype(np.int32)
+            out["vgm_fd_alpha_norm"] = ((fd_raw - mode_means) / (4.0 * mode_stds)).astype(np.float32)
+            out["vgm_fd_entropy"] = (
+                -np.sum(vgm_probs * np.log(np.clip(vgm_probs, 1e-9, 1.0)), axis=1)
+            ).astype(np.float32)
+
+        if len(self.ecdf_full_df_) > 0:
+            if len(df) == self.n_train_full_:
+                ecdf_slice = self.ecdf_full_df_.iloc[:self.n_train_full_].copy()
+                ecdf_slice.index = df.index
+                out = pd.concat([out, ecdf_slice], axis=1)
+            elif len(df) == self.n_test_full_:
+                ecdf_slice = self.ecdf_full_df_.iloc[self.n_train_full_:].copy()
+                ecdf_slice.index = df.index
+                out = pd.concat([out, ecdf_slice], axis=1)
+            else:
+                temp_df = pd.DataFrame({"fd_snap": fd_snap}, index=df.index)
+                for c in ["Age", "Departure Delay in Minutes", "Arrival Delay in Minutes"]:
+                    clean_name = "arr_delay" if "Arrival" in c else ("dep_delay" if "Departure" in c else "age")
+                    temp_df[c] = df[c].fillna(0.0)
+                    out[f"ecdf_{clean_name}_route"] = (
+                        temp_df.groupby("fd_snap")[c].rank(pct=True).astype(np.float32)
+                    )
+
+        return out
+
+
+class AsymmetricViewBuilder:
+    """
+    Constructs the 3 structurally decoupled feature views (View A: LightGBM Lattice,
+    View B: XGBoost Psychometric & Target Encoded Crosses, View C: LightGBM Extra-Trees
+    Haar Orthogonal Rotations) strictly inside each cross-validation fold.
+    """
+
+    def __init__(self, n_haar_projections: int = 28, seed: int = 42) -> None:
+        self.n_haar_projections = n_haar_projections
+        self.seed = seed
+        self.fwl_ridge_: Optional[Ridge] = None
+        self.kin_scaler_: Optional[StandardScaler] = None
+        self.haar_scaler_: Optional[StandardScaler] = None
+        self.haar_matrix_: Optional[np.ndarray] = None
+        self.te_encoder_: Optional[TargetEncoder] = None
+        self.cat_categories_: dict[str, list] = {}
+
+    @staticmethod
+    def _build_composite_keys(df: pd.DataFrame, dgp_feats: pd.DataFrame) -> pd.DataFrame:
+        fd_str = dgp_feats["fd_snapped"].astype(str)
+        fd10_str = dgp_feats["fd_div10"].astype(str)
+        fd_m1000_str = dgp_feats["fd_mod1000"].astype(str)
+        age_str = df["Age"].astype(str)
+        cls_str = df["Class"].astype(str)
+        trav_str = df["Type of Travel"].astype(str)
+        cust_str = df["Customer Type"].astype(str)
+
+        return pd.DataFrame(
+            {
+                "k_fd": fd_str,
+                "k_fd10": fd10_str,
+                "k_fd_m1000": fd_m1000_str,
+                "k_fd_cls": fd_str + "_" + cls_str,
+                "k_age_cls": age_str + "_" + cls_str,
+                "k_age_trip": age_str + "_" + trav_str + "_" + cust_str,
+                "k_cls_trav_wifi": cls_str + "_" + trav_str + "_" + df["Inflight wifi service"].astype(str),
+                "k_onboard_wifi": df["Online boarding"].astype(str) + "_" + df["Inflight wifi service"].astype(str),
+            },
+            index=df.index,
+        )
+
+    def _extract_kinematic_matrix(self, df: pd.DataFrame, dgp_feats: pd.DataFrame) -> np.ndarray:
+        kin_df = pd.DataFrame(index=df.index)
+        kin_df["age"] = df["Age"].astype(np.float32)
+        kin_df["log_fd"] = np.log1p(df["Flight Distance"].astype(np.float32))
+        kin_df["log_dep"] = np.log1p(np.maximum(0.0, df["Departure Delay in Minutes"].fillna(0.0)))
+        kin_df["log_arr"] = np.log1p(np.maximum(0.0, df["Arrival Delay in Minutes"].fillna(0.0)))
+        kin_df["is_biz"] = (df["Class"] == "Business").astype(np.float32)
+        kin_df["is_eco"] = (df["Class"] == "Eco").astype(np.float32)
+        kin_df["is_pers"] = (df["Type of Travel"] == "Personal Travel").astype(np.float32)
+        kin_df["is_disloyal"] = (df["Customer Type"] == "disloyal Customer").astype(np.float32)
+        if "orig_oracle_logit" in dgp_feats.columns:
+            kin_df["orig_logit"] = dgp_feats["orig_oracle_logit"]
+        else:
+            kin_df["orig_logit"] = 0.0
+        return kin_df.to_numpy(dtype=np.float32)
+
+    def fit_fold(
+        self,
+        df_tr: pd.DataFrame,
+        y_tr: np.ndarray,
+        dgp_tr: pd.DataFrame,
+    ) -> "AsymmetricViewBuilder":
+        self.kin_scaler_ = StandardScaler()
+        X_kin = self.kin_scaler_.fit_transform(self._extract_kinematic_matrix(df_tr, dgp_tr))
+        Y_surv = df_tr[SURVEY_COLS].to_numpy(dtype=np.float32)
+        self.fwl_ridge_ = Ridge(alpha=100.0, random_state=self.seed)
+        self.fwl_ridge_.fit(X_kin, Y_surv)
+
+        keys_tr = self._build_composite_keys(df_tr, dgp_tr)
+        self.te_encoder_ = TargetEncoder(cv=5, smooth="auto", random_state=self.seed)
+        self.te_encoder_.fit(keys_tr, y_tr)
+
+        haar_input = np.hstack([Y_surv, X_kin])
+        self.haar_scaler_ = StandardScaler()
+        self.haar_scaler_.fit(haar_input)
+        d_dim = haar_input.shape[1]
+        n_proj = min(self.n_haar_projections, d_dim)
+        rng = np.random.RandomState(self.seed + 101)
+        G_mat = rng.randn(d_dim, n_proj).astype(np.float32)
+        Q_mat, R_mat = np.linalg.qr(G_mat)
+        diag_signs = np.sign(np.diag(R_mat))
+        diag_signs[diag_signs == 0] = 1.0
+        self.haar_matrix_ = (Q_mat * diag_signs[None, :]).astype(np.float32)
+
+        for col in CAT_COLS:
+            self.cat_categories_[col] = sorted(df_tr[col].dropna().unique().tolist())
+        for k_col in keys_tr.columns:
+            self.cat_categories_[k_col] = sorted(keys_tr[k_col].unique().tolist())
+
+        return self
+
+    def transform_views(
+        self,
+        df: pd.DataFrame,
+        dgp_feats: pd.DataFrame,
+        irt_feats: pd.DataFrame,
+        is_train_fold: bool = False,
+        y_tr: Optional[np.ndarray] = None,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """
+        Returns (X_view_a_lgbm, X_view_b_xgb, X_view_c_lgbm_xt).
+        """
+        X_kin = self.kin_scaler_.transform(self._extract_kinematic_matrix(df, dgp_feats))
+        Y_surv = df[SURVEY_COLS].to_numpy(dtype=np.float32)
+
+        R_fwl = Y_surv - self.fwl_ridge_.predict(X_kin)
+        fwl_cols = [f"fwl_res_{c}" for c in SURVEY_COLS]
+        df_fwl = pd.DataFrame(R_fwl.astype(np.float32), index=df.index, columns=fwl_cols)
+
+        keys_df = self._build_composite_keys(df, dgp_feats)
+        if is_train_fold and y_tr is not None:
+            te_vals = self.te_encoder_.fit_transform(keys_df, y_tr)
+        else:
+            te_vals = self.te_encoder_.transform(keys_df)
+        te_cols = [f"te_{c}" for c in keys_df.columns]
+        df_te = pd.DataFrame(te_vals.astype(np.float32), index=df.index, columns=te_cols)
+
+        haar_in = self.haar_scaler_.transform(np.hstack([Y_surv, X_kin]))
+        P_haar = haar_in @ self.haar_matrix_
+        haar_cols = [f"haar_proj_{i}" for i in range(P_haar.shape[1])]
+        df_haar = pd.DataFrame(P_haar.astype(np.float32), index=df.index, columns=haar_cols)
+
+        df_cats = pd.DataFrame(index=df.index)
+        for c in CAT_COLS:
+            df_cats[c] = pd.Categorical(df[c], categories=self.cat_categories_[c]).codes.astype(np.int32)
+
+        df_high_card = pd.DataFrame(index=df.index)
+        for k_col in ["k_fd", "k_fd10", "k_fd_cls", "k_age_cls", "k_onboard_wifi"]:
+            df_high_card[f"cat_{k_col}"] = pd.Categorical(
+                keys_df[k_col], categories=self.cat_categories_[k_col]
+            ).codes.astype(np.int32)
+
+        view_a = pd.concat(
+            [
+                df_cats,
+                df[NUM_COLS + SURVEY_COLS].astype(np.float32),
+                dgp_feats,
+                df_fwl,
+                df_high_card,
+                irt_feats[["irt_theta_global", "irt_zero_cnt", "irt_zero_llr", "irt_person_fit_zh"]],
+            ],
+            axis=1,
+        )
+
+        drop_from_dgp_b = ["fd_mod10", "fd_mod50", "fd_mod250"]
+        dgp_b = dgp_feats.drop(columns=[c for c in drop_from_dgp_b if c in dgp_feats.columns])
+        fwl_sub = [c for c in ["fwl_res_Online boarding", "fwl_res_Inflight wifi service", "fwl_res_Seat comfort"] if c in df_fwl.columns]
+        view_b = pd.concat(
+            [
+                df_cats,
+                df[NUM_COLS + SURVEY_COLS].astype(np.float32),
+                dgp_b,
+                irt_feats,
+                df_te,
+                df_fwl[fwl_sub],
+            ],
+            axis=1,
+        )
+
+        dgp_c_cols = [
+            c for c in [
+                "orig_oracle_logit",
+                "Flight Distance_full_cnt",
+                "Age_full_cnt",
+                "delay_delta",
+                "delay_ratio",
+                "route_log_vol",
+                "route_biz_share",
+            ] if c in dgp_feats.columns
+        ]
+        irt_c_cols = [c for c in ["irt_theta_global", "irt_diff_dig_cab", "irt_diff_cab_gnd", "irt_zero_llr"] if c in irt_feats.columns]
+        te_c_cols = [c for c in ["te_k_fd", "te_k_fd_cls"] if c in df_te.columns]
+        view_c = pd.concat(
+            [
+                df_cats,
+                df[NUM_COLS + SURVEY_COLS].astype(np.float32),
+                df_haar,
+                dgp_feats[dgp_c_cols],
+                irt_feats[irt_c_cols],
+                df_te[te_c_cols],
+            ],
+            axis=1,
+        )
+
+        return view_a, view_b, view_c
+
+
+def apply_structured_survey_dropout(
+    df: pd.DataFrame,
+    dropout_rate: float = 0.04,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """
+    Applies stochastic structured survey dropout augmentation (Section 4.3):
+    Masks 4% of observed ratings in the zero-capable survey items to 0 on pseudo-labeled rows,
+    forcing tree ensembles to learn invariant decision rules when survey items are unrated.
+    """
+    df_aug = df.copy()
+    rng = np.random.RandomState(seed)
+    for col in ZERO_CAPABLE_SURVEY_COLS:
+        if col in df_aug.columns:
+            vals = df_aug[col].to_numpy().copy()
+            observed = vals > 0
+            drop_mask = (rng.rand(len(vals)) < dropout_rate) & observed
+            vals[drop_mask] = 0
+            df_aug[col] = vals
+    return df_aug
+

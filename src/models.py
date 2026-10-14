@@ -8,7 +8,7 @@ import logging
 import math
 import os
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Callable, Optional
 
 import numpy as np
 
@@ -2232,3 +2232,361 @@ def get_model(
         raise ValueError(
             f"Unknown model name: {model_name}. Choose from 'lightgbm', 'catboost', 'xgboost', 'realmlp', 'tabm', 'dcn_v2', 'resnet', 'transformer'."
         )
+
+
+
+# ==============================================================================
+# ARGON RESEARCH VECTOR 1, 3, 5: HYBRID LOSS & RESIDUAL CASCADE ENGINE
+# ==============================================================================
+
+try:
+    import lightgbm as lgb
+except ImportError:
+    lgb = None
+
+try:
+    import xgboost as xgb
+except ImportError:
+    xgb = None
+
+
+class HybridDampedAUCLoss:
+    """
+    Composite Second-Order Objective combining:
+    1. Damped-Hessian Bounded-Residual Logit Loss (DHBR) to neutralize 3.8% CTGAN
+       Bernoulli boundary label flips.
+    2. Quantile-Anchor Smooth Wilcoxon-Mann-Whitney (WMW) AUC Surrogate (O(N * K))
+       to directly optimize ROC-AUC rank concordance in the overlap region.
+    3. Support for continuous soft distillation / pseudo-label targets q_i in [0, 1].
+    """
+
+    def __init__(
+        self,
+        lambda_auc: float = 0.30,
+        kappa_damp: float = 1.45,
+        hess_floor: float = 0.025,
+        eta_quad_damp: float = 0.15,
+        noise_eps: float = 0.038,
+        tau_wmw: float = 0.80,
+        n_anchors: int = 48,
+    ) -> None:
+        self.lambda_auc = lambda_auc
+        self.kappa_damp = kappa_damp
+        self.hess_floor = hess_floor
+        self.eta_quad_damp = eta_quad_damp
+        self.noise_eps = noise_eps
+        self.tau_wmw = tau_wmw
+        self.n_anchors = n_anchors
+        self.anchor_quantiles = np.linspace(0.01, 0.99, n_anchors)
+
+    def compute_grad_hess(
+        self,
+        y_target: np.ndarray,
+        z_pred: np.ndarray,
+        sample_weight: Optional[np.ndarray] = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        z_clip = np.clip(z_pred, -25.0, 25.0)
+        p = 1.0 / (1.0 + np.exp(-z_clip))
+
+        y_smooth = (1.0 - self.noise_eps) * y_target + self.noise_eps * 0.434
+        res = p - y_smooth
+        kr = self.kappa_damp * res
+        tanh_kr = np.tanh(kr)
+        sech2_kr = 1.0 - (tanh_kr ** 2)
+
+        grad_dhbr = tanh_kr / self.kappa_damp
+        hess_dhbr = np.maximum(
+            self.hess_floor,
+            p * (1.0 - p) * sech2_kr + self.eta_quad_damp * (res ** 2),
+        )
+
+        if self.lambda_auc > 0.0 and len(z_pred) > 20:
+            pos_mask = y_target >= 0.5
+            neg_mask = ~pos_mask
+            if np.any(pos_mask) and np.any(neg_mask):
+                z_pos = z_clip[pos_mask]
+                z_neg = z_clip[neg_mask]
+
+                neg_anchors = np.quantile(z_neg, self.anchor_quantiles)
+                pos_anchors = np.quantile(z_pos, self.anchor_quantiles)
+
+                grad_wmw = np.zeros_like(z_pred, dtype=np.float64)
+                hess_wmw = np.zeros_like(z_pred, dtype=np.float64)
+
+                diff_pos = np.clip((z_pos[:, None] - neg_anchors[None, :]) / self.tau_wmw, -25.0, 25.0)
+                sig_pos = 1.0 / (1.0 + np.exp(diff_pos))
+                grad_wmw[pos_mask] = -np.mean(sig_pos, axis=1) / self.tau_wmw
+                hess_wmw[pos_mask] = np.mean(sig_pos * (1.0 - sig_pos), axis=1) / (self.tau_wmw ** 2)
+
+                diff_neg = np.clip((pos_anchors[None, :] - z_neg[:, None]) / self.tau_wmw, -25.0, 25.0)
+                sig_neg = 1.0 / (1.0 + np.exp(diff_neg))
+                grad_wmw[neg_mask] = np.mean(sig_neg, axis=1) / self.tau_wmw
+                hess_wmw[neg_mask] = np.mean(sig_neg * (1.0 - sig_neg), axis=1) / (self.tau_wmw ** 2)
+
+                hess_wmw = np.maximum(hess_wmw, 1e-3)
+
+                grad = (1.0 - self.lambda_auc) * grad_dhbr + self.lambda_auc * grad_wmw
+                hess = (1.0 - self.lambda_auc) * hess_dhbr + self.lambda_auc * hess_wmw
+            else:
+                grad, hess = grad_dhbr, hess_dhbr
+        else:
+            grad, hess = grad_dhbr, hess_dhbr
+
+        if sample_weight is not None:
+            grad = grad * sample_weight
+            hess = hess * sample_weight
+
+        return grad.astype(np.float32), hess.astype(np.float32)
+
+    def lgb_objective(
+        self, y_soft: np.ndarray, sample_weight: Optional[np.ndarray] = None
+    ) -> Callable:
+        def _obj(preds: np.ndarray, train_data: Any) -> tuple[np.ndarray, np.ndarray]:
+            return self.compute_grad_hess(y_soft, preds, sample_weight)
+
+        return _obj
+
+    def xgb_objective(
+        self, y_soft: np.ndarray, sample_weight: Optional[np.ndarray] = None
+    ) -> Callable:
+        def _obj(preds: np.ndarray, dtrain: Any) -> tuple[np.ndarray, np.ndarray]:
+            return self.compute_grad_hess(y_soft, preds, sample_weight)
+
+        return _obj
+
+
+def select_certainty_masked_pseudo_labels(
+    test_probs_list: list[np.ndarray],
+    weights: list[float],
+    conf_threshold: float = 0.985,
+    max_std_threshold: float = 0.0045,
+    max_pl_weight: float = 0.35,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Applies the Bayesian Certainty Mask across the 3 decoupled GBDT views.
+    Returns (admitted_mask, soft_pseudo_targets, instance_weights).
+    """
+    P_stack = np.vstack(test_probs_list)
+    w_arr = np.array(weights, dtype=np.float64)[:, None]
+    w_arr /= np.sum(w_arr)
+
+    p_mean = np.sum(w_arr * P_stack, axis=0)
+    p_std = np.sqrt(np.sum(w_arr * ((P_stack - p_mean[None, :]) ** 2), axis=0))
+
+    conf = np.maximum(p_mean, 1.0 - p_mean)
+    admitted_mask = (conf >= conf_threshold) & (p_std <= max_std_threshold)
+
+    p_clip = np.clip(p_mean, 1e-7, 1.0 - 1e-7)
+    shannon_entropy = -(p_clip * np.log2(p_clip) + (1.0 - p_clip) * np.log2(1.0 - p_clip))
+    pl_weights = (
+        max_pl_weight
+        * ((1.0 - shannon_entropy) ** 2.0)
+        * np.exp(-0.5 * ((p_std / max_std_threshold) ** 2))
+    )
+    return admitted_mask, p_mean[admitted_mask].astype(np.float32), pl_weights[admitted_mask].astype(np.float32)
+
+
+class HierarchicalResidualGBDTCascade:
+    """
+    Executes the 3-Stage Leak-Free Hierarchical Residual Cascade:
+      - Stage 1: LightGBM on View A (Route Lattice & FWL Residuals, feature_contri regularization)
+      - Stage 2: XGBoost on View B (Hurdle GRM IRT & Cross-Fitted Target Encodings) initialized
+                 via shrunk base_margin from Stage 1
+      - Stage 3: LightGBM Extra-Trees on View C (Haar Oblique Rotations & Manifold Counts)
+                 initialized via shrunk init_score from Stage 1 + Stage 2
+    """
+
+    def __init__(
+        self,
+        beta_12: float = 0.72,
+        beta_23: float = 0.75,
+        seed: int = 42,
+    ) -> None:
+        self.beta_12 = beta_12
+        self.beta_23 = beta_23
+        self.seed = seed
+        self.loss_engine = HybridDampedAUCLoss()
+
+    @staticmethod
+    def _build_lgbm_feature_contri(columns: list[str]) -> list[float]:
+        """
+        Penalizes raw dominant survey items at shallow depths in View A so LightGBM
+        builds its primary tree topology on route-by-service FWL residuals.
+        """
+        penalized = {"Online boarding", "Inflight wifi service", "Type of Travel"}
+        return [0.55 if c in penalized else 1.00 for c in columns]
+
+    def fit_predict_fold(
+        self,
+        views_tr: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+        y_tr_soft: np.ndarray,
+        w_tr: np.ndarray,
+        views_val: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+        y_val_hard: np.ndarray,
+        views_te: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+        stage1_oof_tr_margin: Optional[np.ndarray] = None,
+        stage1_val_margin: Optional[np.ndarray] = None,
+        stage1_te_margin: Optional[np.ndarray] = None,
+        stage1_only: bool = False,
+        num_boost_round: int = 2200,
+        early_stopping_rounds: int = 120,
+    ) -> dict[str, np.ndarray]:
+        X_a_tr, X_b_tr, X_c_tr = views_tr
+        X_a_val, X_b_val, X_c_val = views_val
+        X_a_te, X_b_te, X_c_te = views_te
+
+        cat_cols_a = [c for c in X_a_tr.columns if c.startswith("cat_") or c in ["Gender", "Customer Type", "Type of Travel", "Class"]]
+        dtrain_a = lgb.Dataset(X_a_tr, label=(y_tr_soft >= 0.5).astype(np.float32), categorical_feature=cat_cols_a, free_raw_data=False)
+        dval_a = lgb.Dataset(X_a_val, label=y_val_hard, categorical_feature=cat_cols_a, reference=dtrain_a, free_raw_data=False)
+
+        lgb_params_a = {
+            "boosting_type": "gbdt",
+            "learning_rate": 0.035,
+            "num_leaves": 159,
+            "max_depth": 10,
+            "max_bin": 511,
+            "min_child_samples": 45,
+            "min_data_per_group": 50,
+            "cat_smooth": 20.0,
+            "feature_fraction": 0.72,
+            "bagging_fraction": 0.85,
+            "bagging_freq": 1,
+            "reg_alpha": 1.5,
+            "reg_lambda": 5.0,
+            "feature_contri": self._build_lgbm_feature_contri(list(X_a_tr.columns)),
+            "metric": "auc",
+            "verbose": -1,
+            "random_state": self.seed,
+            "objective": self.loss_engine.lgb_objective(y_tr_soft, w_tr),
+        }
+
+        if stage1_val_margin is not None and not stage1_only:
+            z_val_1 = stage1_val_margin
+            z_te_1 = stage1_te_margin if stage1_te_margin is not None else np.zeros(len(X_a_te), dtype=np.float64)
+            if stage1_oof_tr_margin is not None:
+                if len(stage1_oof_tr_margin) == len(X_a_tr):
+                    z_tr_1 = stage1_oof_tr_margin
+                elif len(stage1_oof_tr_margin) < len(X_a_tr):
+                    model_a = lgb.train(
+                        lgb_params_a,
+                        dtrain_a,
+                        num_boost_round=num_boost_round,
+                        valid_sets=[dval_a],
+                        callbacks=[lgb.early_stopping(stopping_rounds=early_stopping_rounds, verbose=False)],
+                    )
+                    extra_z = 0.85 * model_a.predict(X_a_tr.iloc[len(stage1_oof_tr_margin):])
+                    z_tr_1 = np.concatenate([stage1_oof_tr_margin, extra_z])
+                else:
+                    z_tr_1 = stage1_oof_tr_margin[:len(X_a_tr)]
+            else:
+                z_tr_1 = 0.85 * z_val_1
+        else:
+            model_a = lgb.train(
+                lgb_params_a,
+                dtrain_a,
+                num_boost_round=num_boost_round,
+                valid_sets=[dval_a],
+                callbacks=[lgb.early_stopping(stopping_rounds=early_stopping_rounds, verbose=False)],
+            )
+
+            z_val_1 = model_a.predict(X_a_val)
+            z_te_1 = model_a.predict(X_a_te)
+            if stage1_oof_tr_margin is not None:
+                if len(stage1_oof_tr_margin) == len(X_a_tr):
+                    z_tr_1 = stage1_oof_tr_margin
+                elif len(stage1_oof_tr_margin) < len(X_a_tr):
+                    extra_z = 0.85 * model_a.predict(X_a_tr.iloc[len(stage1_oof_tr_margin):])
+                    z_tr_1 = np.concatenate([stage1_oof_tr_margin, extra_z])
+                else:
+                    z_tr_1 = stage1_oof_tr_margin[:len(X_a_tr)]
+            else:
+                z_tr_1 = 0.85 * model_a.predict(X_a_tr)
+
+        if stage1_only:
+            return {
+                "val_logits_1": z_val_1.astype(np.float64),
+                "te_logits_1": z_te_1.astype(np.float64),
+            }
+
+        dtrain_b = xgb.DMatrix(X_b_tr, label=(y_tr_soft >= 0.5).astype(np.float32))
+        dval_b = xgb.DMatrix(X_b_val, label=y_val_hard)
+        dte_b = xgb.DMatrix(X_b_te)
+
+        dtrain_b.set_base_margin(self.beta_12 * z_tr_1)
+        dval_b.set_base_margin(self.beta_12 * z_val_1)
+        dte_b.set_base_margin(self.beta_12 * z_te_1)
+
+        xgb_params_b = {
+            "tree_method": "hist",
+            "max_depth": 8,
+            "max_bin": 256,
+            "learning_rate": 0.03,
+            "subsample": 0.82,
+            "colsample_bytree": 0.65,
+            "colsample_bylevel": 0.70,
+            "min_child_weight": 25.0,
+            "reg_alpha": 2.0,
+            "reg_lambda": 8.0,
+            "eval_metric": "auc",
+            "seed": self.seed + 17,
+        }
+
+        model_b = xgb.train(
+            xgb_params_b,
+            dtrain_b,
+            num_boost_round=num_boost_round,
+            evals=[(dval_b, "val")],
+            obj=self.loss_engine.xgb_objective(y_tr_soft, w_tr),
+            early_stopping_rounds=early_stopping_rounds,
+            verbose_eval=False,
+        )
+
+        z_val_2 = model_b.predict(dval_b, output_margin=True)
+        z_te_2 = model_b.predict(dte_b, output_margin=True)
+        z_tr_2 = 0.88 * model_b.predict(dtrain_b, output_margin=True)
+
+        init_tr_3 = self.beta_23 * (0.55 * z_tr_1 + 0.45 * z_tr_2)
+        init_val_3 = self.beta_23 * (0.55 * z_val_1 + 0.45 * z_val_2)
+        init_te_3 = self.beta_23 * (0.55 * z_te_1 + 0.45 * z_te_2)
+
+        dtrain_c = lgb.Dataset(X_c_tr, label=(y_tr_soft >= 0.5).astype(np.float32), init_score=init_tr_3, free_raw_data=False)
+        dval_c = lgb.Dataset(X_c_val, label=y_val_hard, init_score=init_val_3, reference=dtrain_c, free_raw_data=False)
+
+        lgb_params_c = {
+            "boosting_type": "gbdt",
+            "extra_trees": True,
+            "learning_rate": 0.03,
+            "num_leaves": 255,
+            "max_depth": 11,
+            "min_child_samples": 60,
+            "feature_fraction": 0.42,
+            "feature_fraction_bynode": 0.45,
+            "bagging_fraction": 0.80,
+            "bagging_freq": 1,
+            "reg_alpha": 2.5,
+            "reg_lambda": 10.0,
+            "metric": "auc",
+            "verbose": -1,
+            "random_state": self.seed + 33,
+            "objective": self.loss_engine.lgb_objective(y_tr_soft, w_tr),
+        }
+
+        model_c = lgb.train(
+            lgb_params_c,
+            dtrain_c,
+            num_boost_round=num_boost_round,
+            valid_sets=[dval_c],
+            callbacks=[lgb.early_stopping(stopping_rounds=early_stopping_rounds, verbose=False)],
+        )
+
+        z_val_3 = init_val_3 + model_c.predict(X_c_val)
+        z_te_3 = init_te_3 + model_c.predict(X_c_te)
+
+        return {
+            "val_logits_1": z_val_1.astype(np.float64),
+            "val_logits_2": z_val_2.astype(np.float64),
+            "val_logits_3": z_val_3.astype(np.float64),
+            "te_logits_1": z_te_1.astype(np.float64),
+            "te_logits_2": z_te_2.astype(np.float64),
+            "te_logits_3": z_te_3.astype(np.float64),
+        }

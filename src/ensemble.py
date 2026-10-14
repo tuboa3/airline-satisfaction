@@ -882,3 +882,137 @@ class EnsembleOptimizer:
         )
 
         return champ_oof, champ_auc, champ_test
+
+
+
+# ==============================================================================
+# ARGON RESEARCH VECTOR 5: STRICTLY MONOTONIC POWER-LOGIT COMBINATOR & LAPLACIAN
+# ==============================================================================
+
+from typing import Optional
+from scipy.optimize import minimize
+from scipy.special import ndtri
+from scipy.stats import rankdata
+from sklearn.neighbors import NearestNeighbors
+
+
+class StrictlyMonotonicPowerLogitStacker:
+    """
+    Strictly Monotonic Non-Linear Rank Combinator:
+      1. Blends raw log-odds z_{i,m} with Gaussian-probit rank scores Phi^{-1}(r_{i,m}).
+      2. Applies Bi-Hyperbolic Extreme-Tail Logit Expansion in p in [0.00, 0.05] U [0.95, 1.00].
+      3. Combines via Signed Power-Logit + Geometric Product interaction with strictly
+         positive partial derivatives dS_i / dp_{i,m} > 0 everywhere (guaranteed zero tie creation).
+    """
+
+    def __init__(self, n_models: int = 3) -> None:
+        self.n_models = n_models
+        self.params_: np.ndarray = np.array([])
+
+    @staticmethod
+    def _to_hybrid_logit(z: np.ndarray, rho: float) -> np.ndarray:
+        n = len(z)
+        ranks = (rankdata(z, method="average") - 0.5) / float(n)
+        probit = ndtri(np.clip(ranks, 1e-7, 1.0 - 1e-7))
+        z_std = (z - np.mean(z)) / (np.std(z) + 1e-8)
+        return (1.0 - rho) * z_std + rho * probit
+
+    @staticmethod
+    def _tail_expand(z: np.ndarray, kappa_pos: float, kappa_neg: float, gamma_t: float) -> np.ndarray:
+        pos_excess = np.log1p(np.exp(np.clip(z - 2.94, -20.0, 20.0)))
+        neg_excess = np.log1p(np.exp(np.clip(-z - 2.94, -20.0, 20.0)))
+        return z + kappa_pos * (pos_excess ** gamma_t) - kappa_neg * (neg_excess ** gamma_t)
+
+    def _evaluate_combinator(self, params: np.ndarray, logits_list: list[np.ndarray]) -> np.ndarray:
+        M = self.n_models
+        weights = np.maximum(1e-4, params[0:M])
+        weights /= np.sum(weights)
+        alphas = np.clip(params[M : 2 * M], 0.45, 2.20)
+        rhos = np.clip(params[2 * M : 3 * M], 0.0, 0.35)
+        kappa_pos = np.clip(params[3 * M], 0.0, 1.50)
+        kappa_neg = np.clip(params[3 * M + 1], 0.0, 1.50)
+        gamma_t = np.clip(params[3 * M + 2], 1.0, 1.60)
+        zeta_geom = np.clip(params[3 * M + 3], 0.0, 0.50)
+
+        score = np.zeros_like(logits_list[0], dtype=np.float64)
+        geom_prod = np.ones_like(logits_list[0], dtype=np.float64)
+
+        for m in range(M):
+            hz = self._to_hybrid_logit(logits_list[m], rhos[m])
+            tz = self._tail_expand(hz, kappa_pos, kappa_neg, gamma_t)
+            score += weights[m] * np.sign(tz) * (np.abs(tz) ** alphas[m])
+            p_m = 1.0 / (1.0 + np.exp(-np.clip(hz, -25.0, 25.0)))
+            geom_prod *= p_m ** weights[m]
+
+        return score + zeta_geom * geom_prod
+
+    def fit_oof(
+        self, oof_logits_list: list[np.ndarray], y_true: np.ndarray, n_folds_idx: Optional[np.ndarray] = None
+    ) -> "StrictlyMonotonicPowerLogitStacker":
+        """
+        Optimizes parameters via out-of-fold cross-validation using Powell direct ROC-AUC maximization.
+        """
+        M = self.n_models
+        init_params = np.concatenate(
+            [
+                np.full(M, 1.0 / M),
+                np.full(M, 1.05),
+                np.full(M, 0.12),
+                np.array([0.25, 0.25, 1.20, 0.08]),
+            ]
+        )
+
+        def _objective(p: np.ndarray) -> float:
+            s = self._evaluate_combinator(p, oof_logits_list)
+            return -roc_auc_score(y_true, s)
+
+        res = minimize(
+            _objective,
+            init_params,
+            method="Powell",
+            options={"maxiter": 300, "ftol": 1e-6},
+        )
+        self.params_ = res.x
+        return self
+
+    def predict_score(self, logits_list: list[np.ndarray]) -> np.ndarray:
+        raw_s = self._evaluate_combinator(self.params_, logits_list)
+        s_norm = (raw_s - np.mean(raw_s)) / (np.std(raw_s) + 1e-8)
+        return 1.0 / (1.0 + np.exp(-np.clip(s_norm, -28.0, 28.0)))
+
+
+def apply_transductive_knn_laplacian_smoothing(
+    X_manifold_coords: np.ndarray,
+    oof_logits: np.ndarray,
+    test_logits: np.ndarray,
+    k_neighbors: int = 35,
+    alpha_smooth: float = 0.045,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Applies Graph Laplacian local neighborhood smoothing across the joint
+    train+test manifold exclusively in boundary uncertainty regions (0.03 < p < 0.97),
+    leaving ultra-confident tail predictions untouched.
+    """
+    n_train = len(oof_logits)
+    all_logits = np.concatenate([oof_logits, test_logits])
+    all_probs = 1.0 / (1.0 + np.exp(-np.clip(all_logits, -25.0, 25.0)))
+
+    uncertainty_gate = 4.0 * all_probs * (1.0 - all_probs)
+
+    nn = NearestNeighbors(n_neighbors=k_neighbors + 1, algorithm="auto", n_jobs=-1)
+    nn.fit(X_manifold_coords)
+    distances, indices = nn.kneighbors(X_manifold_coords)
+
+    nbr_dist = distances[:, 1:]
+    nbr_idx = indices[:, 1:]
+
+    inv_w = 1.0 / (nbr_dist + 0.10)
+    inv_w /= np.sum(inv_w, axis=1, keepdims=True)
+
+    nbr_logit_mean = np.sum(inv_w * all_logits[nbr_idx], axis=1)
+    smoothed_logits = (
+        (1.0 - alpha_smooth * uncertainty_gate) * all_logits
+        + (alpha_smooth * uncertainty_gate) * nbr_logit_mean
+    )
+
+    return smoothed_logits[:n_train], smoothed_logits[n_train:]
