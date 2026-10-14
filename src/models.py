@@ -2852,9 +2852,12 @@ def train_catboost_dual_representation(
         cat_name = f"{col}_cat_str"
         cat_col_names.append(cat_name)
         for df_part in (X_tr_cb, X_va_cb, X_te_cb):
-            df_part[cat_name] = df_part[col].fillna(-999).astype(str)
-            if df_part[col].dtype == "object" or str(df_part[col].dtype) == "category":
+            s = df_part[col]
+            if str(s.dtype) == "category" or s.dtype == "object":
+                df_part[cat_name] = s.astype(object).fillna("missing").astype(str)
                 df_part.drop(columns=[col], inplace=True)
+            else:
+                df_part[cat_name] = s.astype(float).fillna(-999).astype(str)
 
     tr_pool = Pool(X_tr_cb, y_tr, cat_features=cat_col_names)
     va_pool = Pool(X_va_cb, y_va, cat_features=cat_col_names)
@@ -2874,6 +2877,8 @@ def train_catboost_dual_representation(
         "random_seed": seed,
         "verbose": 500 if verbose else False,
     }
+    if task_type == "GPU":
+        cb_params["devices"] = "0"
 
     try:
         cb_model = CatBoostClassifier(**cb_params)
@@ -2882,6 +2887,7 @@ def train_catboost_dual_representation(
         if task_type == "GPU":
             logging.warning(f"CatBoost GPU execution note: {e}. Falling back to multi-core CPU...")
             cb_params["task_type"] = "CPU"
+            cb_params.pop("devices", None)
             cb_model = CatBoostClassifier(**cb_params)
             cb_model.fit(tr_pool, eval_set=va_pool, early_stopping_rounds=early_stopping_rounds, verbose=False)
         else:
@@ -3132,6 +3138,18 @@ def train_pytabkit_deep_tabular(
         bs = batch_size if not fast_mode else 128
         n_batches = int(np.ceil(n_samples / bs))
 
+        def _predict_batched(m, num_t, cats_t, eval_bs=4096):
+            m.eval()
+            n = len(num_t)
+            all_preds = []
+            with torch.no_grad():
+                for i in range(0, n, eval_bs):
+                    b_num = num_t[i : i + eval_bs]
+                    b_cats = [c[i : i + eval_bs] for c in cats_t]
+                    out = m(b_num, b_cats)
+                    all_preds.append(out.cpu().numpy())
+            return np.concatenate(all_preds) if all_preds else np.zeros(0, dtype=np.float32)
+
         for ep in range(epochs):
             model.train()
             perm = torch.randperm(n_samples, device=torch_device)
@@ -3145,18 +3163,16 @@ def train_pytabkit_deep_tabular(
 
             model.eval()
             with torch.no_grad():
-                va_logits = model(t_num_va, t_cats_va)
-                va_loss = criterion(va_logits, t_y_va).item()
+                va_logits_arr = _predict_batched(model, t_num_va, t_cats_va)
+                va_loss = criterion(torch.from_numpy(va_logits_arr).to(torch_device), t_y_va).item()
                 if va_loss < best_va_loss:
                     best_va_loss = va_loss
-                    best_va_logits = va_logits.cpu().numpy()
-                    best_te_logits = model(t_num_te, t_cats_te).cpu().numpy()
+                    best_va_logits = va_logits_arr
+                    best_te_logits = _predict_batched(model, t_num_te, t_cats_te)
 
         if best_va_logits is None:
-            model.eval()
-            with torch.no_grad():
-                best_va_logits = model(t_num_va, t_cats_va).cpu().numpy()
-                best_te_logits = model(t_num_te, t_cats_te).cpu().numpy()
+            best_va_logits = _predict_batched(model, t_num_va, t_cats_va)
+            best_te_logits = _predict_batched(model, t_num_te, t_cats_te)
 
         return best_va_logits.astype(np.float64), best_te_logits.astype(np.float64)
 

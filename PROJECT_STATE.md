@@ -383,3 +383,9 @@ All 5 standalone models trained successfully on Kaggle Dual-T4:
   - **Orchestration & Verification (`run_argon_cascade.py`):**
     - Seamlessly supports `--architecture parallel_5family` (default) and `--architecture cascade`.
     - Smoke tested end-to-end with `--fast`, verified exiting code 0 in ~16 seconds, generating verified `submission.csv`, serialized logits, and evaluation summaries.
+
+- **Milestone 12: Resolution of CatBoost Categorical Ingestion & Deep Tabular Batched Inference:**
+  - *CatBoost Categorical `fillna` Fix:* In `train_catboost_dual_representation`, resolved `TypeError: Cannot setitem on a Categorical with a new category (-999)` when creating dual representations by safely converting categorical/object series (`s.astype(object).fillna("missing").astype(str)`) and numeric series (`s.astype(float).fillna(-999).astype(str)`). Explicitly mapped GPU execution to `"devices": "0"` with CPU fallback.
+  - *Deep Tabular Batched Evaluation:* Implemented `_predict_batched` with chunk size `eval_bs=4096` in `train_pytabkit_deep_tabular` across both `RealMLP-TD` and `TabM` (32 ensemble sub-model heads) to ensure zero CUDA OOM risk on large validation and test splits (300,000 rows).
+  - *End-to-End Smoke Test Verification:* Re-verified full 5-family pipeline (`LightGBM`, `XGBoost`, `CatBoost`, `RealMLP-TD`, `TabM`) passing end-to-end in `--fast` mode with zero errors (exit code 0).
+
