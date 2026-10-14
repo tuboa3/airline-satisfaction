@@ -51,7 +51,7 @@ from src.models import (
     select_certainty_masked_pseudo_labels,
 )
 from src.postprocess import ExactMatchPostprocessor
-from src.utils import get_logger, resolve_binary_target, timer
+from src.utils import detect_hardware, get_logger, resolve_binary_target, timer
 
 
 def parse_args():
@@ -60,6 +60,13 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--beta_12", type=float, default=0.72, help="Stage 1 -> Stage 2 margin handoff")
     parser.add_argument("--beta_23", type=float, default=0.75, help="Stage 2 -> Stage 3 init_score handoff")
+    parser.add_argument("--n_jobs", type=int, default=-1, help="Number of CPU cores/threads (-1 to use all cores)")
+    parser.add_argument(
+        "--gpu",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable GPU acceleration across all available NVIDIA GPUs",
+    )
     parser.add_argument(
         "--use_orig_data",
         action=argparse.BooleanOptionalAction,
@@ -89,9 +96,14 @@ def main():
     paths = PathConfig()
     feature_cfg = FeatureConfig()
 
+    primary_dev, num_cpus, num_gpus, gpu_devs = detect_hardware()
+    n_cpus = num_cpus if (args.n_jobs <= 0 or args.n_jobs > num_cpus) else args.n_jobs
+    use_gpu = args.gpu and (num_gpus > 0)
+
     logger.info("=" * 80)
     logger.info("STARTING ARGON RESEARCH DEEP CASCADE PIPELINE (KAGGLE S6E10)")
     logger.info(f"Folds: {args.folds} | Seed: {args.seed} | Fast Mode: {args.fast}")
+    logger.info(f"Hardware Allocation: Active CPU Cores={n_cpus} | GPU Acceleration={use_gpu} (Total GPUs={num_gpus}: {gpu_devs})")
     logger.info(f"Handoff beta_12: {args.beta_12} | beta_23: {args.beta_23} | Two-Pass Mode: {args.two_pass}")
     logger.info(f"Original Data Weighting: {args.use_orig_data} | Distillation: {args.use_distillation}")
     logger.info(f"Transductive Pseudo-Labels: {args.use_pseudo_labels} | Laplacian: {args.use_laplacian}")
@@ -258,7 +270,10 @@ def main():
                 y_tr_aug = np.concatenate(y_tr_list)
                 w_tr_aug = np.concatenate(w_tr_list)
 
-                irt_engine = HurdleGradedResponseModel()
+                fold_gpu = gpu_devs[(fold - 1) % num_gpus] if (use_gpu and num_gpus > 0) else None
+                fold_irt = gpu_devs[fold % num_gpus] if (use_gpu and num_gpus > 1) else fold_gpu
+
+                irt_engine = HurdleGradedResponseModel(device=fold_irt)
                 irt_engine.fit(df_tr, y_tr_clean)
                 irt_tr_aug = irt_engine.transform(df_tr_aug)
                 irt_val = irt_engine.transform(df_val)
@@ -271,7 +286,13 @@ def main():
                 views_val = view_builder.transform_views(df_val, dgp_val, irt_val, is_train_fold=False)
                 views_te = view_builder.transform_views(test_df, dgp_test, irt_te, is_train_fold=False)
 
-                cascade = HierarchicalResidualGBDTCascade(beta_12=args.beta_12, beta_23=args.beta_23, seed=args.seed + fold)
+                cascade = HierarchicalResidualGBDTCascade(
+                    beta_12=args.beta_12,
+                    beta_23=args.beta_23,
+                    seed=args.seed + fold,
+                    num_threads=n_cpus,
+                    gpu_device=fold_gpu,
+                )
                 p1_res = cascade.fit_predict_fold(
                     views_tr=views_tr,
                     y_tr_soft=y_tr_aug,
@@ -293,6 +314,9 @@ def main():
 
     for fold, (trn_idx, val_idx) in enumerate(skf.split(train_df, y_train), start=1):
         with timer(f"Fold {fold}/{args.folds}"):
+            fold_gpu = gpu_devs[(fold - 1) % num_gpus] if (use_gpu and num_gpus > 0) else None
+            fold_irt = gpu_devs[fold % num_gpus] if (use_gpu and num_gpus > 1) else fold_gpu
+
             df_tr = train_df.iloc[trn_idx].copy()
             y_tr_clean = y_train[trn_idx].copy()
             y_tr = y_train_soft[trn_idx].copy()
@@ -324,7 +348,7 @@ def main():
             y_tr_aug = np.concatenate(y_tr_list)
             w_tr_aug = np.concatenate(w_tr_list)
 
-            irt_engine = HurdleGradedResponseModel()
+            irt_engine = HurdleGradedResponseModel(device=fold_irt)
             irt_engine.fit(df_tr, y_tr_clean)
             irt_tr_aug = irt_engine.transform(df_tr_aug)
             irt_val = irt_engine.transform(df_val)
@@ -341,6 +365,8 @@ def main():
                 beta_12=args.beta_12,
                 beta_23=args.beta_23,
                 seed=args.seed + fold,
+                num_threads=n_cpus,
+                gpu_device=fold_gpu,
             )
 
             stage1_oof_tr = oof_logits_1[trn_idx] if args.two_pass else None

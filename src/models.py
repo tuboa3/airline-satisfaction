@@ -2401,10 +2401,14 @@ class HierarchicalResidualGBDTCascade:
         beta_12: float = 0.72,
         beta_23: float = 0.75,
         seed: int = 42,
+        num_threads: int = -1,
+        gpu_device: Optional[str] = None,
     ) -> None:
         self.beta_12 = beta_12
         self.beta_23 = beta_23
         self.seed = seed
+        self.num_threads = num_threads if num_threads > 0 else (os.cpu_count() or 4)
+        self.gpu_device = gpu_device
         self.loss_engine = HybridDampedAUCLoss()
 
     @staticmethod
@@ -2456,6 +2460,8 @@ class HierarchicalResidualGBDTCascade:
             "feature_contri": self._build_lgbm_feature_contri(list(X_a_tr.columns)),
             "metric": "auc",
             "verbose": -1,
+            "n_jobs": self.num_threads,
+            "num_threads": self.num_threads,
             "random_state": self.seed,
             "objective": self.loss_engine.lgb_objective(y_tr_soft, w_tr),
         }
@@ -2529,17 +2535,39 @@ class HierarchicalResidualGBDTCascade:
             "reg_lambda": 8.0,
             "eval_metric": "auc",
             "seed": self.seed + 17,
+            "n_jobs": self.num_threads,
         }
+        if self.gpu_device is not None and self.gpu_device.startswith("cuda"):
+            xgb_params_b["device"] = self.gpu_device
 
-        model_b = xgb.train(
-            xgb_params_b,
-            dtrain_b,
-            num_boost_round=num_boost_round,
-            evals=[(dval_b, "val")],
-            obj=self.loss_engine.xgb_objective(y_tr_soft, w_tr),
-            early_stopping_rounds=early_stopping_rounds,
-            verbose_eval=False,
-        )
+        try:
+            model_b = xgb.train(
+                xgb_params_b,
+                dtrain_b,
+                num_boost_round=num_boost_round,
+                evals=[(dval_b, "val")],
+                obj=self.loss_engine.xgb_objective(y_tr_soft, w_tr),
+                early_stopping_rounds=early_stopping_rounds,
+                verbose_eval=False,
+            )
+        except Exception as e:
+            if "device" in xgb_params_b and xgb_params_b["device"].startswith("cuda"):
+                logging.warning(
+                    f"XGBoost GPU execution notice: {e}. Falling back to multi-core CPU ({self.num_threads} threads)..."
+                )
+                xgb_params_b["device"] = "cpu"
+                xgb_params_b["n_jobs"] = self.num_threads
+                model_b = xgb.train(
+                    xgb_params_b,
+                    dtrain_b,
+                    num_boost_round=num_boost_round,
+                    evals=[(dval_b, "val")],
+                    obj=self.loss_engine.xgb_objective(y_tr_soft, w_tr),
+                    early_stopping_rounds=early_stopping_rounds,
+                    verbose_eval=False,
+                )
+            else:
+                raise e
 
         z_val_2 = model_b.predict(dval_b, output_margin=True)
         z_te_2 = model_b.predict(dte_b, output_margin=True)
@@ -2567,6 +2595,8 @@ class HierarchicalResidualGBDTCascade:
             "reg_lambda": 10.0,
             "metric": "auc",
             "verbose": -1,
+            "n_jobs": self.num_threads,
+            "num_threads": self.num_threads,
             "random_state": self.seed + 33,
             "objective": self.loss_engine.lgb_objective(y_tr_soft, w_tr),
         }

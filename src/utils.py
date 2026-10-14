@@ -75,29 +75,40 @@ def reduce_mem_usage(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
     return df
 
 
-def detect_hardware() -> tuple[str, int]:
+def detect_hardware() -> tuple[str, int, int, list[str]]:
     """
-    Detects whether an NVIDIA GPU is available and determines optimal thread count.
-    Returns: (device_type, num_threads)
+    Detects CPU and GPU topology, configures OpenMP / BLAS thread pools,
+    and returns (device_type, num_cpus, num_gpus, gpu_devices).
     """
     num_cpus = os.cpu_count() or 4
-    gpu_available = False
+    os.environ["OMP_NUM_THREADS"] = str(num_cpus)
+    os.environ["MKL_NUM_THREADS"] = str(num_cpus)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(num_cpus)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(num_cpus)
+
+    num_gpus = 0
+    gpu_devices: list[str] = []
 
     try:
         import torch
 
+        torch.set_num_threads(num_cpus)
         if torch.cuda.is_available():
-            gpu_available = True
-            gpu_name = torch.cuda.get_device_name(0)
-            logging.info(f"NVIDIA GPU Detected: {gpu_name}")
-    except ImportError:
-        pass
+            num_gpus = torch.cuda.device_count()
+            gpu_devices = [f"cuda:{i}" for i in range(num_gpus)]
+            for i in range(num_gpus):
+                name = torch.cuda.get_device_name(i)
+                mem_gib = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+                logging.info(f"NVIDIA GPU Active [{i}]: {name} ({mem_gib:.1f} GiB VRAM)")
+    except Exception as e:
+        logging.warning(f"Hardware probe notice: {e}")
 
-    device = "cuda" if gpu_available else "cpu"
+    primary_device = gpu_devices[0] if gpu_devices else "cpu"
     logging.info(
-        f"Hardware Configuration: Device={device.upper()} | CPU Threads={num_cpus}"
+        f"Hardware Configuration: Primary Device={primary_device.upper()} | "
+        f"Total GPUs={num_gpus} | Active CPU Threads={num_cpus}"
     )
-    return device, num_cpus
+    return primary_device, num_cpus, num_gpus, gpu_devices
 
 
 @contextmanager

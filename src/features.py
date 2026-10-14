@@ -1859,12 +1859,13 @@ class HurdleGradedResponseModel:
     strictly on observed ratings in {1, 2, 3, 4, 5}.
     """
 
-    def __init__(self, theta_grid_size: int = 81) -> None:
+    def __init__(self, theta_grid_size: int = 81, device: Optional[str] = None) -> None:
         self.theta_grid: np.ndarray = np.linspace(-4.0, 4.0, theta_grid_size)
         self.alphas_: np.ndarray = np.ones(len(SURVEY_COLS), dtype=np.float64)
         self.betas_: np.ndarray = np.zeros((len(SURVEY_COLS), 4), dtype=np.float64)
         self.zero_log_odds_: np.ndarray = np.zeros(len(ZERO_CAPABLE_SURVEY_COLS))
         self.non_zero_log_odds_: np.ndarray = np.zeros(len(ZERO_CAPABLE_SURVEY_COLS))
+        self.device = device
 
     def fit(self, df_survey: pd.DataFrame, y: np.ndarray) -> "HurdleGradedResponseModel":
         X = df_survey[SURVEY_COLS].to_numpy(dtype=np.int32)
@@ -1916,6 +1917,7 @@ class HurdleGradedResponseModel:
         """
         Vectorized MAP/EAP person scoring, Fisher Test Information I(theta),
         and Drasgow-Levine-Williams Z_h aberrant person-fit statistic.
+        Uses GPU PyTorch if available, else exact NumPy CPU.
         """
         N = X.shape[0]
         G = len(self.theta_grid)
@@ -1949,6 +1951,56 @@ class HurdleGradedResponseModel:
 
             var_ll[idx] = np.maximum(var_ll[idx] - (expected_ll[idx] ** 2), 1e-8)
 
+        # 1. GPU Acceleration via PyTorch if device is configured
+        if self.device is not None and self.device.startswith("cuda"):
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    dev = torch.device(self.device)
+                    grid_t = torch.from_numpy(self.theta_grid).float().to(dev)
+                    prior_t = (-0.5 * (grid_t ** 2)).to(dev)
+                    X_t = torch.from_numpy(X).long().to(dev)
+                    log_p_t = torch.from_numpy(log_p).float().to(dev)
+                    exp_ll_t = torch.from_numpy(expected_ll).float().to(dev)
+                    var_ll_t = torch.from_numpy(var_ll).float().to(dev)
+                    info_t = torch.from_numpy(item_info).float().to(dev)
+
+                    total_lp_t = prior_t.unsqueeze(0).repeat(N, 1)
+                    for idx, j in enumerate(item_indices):
+                        r_j_t = X_t[:, j]
+                        valid_t = r_j_t > 0
+                        total_lp_t[valid_t] += log_p_t[idx, r_j_t[valid_t]]
+
+                    max_lp_t = torch.max(total_lp_t, dim=1, keepdim=True).values
+                    weights_t = torch.exp(total_lp_t - max_lp_t)
+                    weights_t /= torch.sum(weights_t, dim=1, keepdim=True)
+                    theta_eap_t = torch.matmul(weights_t, grid_t)
+                    best_g_t = torch.argmax(total_lp_t, dim=1)
+
+                    obs_ll_t = torch.zeros(N, device=dev, dtype=torch.float32)
+                    exp_sum_t = torch.zeros(N, device=dev, dtype=torch.float32)
+                    var_sum_t = torch.zeros(N, device=dev, dtype=torch.float32)
+                    fish_t = torch.ones(N, device=dev, dtype=torch.float32)
+
+                    for idx, j in enumerate(item_indices):
+                        r_j_t = X_t[:, j]
+                        valid_t = r_j_t > 0
+                        g_v_t = best_g_t[valid_t]
+                        obs_ll_t[valid_t] += log_p_t[idx, r_j_t[valid_t], g_v_t]
+                        exp_sum_t[valid_t] += exp_ll_t[idx, g_v_t]
+                        var_sum_t[valid_t] += var_ll_t[idx, g_v_t]
+                        fish_t[valid_t] += info_t[idx, g_v_t]
+
+                    zh_t = (obs_ll_t - exp_sum_t) / torch.sqrt(torch.clamp(var_sum_t, min=1e-6))
+                    return (
+                        theta_eap_t.cpu().numpy().astype(np.float64),
+                        fish_t.cpu().numpy().astype(np.float64),
+                        zh_t.cpu().numpy().astype(np.float64),
+                    )
+            except Exception:
+                pass  # Clean fallback to CPU NumPy
+
+        # 2. Exact CPU NumPy Fallback
         total_log_post = np.broadcast_to(log_prior[None, :], (N, G)).copy()
         for idx, j in enumerate(item_indices):
             r_j = X[:, j]
@@ -2123,6 +2175,8 @@ class TransductiveManifoldAndDGPInverter:
             "bagging_fraction": 0.8,
             "bagging_freq": 1,
             "verbose": -1,
+            "n_jobs": -1,
+            "num_threads": -1,
             "random_state": self.seed,
         }
         self.orig_oracle_model_ = lgb.train(oracle_params, dtrain_orig, num_boost_round=600)
@@ -2173,6 +2227,8 @@ class TransductiveManifoldAndDGPInverter:
                 "learning_rate": 0.05,
                 "num_leaves": 31,
                 "verbose": -1,
+                "n_jobs": -1,
+                "num_threads": -1,
                 "random_state": self.seed,
             },
             dadv,

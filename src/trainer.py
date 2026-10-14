@@ -43,7 +43,7 @@ class CrossValidationEngine:
         self.model_name = model_name
 
         if device is None:
-            self.device, _ = detect_hardware()
+            self.device = detect_hardware()[0]
         else:
             self.device = device
 

@@ -998,10 +998,14 @@ def apply_transductive_knn_laplacian_smoothing(
     all_probs = 1.0 / (1.0 + np.exp(-np.clip(all_logits, -25.0, 25.0)))
 
     uncertainty_gate = 4.0 * all_probs * (1.0 - all_probs)
+    active_mask = (all_probs >= 0.03) & (all_probs <= 0.97)
 
-    nn = NearestNeighbors(n_neighbors=k_neighbors + 1, algorithm="auto", n_jobs=-1)
+    if not np.any(active_mask):
+        return oof_logits, test_logits
+
+    nn = NearestNeighbors(n_neighbors=k_neighbors + 1, algorithm="kd_tree", leaf_size=40, n_jobs=-1)
     nn.fit(X_manifold_coords)
-    distances, indices = nn.kneighbors(X_manifold_coords)
+    distances, indices = nn.kneighbors(X_manifold_coords[active_mask])
 
     nbr_dist = distances[:, 1:]
     nbr_idx = indices[:, 1:]
@@ -1010,9 +1014,14 @@ def apply_transductive_knn_laplacian_smoothing(
     inv_w /= np.sum(inv_w, axis=1, keepdims=True)
 
     nbr_logit_mean = np.sum(inv_w * all_logits[nbr_idx], axis=1)
-    smoothed_logits = (
-        (1.0 - alpha_smooth * uncertainty_gate) * all_logits
-        + (alpha_smooth * uncertainty_gate) * nbr_logit_mean
+
+    gate_active = uncertainty_gate[active_mask]
+    smoothed_active = (
+        (1.0 - alpha_smooth * gate_active) * all_logits[active_mask]
+        + (alpha_smooth * gate_active) * nbr_logit_mean
     )
+
+    smoothed_logits = all_logits.copy()
+    smoothed_logits[active_mask] = smoothed_active
 
     return smoothed_logits[:n_train], smoothed_logits[n_train:]
