@@ -15,6 +15,7 @@ Implements:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import sys
@@ -85,6 +86,12 @@ def parse_args():
         help="Enable Bayesian certainty-masked pseudo-labeling with survey dropout (Vector 3)",
     )
     parser.add_argument("--two_pass", action="store_true", help="Two-pass outer margin handoff to prevent in-sample residual starvation (Vector 5)")
+    parser.add_argument(
+        "--fold_workers",
+        type=int,
+        default=0,
+        help="Number of concurrent folds during cross-fitting (0 = auto based on CPU cores and GPUs)",
+    )
     parser.add_argument("--use_laplacian", action="store_true", help="Apply Graph Laplacian test manifold smoothing")
     parser.add_argument("--fast", action="store_true", help="Fast smoke-test mode on a lightweight sample")
     return parser.parse_args()
@@ -229,178 +236,228 @@ def main():
 
     skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
 
-    # 3. Cross-Validation Execution (Single-Pass or Two-Pass)
+    # 3. Cross-Validation Execution (Single-Pass or Two-Pass with High-Efficiency Concurrency)
     logger.info("=" * 80)
     logger.info(f"COMMENCING {args.folds}-FOLD LEAK-FREE RESIDUAL CASCADE (TWO_PASS={args.two_pass})")
     logger.info("=" * 80)
 
-    # If Two-Pass: Pass 1 fits Stage 1 across all folds first to get true out-of-fold margins
+    ram_gb = (
+        os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024**3)
+        if hasattr(os, "sysconf")
+        else 16.0
+    )
+    cache_fold_views = (ram_gb >= 16.0) and not args.fast
+
+    if args.fold_workers > 0:
+        p1_workers = min(args.fold_workers, args.folds)
+        p2_workers = min(args.fold_workers, args.folds)
+    else:
+        p1_workers = max(1, min(n_cpus, args.folds, 4 if n_cpus >= 4 else 2))
+        if use_gpu and num_gpus > 1:
+            p2_workers = min(num_gpus, n_cpus, args.folds)
+        elif use_gpu and num_gpus == 1:
+            p2_workers = 1
+        else:
+            p2_workers = max(1, min(n_cpus, args.folds, 2))
+
+    p1_threads = max(1, n_cpus // p1_workers)
+    p2_threads = max(1, n_cpus // p2_workers)
+    logger.info(
+        f"Concurrency Strategy: Pass 1 Workers={p1_workers} ({p1_threads} threads/fold) | "
+        f"Pass 2 Workers={p2_workers} ({p2_threads} threads/fold) | View Caching={cache_fold_views}"
+    )
+
+    def _prepare_fold_views(fold: int, trn_idx: np.ndarray, val_idx: np.ndarray, fold_irt_dev: Optional[str]):
+        df_tr = train_df.iloc[trn_idx].copy()
+        y_tr_clean = y_train[trn_idx].copy()
+        y_tr = y_train_soft[trn_idx].copy()
+        dgp_tr = dgp_train.iloc[trn_idx].copy()
+
+        df_val = train_df.iloc[val_idx].copy()
+        y_val = y_train[val_idx].copy()
+        dgp_val = dgp_train.iloc[val_idx].copy()
+
+        df_tr_list = [df_tr]
+        dgp_tr_list = [dgp_tr]
+        y_tr_list = [y_tr]
+        w_tr_list = [np.ones(len(df_tr), dtype=np.float32)]
+
+        if orig_df is not None and args.use_orig_data and dgp_orig is not None:
+            df_tr_list.append(orig_df)
+            dgp_tr_list.append(dgp_orig)
+            y_tr_list.append(y_orig)
+            w_tr_list.append(w_orig_fold)
+
+        if df_pl is not None:
+            df_tr_list.append(df_pl)
+            dgp_tr_list.append(dgp_pl)
+            y_tr_list.append(y_pl)
+            w_tr_list.append(w_pl)
+
+        df_tr_aug = pd.concat(df_tr_list, axis=0, ignore_index=True)
+        dgp_tr_aug = pd.concat(dgp_tr_list, axis=0, ignore_index=True)
+        y_tr_aug = np.concatenate(y_tr_list)
+        w_tr_aug = np.concatenate(w_tr_list)
+
+        irt_engine = HurdleGradedResponseModel(device=fold_irt_dev)
+        irt_engine.fit(df_tr, y_tr_clean)
+        irt_tr_aug = irt_engine.transform(df_tr_aug)
+        irt_val = irt_engine.transform(df_val)
+        irt_te = irt_engine.transform(test_df)
+
+        view_builder = AsymmetricViewBuilder(n_haar_projections=28, seed=args.seed + fold)
+        view_builder.fit_fold(df_tr, y_tr_clean, dgp_tr)
+
+        views_tr = view_builder.transform_views(df_tr_aug, dgp_tr_aug, irt_tr_aug, is_train_fold=True, y_tr=y_tr_aug)
+        views_val = view_builder.transform_views(df_val, dgp_val, irt_val, is_train_fold=False)
+        views_te = view_builder.transform_views(test_df, dgp_test, irt_te, is_train_fold=False)
+
+        return views_tr, views_val, views_te, y_tr_aug, w_tr_aug, y_val
+
+    fold_splits = list(enumerate(skf.split(train_df, y_train), start=1))
+    stage1_models = {}
+    fold_views_cache = {}
+
     if args.two_pass:
         logger.info("[TWO-PASS EXECUTION] Commencing Pass 1: Cross-fitting Stage 1 (LightGBM on View A)...")
-        for fold, (trn_idx, val_idx) in enumerate(skf.split(train_df, y_train), start=1):
-            with timer(f"Pass 1 - Fold {fold}/{args.folds} (Stage 1)"):
-                df_tr = train_df.iloc[trn_idx].copy()
-                y_tr_clean = y_train[trn_idx].copy()
-                y_tr = y_train_soft[trn_idx].copy()
-                dgp_tr = dgp_train.iloc[trn_idx].copy()
 
-                df_val = train_df.iloc[val_idx].copy()
-                y_val = y_train[val_idx].copy()
-                dgp_val = dgp_train.iloc[val_idx].copy()
-
-                df_tr_list = [df_tr]
-                dgp_tr_list = [dgp_tr]
-                y_tr_list = [y_tr]
-                w_tr_list = [np.ones(len(df_tr), dtype=np.float32)]
-
-                if orig_df is not None and args.use_orig_data and dgp_orig is not None:
-                    df_tr_list.append(orig_df)
-                    dgp_tr_list.append(dgp_orig)
-                    y_tr_list.append(y_orig)
-                    w_tr_list.append(w_orig_fold)
-
-                if df_pl is not None:
-                    df_tr_list.append(df_pl)
-                    dgp_tr_list.append(dgp_pl)
-                    y_tr_list.append(y_pl)
-                    w_tr_list.append(w_pl)
-
-                df_tr_aug = pd.concat(df_tr_list, axis=0, ignore_index=True)
-                dgp_tr_aug = pd.concat(dgp_tr_list, axis=0, ignore_index=True)
-                y_tr_aug = np.concatenate(y_tr_list)
-                w_tr_aug = np.concatenate(w_tr_list)
-
-                fold_gpu = gpu_devs[(fold - 1) % num_gpus] if (use_gpu and num_gpus > 0) else None
-                fold_irt = gpu_devs[fold % num_gpus] if (use_gpu and num_gpus > 1) else fold_gpu
-
-                irt_engine = HurdleGradedResponseModel(device=fold_irt)
-                irt_engine.fit(df_tr, y_tr_clean)
-                irt_tr_aug = irt_engine.transform(df_tr_aug)
-                irt_val = irt_engine.transform(df_val)
-                irt_te = irt_engine.transform(test_df)
-
-                view_builder = AsymmetricViewBuilder(n_haar_projections=28, seed=args.seed + fold)
-                view_builder.fit_fold(df_tr, y_tr_clean, dgp_tr)
-
-                views_tr = view_builder.transform_views(df_tr_aug, dgp_tr_aug, irt_tr_aug, is_train_fold=True, y_tr=y_tr_aug)
-                views_val = view_builder.transform_views(df_val, dgp_val, irt_val, is_train_fold=False)
-                views_te = view_builder.transform_views(test_df, dgp_test, irt_te, is_train_fold=False)
-
-                cascade = HierarchicalResidualGBDTCascade(
-                    beta_12=args.beta_12,
-                    beta_23=args.beta_23,
-                    seed=args.seed + fold,
-                    num_threads=n_cpus,
-                    gpu_device=fold_gpu,
-                )
-                p1_res = cascade.fit_predict_fold(
-                    views_tr=views_tr,
-                    y_tr_soft=y_tr_aug,
-                    w_tr=w_tr_aug,
-                    views_val=views_val,
-                    y_val_hard=y_val,
-                    views_te=views_te,
-                    stage1_only=True,
-                    num_boost_round=num_boost_round,
-                    early_stopping_rounds=early_stopping_rounds,
-                )
-                oof_logits_1[val_idx] = p1_res["val_logits_1"]
-                test_logits_1 += p1_res["te_logits_1"] / args.folds
-                auc_1 = roc_auc_score(y_val, p1_res["val_logits_1"])
-                logger.info(f"Pass 1 - Fold {fold} Stage 1 AUC = {auc_1:.5f}")
-
-        logger.info(f"Pass 1 Complete: Total Stage 1 OOF ROC-AUC = {roc_auc_score(y_train, oof_logits_1):.6f}")
-        logger.info("[TWO-PASS EXECUTION] Commencing Pass 2: Stages 2 & 3 with true out-of-fold margin handoffs...")
-
-    for fold, (trn_idx, val_idx) in enumerate(skf.split(train_df, y_train), start=1):
-        with timer(f"Fold {fold}/{args.folds}"):
+        def _run_pass1_fold(fold_info):
+            fold, trn_idx, val_idx = fold_info
             fold_gpu = gpu_devs[(fold - 1) % num_gpus] if (use_gpu and num_gpus > 0) else None
             fold_irt = gpu_devs[fold % num_gpus] if (use_gpu and num_gpus > 1) else fold_gpu
 
-            df_tr = train_df.iloc[trn_idx].copy()
-            y_tr_clean = y_train[trn_idx].copy()
-            y_tr = y_train_soft[trn_idx].copy()
-            dgp_tr = dgp_train.iloc[trn_idx].copy()
-
-            df_val = train_df.iloc[val_idx].copy()
-            y_val = y_train[val_idx].copy()
-            dgp_val = dgp_train.iloc[val_idx].copy()
-
-            df_tr_list = [df_tr]
-            dgp_tr_list = [dgp_tr]
-            y_tr_list = [y_tr]
-            w_tr_list = [np.ones(len(df_tr), dtype=np.float32)]
-
-            if orig_df is not None and args.use_orig_data and dgp_orig is not None:
-                df_tr_list.append(orig_df)
-                dgp_tr_list.append(dgp_orig)
-                y_tr_list.append(y_orig)
-                w_tr_list.append(w_orig_fold)
-
-            if df_pl is not None:
-                df_tr_list.append(df_pl)
-                dgp_tr_list.append(dgp_pl)
-                y_tr_list.append(y_pl)
-                w_tr_list.append(w_pl)
-
-            df_tr_aug = pd.concat(df_tr_list, axis=0, ignore_index=True)
-            dgp_tr_aug = pd.concat(dgp_tr_list, axis=0, ignore_index=True)
-            y_tr_aug = np.concatenate(y_tr_list)
-            w_tr_aug = np.concatenate(w_tr_list)
-
-            irt_engine = HurdleGradedResponseModel(device=fold_irt)
-            irt_engine.fit(df_tr, y_tr_clean)
-            irt_tr_aug = irt_engine.transform(df_tr_aug)
-            irt_val = irt_engine.transform(df_val)
-            irt_te = irt_engine.transform(test_df)
-
-            view_builder = AsymmetricViewBuilder(n_haar_projections=28, seed=args.seed + fold)
-            view_builder.fit_fold(df_tr, y_tr_clean, dgp_tr)
-
-            views_tr = view_builder.transform_views(df_tr_aug, dgp_tr_aug, irt_tr_aug, is_train_fold=True, y_tr=y_tr_aug)
-            views_val = view_builder.transform_views(df_val, dgp_val, irt_val, is_train_fold=False)
-            views_te = view_builder.transform_views(test_df, dgp_test, irt_te, is_train_fold=False)
+            views_tr, views_val, views_te, y_tr_aug, w_tr_aug, y_val = _prepare_fold_views(
+                fold, trn_idx, val_idx, fold_irt
+            )
 
             cascade = HierarchicalResidualGBDTCascade(
                 beta_12=args.beta_12,
                 beta_23=args.beta_23,
                 seed=args.seed + fold,
-                num_threads=n_cpus,
+                num_threads=p1_threads,
                 gpu_device=fold_gpu,
             )
-
-            stage1_oof_tr = oof_logits_1[trn_idx] if args.two_pass else None
-            stage1_val_m = oof_logits_1[val_idx] if args.two_pass else None
-            stage1_te_m = test_logits_1 if args.two_pass else None
-
-            preds_dict = cascade.fit_predict_fold(
+            p1_res = cascade.fit_predict_fold(
                 views_tr=views_tr,
                 y_tr_soft=y_tr_aug,
                 w_tr=w_tr_aug,
                 views_val=views_val,
                 y_val_hard=y_val,
                 views_te=views_te,
-                stage1_oof_tr_margin=stage1_oof_tr,
-                stage1_val_margin=stage1_val_m,
-                stage1_te_margin=stage1_te_m,
+                stage1_only=True,
                 num_boost_round=num_boost_round,
                 early_stopping_rounds=early_stopping_rounds,
             )
+            cached_data = (views_tr, views_val, views_te, y_tr_aug, w_tr_aug, y_val) if cache_fold_views else None
+            return fold, val_idx, p1_res, cached_data
 
-            if not args.two_pass:
-                oof_logits_1[val_idx] = preds_dict["val_logits_1"]
-                test_logits_1 += preds_dict["te_logits_1"] / args.folds
+        if p1_workers > 1:
+            logger.info(f"Dispatching Pass 1 across {p1_workers} concurrent workers...")
+            with ThreadPoolExecutor(max_workers=p1_workers) as executor:
+                futures = {executor.submit(_run_pass1_fold, (f, trn, val)): f for f, (trn, val) in fold_splits}
+                for fut in as_completed(futures):
+                    fold, val_idx, p1_res, cached_data = fut.result()
+                    oof_logits_1[val_idx] = p1_res["val_logits_1"]
+                    test_logits_1 += p1_res["te_logits_1"] / args.folds
+                    stage1_models[fold] = p1_res.get("model_a")
+                    if cached_data is not None:
+                        fold_views_cache[fold] = cached_data
+                    auc_1 = roc_auc_score(y_train[val_idx], p1_res["val_logits_1"])
+                    logger.info(f"Pass 1 - Fold {fold} Stage 1 AUC = {auc_1:.5f}")
+        else:
+            for fold, (trn_idx, val_idx) in fold_splits:
+                with timer(f"Pass 1 - Fold {fold}/{args.folds} (Stage 1)"):
+                    _, _, p1_res, cached_data = _run_pass1_fold((fold, trn_idx, val_idx))
+                    oof_logits_1[val_idx] = p1_res["val_logits_1"]
+                    test_logits_1 += p1_res["te_logits_1"] / args.folds
+                    stage1_models[fold] = p1_res.get("model_a")
+                    if cached_data is not None:
+                        fold_views_cache[fold] = cached_data
+                    auc_1 = roc_auc_score(y_train[val_idx], p1_res["val_logits_1"])
+                    logger.info(f"Pass 1 - Fold {fold} Stage 1 AUC = {auc_1:.5f}")
 
-            oof_logits_2[val_idx] = preds_dict["val_logits_2"]
-            oof_logits_3[val_idx] = preds_dict["val_logits_3"]
+        logger.info(f"Pass 1 Complete: Total Stage 1 OOF ROC-AUC = {roc_auc_score(y_train, oof_logits_1):.6f}")
+        logger.info("[TWO-PASS EXECUTION] Commencing Pass 2: Stages 2 & 3 with true out-of-fold margin handoffs...")
 
-            test_logits_2 += preds_dict["te_logits_2"] / args.folds
-            test_logits_3 += preds_dict["te_logits_3"] / args.folds
+    def _run_pass2_fold(fold_info):
+        fold, trn_idx, val_idx = fold_info
+        fold_gpu = gpu_devs[(fold - 1) % num_gpus] if (use_gpu and num_gpus > 0) else None
+        fold_irt = gpu_devs[fold % num_gpus] if (use_gpu and num_gpus > 1) else fold_gpu
 
-            auc_1 = roc_auc_score(y_val, oof_logits_1[val_idx])
-            auc_2 = roc_auc_score(y_val, preds_dict["val_logits_2"])
-            auc_3 = roc_auc_score(y_val, preds_dict["val_logits_3"])
-            logger.info(f"Fold {fold} AUCs: Stage 1 = {auc_1:.5f} | Stage 2 = {auc_2:.5f} | Stage 3 = {auc_3:.5f}")
+        if cache_fold_views and fold in fold_views_cache:
+            views_tr, views_val, views_te, y_tr_aug, w_tr_aug, y_val = fold_views_cache[fold]
+        else:
+            views_tr, views_val, views_te, y_tr_aug, w_tr_aug, y_val = _prepare_fold_views(
+                fold, trn_idx, val_idx, fold_irt
+            )
+
+        cascade = HierarchicalResidualGBDTCascade(
+            beta_12=args.beta_12,
+            beta_23=args.beta_23,
+            seed=args.seed + fold,
+            num_threads=p2_threads,
+            gpu_device=fold_gpu,
+        )
+
+        stage1_oof_tr = oof_logits_1[trn_idx] if args.two_pass else None
+        stage1_val_m = oof_logits_1[val_idx] if args.two_pass else None
+        stage1_te_m = test_logits_1 if args.two_pass else None
+        stage1_m = stage1_models.get(fold, None)
+
+        preds_dict = cascade.fit_predict_fold(
+            views_tr=views_tr,
+            y_tr_soft=y_tr_aug,
+            w_tr=w_tr_aug,
+            views_val=views_val,
+            y_val_hard=y_val,
+            views_te=views_te,
+            stage1_oof_tr_margin=stage1_oof_tr,
+            stage1_val_margin=stage1_val_m,
+            stage1_te_margin=stage1_te_m,
+            stage1_model=stage1_m,
+            num_boost_round=num_boost_round,
+            early_stopping_rounds=early_stopping_rounds,
+        )
+        return fold, val_idx, preds_dict
+
+    if p2_workers > 1:
+        logger.info(f"Dispatching Pass 2 across {p2_workers} concurrent workers (dual GPUs & CPU cores active)...")
+        with ThreadPoolExecutor(max_workers=p2_workers) as executor:
+            futures = {executor.submit(_run_pass2_fold, (f, trn, val)): f for f, (trn, val) in fold_splits}
+            for fut in as_completed(futures):
+                fold, val_idx, preds_dict = fut.result()
+                if not args.two_pass:
+                    oof_logits_1[val_idx] = preds_dict["val_logits_1"]
+                    test_logits_1 += preds_dict["te_logits_1"] / args.folds
+
+                oof_logits_2[val_idx] = preds_dict["val_logits_2"]
+                oof_logits_3[val_idx] = preds_dict["val_logits_3"]
+
+                test_logits_2 += preds_dict["te_logits_2"] / args.folds
+                test_logits_3 += preds_dict["te_logits_3"] / args.folds
+
+                auc_1 = roc_auc_score(y_train[val_idx], oof_logits_1[val_idx])
+                auc_2 = roc_auc_score(y_train[val_idx], preds_dict["val_logits_2"])
+                auc_3 = roc_auc_score(y_train[val_idx], preds_dict["val_logits_3"])
+                logger.info(f"Fold {fold} AUCs: Stage 1 = {auc_1:.5f} | Stage 2 = {auc_2:.5f} | Stage 3 = {auc_3:.5f}")
+    else:
+        for fold, (trn_idx, val_idx) in fold_splits:
+            with timer(f"Fold {fold}/{args.folds}"):
+                _, _, preds_dict = _run_pass2_fold((fold, trn_idx, val_idx))
+                if not args.two_pass:
+                    oof_logits_1[val_idx] = preds_dict["val_logits_1"]
+                    test_logits_1 += preds_dict["te_logits_1"] / args.folds
+
+                oof_logits_2[val_idx] = preds_dict["val_logits_2"]
+                oof_logits_3[val_idx] = preds_dict["val_logits_3"]
+
+                test_logits_2 += preds_dict["te_logits_2"] / args.folds
+                test_logits_3 += preds_dict["te_logits_3"] / args.folds
+
+                auc_1 = roc_auc_score(y_train[val_idx], oof_logits_1[val_idx])
+                auc_2 = roc_auc_score(y_train[val_idx], preds_dict["val_logits_2"])
+                auc_3 = roc_auc_score(y_train[val_idx], preds_dict["val_logits_3"])
+                logger.info(f"Fold {fold} AUCs: Stage 1 = {auc_1:.5f} | Stage 2 = {auc_2:.5f} | Stage 3 = {auc_3:.5f}")
 
     # 4. Out-of-Fold Evaluation & Inter-Model Correlation Decoupling
     auc_stage_1 = roc_auc_score(y_train, oof_logits_1)

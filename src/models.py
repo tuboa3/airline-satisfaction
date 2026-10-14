@@ -2502,6 +2502,7 @@ class HierarchicalResidualGBDTCascade:
         stage1_oof_tr_margin: Optional[np.ndarray] = None,
         stage1_val_margin: Optional[np.ndarray] = None,
         stage1_te_margin: Optional[np.ndarray] = None,
+        stage1_model: Optional[Any] = None,
         stage1_only: bool = False,
         num_boost_round: int = 2200,
         early_stopping_rounds: int = 120,
@@ -2511,8 +2512,8 @@ class HierarchicalResidualGBDTCascade:
         X_a_te, X_b_te, X_c_te = views_te
 
         cat_cols_a = [c for c in X_a_tr.columns if c.startswith("cat_") or c in ["Gender", "Customer Type", "Type of Travel", "Class"]]
-        dtrain_a = lgb.Dataset(X_a_tr, label=(y_tr_soft >= 0.5).astype(np.float32), categorical_feature=cat_cols_a, free_raw_data=False)
-        dval_a = lgb.Dataset(X_a_val, label=y_val_hard, categorical_feature=cat_cols_a, reference=dtrain_a, free_raw_data=False)
+        dtrain_a = lgb.Dataset(X_a_tr, label=(y_tr_soft >= 0.5).astype(np.float32), categorical_feature=cat_cols_a, free_raw_data=True)
+        dval_a = lgb.Dataset(X_a_val, label=y_val_hard, categorical_feature=cat_cols_a, reference=dtrain_a, free_raw_data=True)
 
         lgb_params_a = {
             "boosting_type": "gbdt",
@@ -2531,13 +2532,28 @@ class HierarchicalResidualGBDTCascade:
             "feature_contri": self._build_lgbm_feature_contri(list(X_a_tr.columns)),
             "metric": "auc",
             "verbose": -1,
+            "force_row_wise": True,
             "n_jobs": self.num_threads,
             "num_threads": self.num_threads,
             "random_state": self.seed,
             "objective": self.loss_engine.lgb_objective(y_tr_soft, w_tr),
         }
 
-        if stage1_val_margin is not None and not stage1_only:
+        if stage1_model is not None:
+            model_a = stage1_model
+            z_val_1 = stage1_val_margin if stage1_val_margin is not None else model_a.predict(X_a_val)
+            z_te_1 = stage1_te_margin if stage1_te_margin is not None else model_a.predict(X_a_te)
+            if stage1_oof_tr_margin is not None:
+                if len(stage1_oof_tr_margin) == len(X_a_tr):
+                    z_tr_1 = stage1_oof_tr_margin
+                elif len(stage1_oof_tr_margin) < len(X_a_tr):
+                    extra_z = 0.85 * model_a.predict(X_a_tr.iloc[len(stage1_oof_tr_margin):])
+                    z_tr_1 = np.concatenate([stage1_oof_tr_margin, extra_z])
+                else:
+                    z_tr_1 = stage1_oof_tr_margin[:len(X_a_tr)]
+            else:
+                z_tr_1 = 0.85 * model_a.predict(X_a_tr)
+        elif stage1_val_margin is not None and not stage1_only:
             z_val_1 = stage1_val_margin
             z_te_1 = stage1_te_margin if stage1_te_margin is not None else np.zeros(len(X_a_te), dtype=np.float64)
             if stage1_oof_tr_margin is not None:
@@ -2583,6 +2599,7 @@ class HierarchicalResidualGBDTCascade:
             return {
                 "val_logits_1": z_val_1.astype(np.float64),
                 "te_logits_1": z_te_1.astype(np.float64),
+                "model_a": model_a,
             }
 
         dtrain_b = xgb.DMatrix(X_b_tr, label=(y_tr_soft >= 0.5).astype(np.float32))
@@ -2648,8 +2665,8 @@ class HierarchicalResidualGBDTCascade:
         init_val_3 = self.beta_23 * (0.55 * z_val_1 + 0.45 * z_val_2)
         init_te_3 = self.beta_23 * (0.55 * z_te_1 + 0.45 * z_te_2)
 
-        dtrain_c = lgb.Dataset(X_c_tr, label=(y_tr_soft >= 0.5).astype(np.float32), init_score=init_tr_3, free_raw_data=False)
-        dval_c = lgb.Dataset(X_c_val, label=y_val_hard, init_score=init_val_3, reference=dtrain_c, free_raw_data=False)
+        dtrain_c = lgb.Dataset(X_c_tr, label=(y_tr_soft >= 0.5).astype(np.float32), init_score=init_tr_3, free_raw_data=True)
+        dval_c = lgb.Dataset(X_c_val, label=y_val_hard, init_score=init_val_3, reference=dtrain_c, free_raw_data=True)
 
         lgb_params_c = {
             "boosting_type": "gbdt",
@@ -2666,6 +2683,7 @@ class HierarchicalResidualGBDTCascade:
             "reg_lambda": 10.0,
             "metric": "auc",
             "verbose": -1,
+            "force_row_wise": True,
             "n_jobs": self.num_threads,
             "num_threads": self.num_threads,
             "random_state": self.seed + 33,
